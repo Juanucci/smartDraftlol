@@ -1,4 +1,4 @@
-"""Carga de campeones desde YAML hacia `Champion`."""
+"""Carga de campeones desde YAML hacia `Champion` — schema v2."""
 
 from __future__ import annotations
 
@@ -7,27 +7,64 @@ from pathlib import Path
 
 import yaml
 
-from lol_reasoner.domain.champion import AbilityEffect, Champion, DamageProfile, PowerSpike
-from lol_reasoner.domain.enums import Axis, CooldownClass, EffectKind, Phase, TradePattern
+from lol_reasoner.domain.champion import Ability, Champion, DamageProfile, Effect, PowerSpike, StackingMechanic
+from lol_reasoner.domain.enums import (
+    Axis,
+    CooldownClass,
+    DamageType,
+    EffectCondition,
+    EffectType,
+    Phase,
+    ResourceType,
+    TacticalUse,
+    TradePattern,
+)
 from lol_reasoner.knowledge.schema import validate_champion_dict
+
+
+def _build_effect(e: dict) -> Effect:
+    return Effect(
+        type=EffectType(e["type"]),
+        magnitude=e["magnitude"],
+        conditions=frozenset(EffectCondition(c) for c in e.get("conditions", [])),
+        damage_type=DamageType(e["damage_type"]) if e.get("damage_type") else None,
+        feeds_stack=e.get("feeds_stack"),
+        stack_scaling=e.get("stack_scaling"),
+        amplifies_slot=e.get("amplifies_slot"),
+        bypasses_shields=e.get("bypasses_shields", False),
+        doc=e.get("doc", ""),
+    )
+
+
+def _build_ability(a: dict) -> Ability:
+    return Ability(
+        slot=a["slot"],
+        name=a["name"],
+        cooldown_class=CooldownClass(a["cooldown_class"]),
+        effects=tuple(_build_effect(e) for e in a["effects"]),
+        tactical_uses=frozenset(TacticalUse(u) for u in a.get("tactical_uses", [])),
+        available_from=Phase(a.get("available_from", Phase.EARLY_LANE.value)),
+        doc=a.get("doc", ""),
+    )
+
+
+def _build_stacking_mechanic(m: dict) -> StackingMechanic:
+    return StackingMechanic(
+        id=m["id"],
+        name=m["name"],
+        threshold=m["threshold"],
+        stacks_per_application=m["stacks_per_application"],
+        applied_by=frozenset(m["applied_by"]),
+        reward_name=m["reward_name"],
+        reward_effects=tuple(_build_effect(e) for e in m.get("reward_effects", [])),
+    )
 
 
 def _build_champion(data: dict) -> Champion:
     damage_profile = DamageProfile(**data["damage_profile"])
     axes = {Axis(name): value for name, value in data["axes"].items()}
-    abilities = tuple(
-        AbilityEffect(
-            slot=a["slot"],
-            name=a["name"],
-            kind=EffectKind(a["kind"]),
-            cooldown_class=CooldownClass(a["cooldown_class"]),
-            counters=frozenset(a.get("counters", [])),
-            countered_by=frozenset(a.get("countered_by", [])),
-            available_from=Phase(a.get("available_from", Phase.EARLY_LANE.value)),
-            note=a.get("note", ""),
-        )
-        for a in data["abilities"]
-    )
+    abilities = tuple(_build_ability(a) for a in data["abilities"])
+    stacking_mechanics = tuple(_build_stacking_mechanic(m) for m in data["stacking_mechanics"])
     spikes = tuple(
         PowerSpike(phase=Phase(s["phase"]), magnitude=s["magnitude"], reason=s["reason"]) for s in data["spikes"]
     )
@@ -37,12 +74,12 @@ def _build_champion(data: dict) -> Champion:
         archetype=data["archetype"],
         damage_profile=damage_profile,
         axes=axes,
-        trade_pattern=TradePattern(data["trade_pattern"]),
+        casting_resource=ResourceType(data["casting_resource"]),
+        trade_patterns=frozenset(TradePattern(t) for t in data["trade_patterns"]),
         tags=frozenset(data["tags"]),
         abilities=abilities,
+        stacking_mechanics=stacking_mechanics,
         spikes=spikes,
-        strengths=tuple(data["strengths"]),
-        vulnerabilities=tuple(data["vulnerabilities"]),
         knowledge_version=data["knowledge_version"],
     )
 

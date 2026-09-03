@@ -1,8 +1,12 @@
-# Decisiones técnicas — V0, primer hito (Darius vs Mordekaiser)
+# Decisiones técnicas — V0
 
 Documento breve de decisiones tomadas sin bloquear en el usuario, con su
 justificación. Ninguna de estas decisiones es definitiva: son puntos de
 partida razonables para validar la arquitectura.
+
+Secciones 1-10: hito 1 (primera implementación, schema v1). Sección 11:
+hito 1.5 (refactor del modelo de conocimiento a schema v2 — mismo par de
+campeones, Darius y Mordekaiser).
 
 ## 1. Ejes semánticos 0..4, no 0..100
 
@@ -103,3 +107,101 @@ inventar un timing de objeto.
 - La convención de signo de scoring.
 - La prohibición de nombres de campeón en reglas generales (verificada por
   test, no por buena voluntad).
+
+## 11. Hito 1.5 — refactor del modelo de conocimiento (schema v2)
+
+El hito 1 validó la tubería (YAML → traza → score → explicación), pero el
+modelo de conocimiento era demasiado limitado: `AbilityEffect.kind` era
+singular (una habilidad = un efecto), `counters`/`countered_by` permitían
+afirmar un resultado sin representar el mecanismo, y `available_from`,
+`spikes`, `strengths`/`vulnerabilities` se cargaban sin que ninguna regla
+los leyera. Dos afirmaciones concretas resultaron directamente falsas:
+"el daño verdadero ignora escudos" (S01) y "Indestructible revierte
+cargas de Hemorrhage" (S02).
+
+**11.1 — `Ability` tiene N `Effect`, no un `kind`.** Cada `Effect` es
+`{type, magnitude, conditions: frozenset[EffectCondition], damage_type?,
+feeds_stack?, stack_scaling?, amplifies_slot?, bypasses_shields=False,
+doc}`. `conditions` es un conjunto (no un solo valor) porque un efecto
+puede depender de varias circunstancias a la vez (p. ej. el heal de
+Decimate exige `ON_OUTER_ZONE` **y** `TARGET_IS_CHAMPION`).
+
+**11.2 — Se elimina `counters`/`countered_by`.** Las reglas generales
+ahora cruzan `EffectType`/`tactical_uses` estructuralmente (¿tiene un
+escudo? ¿tiene daño verdadero? ¿interrumpe?), nunca una lista de tags
+declarada a mano que ya presupone el resultado. `bypasses_shields`
+existe como una vía de extensión explícita (una habilidad *futura y
+concreta* podría declararlo) pero ninguna del hito 1.5 lo activa: por
+defecto, cualquier escudo absorbe cualquier daño, verdadero incluido.
+
+**11.3 — `StackingMechanic` como objeto de primera clase.** Umbral,
+`stacks_per_application`, `applied_by` (fuentes) y `reward_effects`
+declarados; `applications_needed` se deriva (`ceil(threshold /
+stacks_per_application)`); `ramp_speed_rank` (qué tan rápido se llega,
+un ordinal cualitativo, nunca una tasa) y `reward_magnitude` (filtrada
+por fase vía `amplifies_slot`) se calculan en
+`reasoning/rules/stacking.py`, no se escriben a mano por campeón. Una
+validación cruzada en `schema.py` obliga a que todo slot listado en
+`applied_by` tenga de verdad un efecto `STACK_APPLICATION` con ese
+`feeds_stack`, para que ambas declaraciones no puedan desincronizarse.
+
+**11.4 — `available_from` se cumple estructuralmente.**
+`ReasoningContext.candidate_abilities()`/`enemy_abilities()` filtran por
+fase; ninguna regla puede leer `champion.abilities` directo (verificado
+por AST en `test_phase_availability.py`). Antes, `true_damage_source`
+era un tag global de Darius legible en `early_lane` aunque proviniera de
+su R (nivel 6): ahora el daño verdadero vive en el `Effect` de la R, y
+solo aparece en la traza desde que esa habilidad está disponible.
+
+**11.5 — Disciplina de vocabulario vivo.** `Tag` quedó vacío (los
+candidatos `percent_health_damage`, `attack_speed_slow`,
+`dash_dependent`, `ranged_poke`, `short_trader` se documentan como
+vocabulario potencial en `domain/enums.py`, no como miembros de enum
+inactivos). Cada `EffectType`/`TacticalUse` activo tiene un consumidor
+real, verificado en `tests/test_vocabulary_alive.py` con evidencia
+comportamental (aparece citado en un `FactRef` de la traza real, en
+alguna de las dos direcciones) más un escaneo de referencia en código.
+Tres tipos (`DISPLACE_ENEMY`, `BRIEF_CC`, `SLOW`, todos de
+`DisplacementVsMobilityRule`/G15) están documentados como
+"condicionalmente silenciosos para este par": la regla existe y se
+ejecuta, pero ni Darius ni Mordekaiser tienen movilidad/disengage que un
+desplazamiento pudiera negar — se espera que esa lista se achique con
+campeones más móviles.
+
+**11.6 — Deduplicación causal (anti-doble-conteo).** Cuando varios
+`Effect` de una misma habilidad describen el mismo "momento" (p. ej.
+`DISPLACE_ENEMY` + `BRIEF_CC` + `INTERRUPT` de Apprehend), la regla que
+los interpreta agrega el **máximo** de sus magnitudes, no la suma, en
+una única `RuleEffect` — ver `DisplacementVsMobilityRule`. Esto es
+distinto de que dos *reglas diferentes* lean el mismo efecto para
+afirmar cosas *distintas* (p. ej. `INTERRUPT` de Apprehend aporta tanto
+a "control de espacio" en G15 como a "niega una aplicación de stack
+puntual" en G04): eso no es doble conteo, son dos consecuencias reales y
+no redundantes del mismo efecto.
+
+**11.7 — Confianza: tres correcciones.** (a) La cobertura se interseca
+con `registry.ALL_CATEGORIES` antes de dividir: categorías de aviso como
+`missing_item_data` no cuentan como cobertura mecánica. (b)
+`missing_info_count` cuenta textos `invalidated_if` **distintos**, no
+entradas — la misma observación repetida en 4 fases contaba 4 veces
+antes. (c) La contradicción se calcula por `(fase, factor)`, no
+agregada sobre toda la traza: una ventaja de `early_lane` y una
+desventaja de `side_lane_late` en el mismo factor ya no se cancelan
+como si fueran simultáneas. La misma dedup por texto distinto se aplicó
+a `conditional_entry_count` (usado por `required_skill` en
+`PersonalScore`).
+
+**11.8 — `specific.py` queda vacío.** S01 y S02 no eran interacciones
+reales que las reglas generales no pudieran capturar: eran afirmaciones
+falsas. Al modelar `Effect.damage_type` y
+`SHIELD_FROM_STORED`/`CONVERT_SHIELD_TO_HEAL` estructuralmente, ambas
+quedaron cubiertas — correctamente — por reglas generales
+(`DamageTypeAndShieldRule`, `MitigationAndDisruptionRule`) sin necesitar
+ninguna excepción. El módulo, el tope de 10 y los tests que exigen
+`justification`+`condition` se conservan para cuando de verdad haga
+falta una.
+
+**11.9 — Guardrail de 15 reglas generales: temporal.** Este hito llega a
+14 (13 en `general.py` + `StackRaceRule` en `stacking.py`). Es un límite
+deliberadamente estrecho para esta V0 con 2 campeones; se revisa
+explícitamente al incorporar los otros ocho.

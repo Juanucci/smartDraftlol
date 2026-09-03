@@ -29,12 +29,17 @@ def test_analysis_differs_by_phase(darius, mordekaiser):
     assert early != level6
 
 
-def test_isolation_and_execute_rules_only_appear_from_level_6(darius, mordekaiser):
+def test_isolation_rules_only_appear_from_level_6(darius, mordekaiser):
+    """Realm of Death solo está disponible desde level_6: las categorías de
+    IsolationRule (robo de estadísticas / restricción de espacio) no
+    deberían aparecer antes, porque `ctx.enemy_abilities()` ya filtra R."""
+
     trace = RuleEngine().build_trace(darius, mordekaiser, ALL_PHASES)
+    isolation_categories = {"isolation_stat_steal", "isolation_arena"}
     early_categories = {e.category for e in trace.for_phase(Phase.EARLY_LANE)}
-    assert "ultimate_impact" not in early_categories
+    assert not (isolation_categories & early_categories)
     level6_categories = {e.category for e in trace.for_phase(Phase.LEVEL_6)}
-    assert "ultimate_impact" in level6_categories
+    assert isolation_categories & level6_categories
 
 
 def test_directionality_darius_vs_mordekaiser_is_not_a_mirror(darius, mordekaiser):

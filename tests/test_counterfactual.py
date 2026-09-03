@@ -1,9 +1,10 @@
 """Tests contrafactuales: mutar una propiedad del YAML en memoria debe
 cambiar el resultado de forma coherente y explicable, y dejar evidencia
-en la traza. Esto es lo que demuestra que el motor razona a partir de
-las propiedades declaradas y no repite una tabla de resultados
-precargada: si repitiera respuestas fijas, mutar el YAML no cambiaría
-nada.
+en la traza. Esto demuestra que el motor razona a partir de las
+propiedades declaradas y no repite una tabla de resultados precargada.
+
+(Ver también tests/test_stacking.py::test_counterfactual_lowering_darius_threshold_flips_the_first_threshold_entry
+para el contrafactual sobre el umbral de una StackingMechanic.)
 """
 
 from __future__ import annotations
@@ -24,47 +25,51 @@ def _raw_champion_dict(champion_id: str) -> dict:
         return yaml.safe_load(p.read_text(encoding="utf-8"))
 
 
-def test_removing_darius_vulnerable_tags_reduces_mordekaiser_advantage():
-    """Indestructible (Mordekaiser.W) niega los tags auto_attack_reliant y
-    sustained_dps_reliant de Darius (G04). Si Darius no tuviera esos tags,
-    esa ventaja mecánica para Mordekaiser debería desaparecer y su
-    GlobalScore como candidato contra Darius debería bajar."""
+def test_removing_darius_q_heal_effect_reduces_mordekaiser_disadvantage():
+    """PokeVsSustainRule (G02) da un PRO a Darius-candidato por el heal
+    condicional de Decimate. Si esa curación no existiera, esa ventaja
+    debería desaparecer y su GlobalScore como candidato contra Mordekaiser
+    debería bajar."""
 
     original = _raw_champion_dict("darius")
     mutated = copy.deepcopy(original)
-    mutated["tags"] = [t for t in mutated["tags"] if t not in ("auto_attack_reliant", "sustained_dps_reliant")]
+    for ability in mutated["abilities"]:
+        if ability["slot"] == "Q":
+            ability["effects"] = [e for e in ability["effects"] if e["type"] != "heal"]
 
     darius_original = load_champion_from_dict(original, source="<original>")
     darius_mutated = load_champion_from_dict(mutated, source="<counterfactual>")
     mordekaiser = load_champion_from_dict(_raw_champion_dict("mordekaiser"), source="<mordekaiser>")
 
-    query = MatchupQuery(enemy_id="darius", candidate_ids=("mordekaiser",))
-    rec_before = recommend(query, {"darius": darius_original, "mordekaiser": mordekaiser}).recommendations["mordekaiser"]
-    rec_after = recommend(query, {"darius": darius_mutated, "mordekaiser": mordekaiser}).recommendations["mordekaiser"]
+    query = MatchupQuery(enemy_id="mordekaiser", candidate_ids=("darius",))
+    rec_before = recommend(query, {"darius": darius_original, "mordekaiser": mordekaiser}).recommendations["darius"]
+    rec_after = recommend(query, {"darius": darius_mutated, "mordekaiser": mordekaiser}).recommendations["darius"]
 
     assert rec_after.global_score < rec_before.global_score
 
     before_texts = " | ".join(r.text for r in rec_before.reasons)
     after_texts = " | ".join(r.text for r in rec_after.reasons)
-    assert "Indestructible" in before_texts and "niega el patrón" in before_texts
-    assert "Indestructible" not in after_texts or "niega el patrón" not in after_texts
+    assert "también lo cura al conectar" in before_texts
+    assert "también lo cura al conectar" not in after_texts
 
-    # y la traza cruda también perdió la entrada correspondiente (evidencia directa)
-    before_ids = {e["id"] for e in rec_before.trace_entries}
-    after_ids = {e["id"] for e in rec_after.trace_entries}
-    assert "G04#early_lane#1" in before_ids
-    assert "G04#early_lane#1" not in after_ids
+    heal_entries_before = [e for e in rec_before.trace_entries if e["rule_id"] == "G02" and "también lo cura" in e["text"]]
+    heal_entries_after = [e for e in rec_after.trace_entries if e["rule_id"] == "G02" and "también lo cura" in e["text"]]
+    assert heal_entries_before
+    assert not heal_entries_after
 
 
-def test_lowering_enemy_durability_removes_true_damage_value_rule():
-    """G03 (el daño verdadero conserva valor) solo dispara si la
-    durabilidad del rival es >= 3. Bajar Mordekaiser.durability por
-    debajo de ese umbral debería hacer desaparecer esa ventaja para
-    Darius y bajar su GlobalScore."""
+def test_shrinking_mordekaiser_shield_magnitude_reduces_the_mitigation_penalty():
+    """DamageMitigationAndDisruptionRule escala su CONTRA con la magnitud
+    del escudo de Indestructible. Bajarla debería reducir (no eliminar)
+    la penalización que sufre Darius como candidato."""
 
     original = _raw_champion_dict("mordekaiser")
     mutated = copy.deepcopy(original)
-    mutated["axes"]["durability"] = 1
+    for ability in mutated["abilities"]:
+        if ability["slot"] == "W":
+            for effect in ability["effects"]:
+                if effect["type"] == "shield_from_stored":
+                    effect["magnitude"] = 1  # antes: 3
 
     mordekaiser_original = load_champion_from_dict(original, source="<original>")
     mordekaiser_mutated = load_champion_from_dict(mutated, source="<counterfactual>")
@@ -72,20 +77,16 @@ def test_lowering_enemy_durability_removes_true_damage_value_rule():
 
     def _run(enemy):
         query = MatchupQuery(enemy_id="mordekaiser", candidate_ids=("darius",))
-        champs = {"darius": darius, "mordekaiser": enemy}
-        return recommend(query, champs).recommendations["darius"]
+        return recommend(query, {"darius": darius, "mordekaiser": enemy}).recommendations["darius"]
 
     rec_before = _run(mordekaiser_original)
     rec_after = _run(mordekaiser_mutated)
 
-    assert rec_after.global_score < rec_before.global_score
+    assert rec_after.global_score > rec_before.global_score  # menos escudo => menos mitigación => mejor para Darius
 
-    before_ids = {e["id"] for e in rec_before.trace_entries}
-    after_ids = {e["id"] for e in rec_after.trace_entries}
-    g03_ids_before = {i for i in before_ids if i.startswith("G03#")}
-    g03_ids_after = {i for i in after_ids if i.startswith("G03#")}
-    assert g03_ids_before  # el hecho estaba presente en el escenario original
-    assert not g03_ids_after  # y desaparece tras la mutación, con evidencia trazable
+    mitigation_before = next(e for e in rec_before.trace_entries if e["id"] == "G04#early_lane")
+    mitigation_after = next(e for e in rec_after.trace_entries if e["id"] == "G04#early_lane")
+    assert mitigation_after["delta"] < mitigation_before["delta"]
 
 
 def test_raising_candidate_execution_demand_lowers_personal_score_at_low_mastery():
@@ -110,3 +111,33 @@ def test_raising_candidate_execution_demand_lowers_personal_score_at_low_mastery
     rec_after = _run(mordekaiser_mutated)
 
     assert rec_after.personal_score < rec_before.personal_score
+    # execution_demand SÍ mueve el propio factor EXECUTION_DEMAND del GlobalScore (ExecutionDemandBaselineRule,
+    # G10): lo que la independencia de `mastery` garantiza es que ESTE cambio de mastery no mueve el GlobalScore
+    # (ver test_scoring.py::test_mastery_changes_personal_score_but_not_global_score), no que ningún eje lo haga.
+
+
+def test_removing_mordekaiser_r_available_from_level_6_effects_present_before_level_6_disappear():
+    """Contrafactual estructural: si Realm of Death (R) se declarara
+    disponible desde early_lane (mutación deliberadamente incorrecta,
+    solo para probar que el motor reacciona), las entradas de
+    IsolationRule deberían aparecer ya en early_lane."""
+
+    original = _raw_champion_dict("mordekaiser")
+    mutated = copy.deepcopy(original)
+    for ability in mutated["abilities"]:
+        if ability["slot"] == "R":
+            ability["available_from"] = "early_lane"
+
+    mordekaiser_original = load_champion_from_dict(original, source="<original>")
+    mordekaiser_mutated = load_champion_from_dict(mutated, source="<counterfactual>")
+    darius = load_champion_from_dict(_raw_champion_dict("darius"), source="<darius>")
+
+    from lol_reasoner.domain.enums import Phase
+    from lol_reasoner.reasoning.engine import RuleEngine
+
+    trace_before = RuleEngine().build_trace(darius, mordekaiser_original, (Phase.EARLY_LANE,))
+    trace_after = RuleEngine().build_trace(darius, mordekaiser_mutated, (Phase.EARLY_LANE,))
+
+    isolation_categories = {"isolation_stat_steal", "isolation_arena"}
+    assert not ({e.category for e in trace_before.entries} & isolation_categories)
+    assert {e.category for e in trace_after.entries} & isolation_categories

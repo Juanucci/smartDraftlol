@@ -1,4 +1,4 @@
-# Base de conocimiento semántica de Darius para lol_reasoner V0.
+# Base de conocimiento semántica de Darius para lol_reasoner — schema v2.
 #
 # knowledge_version es la versión INTERNA de esta base de datos, no un
 # parche de League of Legends. Estos valores son una lectura cualitativa
@@ -6,13 +6,15 @@
 # para validar la arquitectura del motor de razonamiento, no como
 # recomendación competitiva actualizada. Ver README > Limitaciones.
 
+schema_version: 2
+
 id: darius
 name: Darius
 archetype: bruiser_duelist_stacking
 
-# Mezcla orientativa del daño que inflige (no un cálculo real de mitigación).
-# El grueso es físico (autos + Hemorrhage); el R agrega una porción de
-# daño verdadero relevante como ejecución.
+# Puramente descriptivo para la salida humana. Ninguna regla lee esto:
+# la fuente de verdad es Effect.damage_type en cada habilidad, filtrado
+# por fase de disponibilidad.
 damage_profile:
   physical: 0.8
   magic: 0.0
@@ -21,68 +23,167 @@ damage_profile:
 # Ejes 0..4 = ninguno/bajo/medio/alto/extremo.
 axes:
   attack_range: 1        # melee corto
-  mobility: 1             # sin dash; Apprehend es un tirón, no reposicionamiento propio
-  sustain: 2               # W (Decimate/Crippling Strike da AS decreciente + algo de heal on-hit)
+  mobility: 0              # sin ninguna forma de reposicionarse a sí mismo: Apprehend desplaza al RIVAL, no a Darius
+  sustain: 2               # heal condicional de Decimate (filo exterior) + algo de vida on-hit
   burst: 1                  # su daño es acumulativo, no explosivo
   sustained_dps: 4          # Hemorrhage se acumula con cada golpe, hasta 5 cargas
-  cc: 2                       # slow de Apprehend, sin CC duro además de eso
+  cc: 2                       # control breve de Apprehend + slow; sin CC duro prolongado
   durability: 3                 # HP base alta, buen bruiser tanque-ish
   waveclear: 2                    # Decimate limpia bien pero no es un waveclear extremo
   early_pressure: 4                  # muy fuerte desde nivel 1-3
   scaling: 2                            # escala pero es menos dominante tarde que en lane
-  all_in: 4                                # su plan central ES el all-in prolongado
+  all_in: 4                                # su plan central ES el all-in/intercambio prolongado
   disengage: 0                               # no tiene forma de desconectar
   ability_reliance: 2                          # fuerte incluso sin combos perfectos
-  execution_demand: 2                             # promedio: hay timing en Q reset, no es extremo
+  execution_demand: 2                             # promedio: hay timing en el reset de W, no es extremo
 
-trade_pattern: extended_trade
+casting_resource: mana
 
-tags:
-  - extended_fighter
-  - physical_damage_heavy
-  - true_damage_source
-  - stacking_mechanic
-  - auto_attack_reliant
-  - sustained_dps_reliant
-  - hard_cc
+# Descriptivo/resumen. Las reglas NO leen esto: inspeccionan `tactical_uses`
+# de las habilidades concretas disponibles en cada fase.
+trade_patterns:
+  - extended_trade
+
+# Vacío deliberadamente en este hito: ver domain/enums.py (Tag).
+tags: []
 
 abilities:
   - slot: P
     name: Hemorrhage
-    kind: stacking_dot
     cooldown_class: short
-    counters: []
-    countered_by: []
     available_from: early_lane
-    note: >
-      Cada golpe (auto o E) aplica una carga de sangrado que se refresca y
-      escala hasta 5 cargas; morir con 5 cargas activa la pasiva de Noxus.
-      Es el corazón del patrón de trade extendido de Darius.
+    effects:
+      - type: stack_application
+        magnitude: 1
+        conditions: [on_hit]
+        feeds_stack: hemorrhage
+        doc: >
+          Cada golpe básico aplica una carga. El filo exterior de Decimate
+          también aplica una carga (ver Q) — ambas fuentes están declaradas
+          en stacking_mechanics.hemorrhage.applied_by, no acá, para que la
+          velocidad de acumulación se derive en un solo lugar.
+    doc: >
+      La pasiva en sí. Acumula hasta 5 cargas (stacking_mechanics.hemorrhage);
+      llegar a 5 activa Noxian Might. No requiere que el objetivo muera con
+      5 cargas: Noxian Might es un empoderamiento propio, no una ejecución
+      automática.
+
+  - slot: Q
+    name: Decimate
+    cooldown_class: medium
+    available_from: early_lane
+    tactical_uses: [sustain, poke, waveclear, trade_extend]
+    effects:
+      - type: damage
+        magnitude: 3
+        damage_type: physical
+        conditions: [on_outer_zone]
+        doc: "Filo exterior: el resultado completo de la habilidad."
+      - type: damage
+        magnitude: 1
+        damage_type: physical
+        conditions: [on_inner_zone]
+        doc: "Zona interior: golpea, pero niega buena parte del valor de la habilidad (sin heal, sin carga)."
+      - type: heal
+        magnitude: 2
+        conditions: [on_outer_zone, target_is_champion]
+        doc: "La curación es condicional a acertar el filo exterior sobre un campeón, no cualquier impacto."
+      - type: stack_application
+        magnitude: 1
+        conditions: [on_outer_zone, target_is_champion]
+        feeds_stack: hemorrhage
+    doc: >
+      Tiene una zona interior (junto a Darius) y una exterior (el borde del
+      área): solo el filo exterior sobre un campeón produce el resultado
+      completo — daño pleno, curación y carga de Hemorrhage. La zona
+      interior es utilizable para negar parte de ese valor.
+
+  - slot: W
+    name: Crippling Strike
+    cooldown_class: short
+    available_from: early_lane
+    tactical_uses: [trade_extend]
+    effects:
+      - type: empower_next_attack
+        magnitude: 2
+      - type: auto_attack_reset
+        magnitude: 3
+      - type: slow
+        magnitude: 3
+    doc: >
+      Potencia y resetea el siguiente ataque básico, y ralentiza fuertemente
+      al objetivo. NO aplica una carga de Hemorrhage por sí misma: el ataque
+      básico que potencia y resetea es el que aplica la carga (ya contado en
+      stacking_mechanics.hemorrhage.applied_by como "basic_attack"). Su rol
+      estructural es acelerar la llegada del próximo golpe, no duplicar la
+      carga de ese golpe.
 
   - slot: E
     name: Apprehend
-    kind: gap_closer
     cooldown_class: medium
-    counters: []
-    countered_by: []
     available_from: early_lane
-    note: >
-      Tirón + slow en área que jala a los enemigos hacia Darius y aplica
-      una carga de Hemorrhage; funciona como su única herramienta de
-      control de espacio y de anti-kite parcial.
+    tactical_uses: [initiate, anti_kite, setup_combo]
+    effects:
+      - type: displace_enemy
+        magnitude: 3
+        doc: "Tira al enemigo hacia Darius. Darius NO se desplaza: esto no es un self_dash."
+      - type: brief_cc
+        magnitude: 1
+      - type: interrupt
+        magnitude: 2
+      - type: slow
+        magnitude: 2
+        conditions: [on_delay]
+        doc: "El slow aplica después del desplazamiento, no simultáneamente."
+      - type: armor_penetration
+        magnitude: 1
+        doc: "Penetración de armadura pasiva (sin porcentaje concreto en esta V0)."
+    doc: >
+      NO es un gap closer: Darius no se reposiciona a sí mismo, tira al
+      enemigo hacia él. Sirve para iniciar, evitar que el rival gane
+      espacio (anti-kite) y preparar el filo exterior de Decimate. NO es
+      una herramienta de disengage (no crea espacio para Darius) y no
+      aplica Hemorrhage por sí misma.
 
   - slot: R
     name: Noxian Guillotine
-    kind: true_damage_execute
     cooldown_class: long
-    counters: []
-    countered_by: []
     available_from: level_6
-    note: >
-      Daño verdadero que escala con la vida faltante del objetivo; su
-      cooldown se resetea al conseguir el remate. Al ser daño verdadero,
-      no es mitigado por reducciones de daño convencionales ni por
-      escudos genéricos.
+    effects:
+      - type: damage
+        magnitude: 3
+        damage_type: "true"
+        doc: "Daño verdadero: ignora resistencias por definición del tipo de daño (no de un flag especial)."
+      - type: amplify_ability
+        magnitude: 2
+        stack_scaling: hemorrhage
+        amplifies_slot: R
+        doc: "El daño de esta misma habilidad escala con las cargas de Hemorrhage ya aplicadas al objetivo."
+      - type: cooldown_reset
+        magnitude: 1
+        conditions: [on_takedown]
+    doc: >
+      La amenaza de remate depende del daño amplificado por las cargas de
+      Hemorrhage acumuladas, no de una mecánica de ejecución por vida
+      faltante. Resetea su cooldown al conseguir el remate. Al ser daño
+      verdadero, ignora resistencias — pero eso no implica que ignore
+      escudos comunes (ver ShieldAbsorbsAnyDamageRule): un escudo puede
+      absorberlo igual que cualquier otro daño.
+
+stacking_mechanics:
+  - id: hemorrhage
+    name: Hemorrhage
+    threshold: 5
+    stacks_per_application: 1
+    applied_by: [basic_attack, Q]
+    reward_name: Noxian Might
+    reward_effects:
+      - type: empower_self
+        magnitude: 4
+      - type: amplify_ability
+        magnitude: 3
+        amplifies_slot: R
+        doc: "Al alcanzar 5 cargas, además de Noxian Might, amplifica específicamente a Noxian Guillotine."
 
 spikes:
   - phase: early_lane
@@ -90,7 +191,7 @@ spikes:
     reason: "Presión de nivel 1-3 muy alta gracias a Hemorrhage + Apprehend."
   - phase: level_6
     magnitude: 3
-    reason: "Noxian Guillotine agrega una amenaza de ejecución y remate en cadena."
+    reason: "Noxian Guillotine agrega una amenaza de remate amplificada por cargas, con reset en cadena."
   - phase: first_item
     magnitude: 2
     reason: "Se beneficia de progresión de poder temprana, pero no depende de un objeto puntual para funcionar."
@@ -98,14 +199,4 @@ spikes:
     magnitude: 2
     reason: "Sigue siendo peligroso en un 1v1 side lane, pero pierde parte de su ventaja relativa de early game."
 
-strengths:
-  - "Presión de lane temprana muy alta si el rival se queda dentro del alcance de Apprehend."
-  - "El daño acumulado de Hemorrhage castiga intercambios largos y descuidados."
-  - "Noxian Guillotine agrega una amenaza de remate que ignora resistencias convencionales."
-
-vulnerabilities:
-  - "Sin dash ni forma de cerrar distancia si el rival mantiene espacio de forma consistente."
-  - "Depende de mantenerse dentro de rango de auto-ataque para acumular Hemorrhage; kite sostenido licua su plan."
-  - "Apprehend tiene cooldown medio: fuera de esa ventana, su control de espacio cae notablemente."
-
-knowledge_version: "0.1.0"
+knowledge_version: "0.2.0"

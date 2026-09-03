@@ -14,7 +14,7 @@ from lol_reasoner.domain.champion import Champion
 from lol_reasoner.domain.enums import Factor, Phase, Polarity
 from lol_reasoner.reasoning.context import ReasoningContext
 from lol_reasoner.reasoning.rules.base import Rule, RuleEffect
-from lol_reasoner.reasoning.rules.general import GENERAL_RULES
+from lol_reasoner.reasoning.rules.registry import ALL_GENERAL_RULES
 from lol_reasoner.reasoning.rules.specific import SPECIFIC_INTERACTIONS, SpecificInteraction
 from lol_reasoner.reasoning.trace import ReasoningTrace, TraceEntry
 
@@ -32,7 +32,7 @@ _ITEM_GAP_SUMMARY = (
 class RuleEngine:
     def __init__(
         self,
-        general_rules: Sequence[Rule] = GENERAL_RULES,
+        general_rules: Sequence[Rule] = ALL_GENERAL_RULES,
         specific_interactions: Sequence[SpecificInteraction] = SPECIFIC_INTERACTIONS,
     ) -> None:
         self._general_rules = tuple(general_rules)

@@ -12,8 +12,10 @@ import ast
 import inspect
 
 from lol_reasoner.knowledge.loader import load_all_champions
-from lol_reasoner.reasoning.rules import general
+from lol_reasoner.reasoning.rules import general, stacking
 from lol_reasoner.reasoning.rules.specific import MAX_SPECIFIC_INTERACTIONS, SPECIFIC_INTERACTIONS
+
+_GENERAL_MODULES = (general, stacking)
 
 
 def _all_champion_identifiers() -> set[str]:
@@ -40,24 +42,47 @@ def _string_literals(module) -> set[str]:
 
 def test_general_rules_module_has_no_champion_literals():
     forbidden = _all_champion_identifiers()
-    literals = _string_literals(general)
-    hit = forbidden & literals
-    assert not hit, f"reasoning/rules/general.py contiene literales de campeón: {hit}"
+    for module in _GENERAL_MODULES:
+        literals = _string_literals(module)
+        hit = forbidden & literals
+        assert not hit, f"{module.__name__} contiene literales de campeón: {hit}"
+
+
+_CHAMPION_LIKE_NAMES = {"candidate", "enemy"}
+
+
+def _is_champion_id_access(node: ast.AST) -> bool:
+    """True si `node` es `<algo>.id` donde `<algo>` es un campeón
+    (`ctx.candidate`/`ctx.enemy`/una variable `candidate`/`enemy`), no
+    cualquier otro objeto con un `.id` propio (p. ej. una
+    `StackingMechanic.id`, que es un identificador de mecánica, no de
+    campeón)."""
+
+    if not (isinstance(node, ast.Attribute) and node.attr == "id"):
+        return False
+    base = node.value
+    if isinstance(base, ast.Attribute):
+        return base.attr in _CHAMPION_LIKE_NAMES
+    if isinstance(base, ast.Name):
+        return base.id in _CHAMPION_LIKE_NAMES
+    return False
 
 
 def test_general_rules_do_not_branch_on_champion_id():
     """Ninguna regla general puede comparar `.id` de un campeón: eso sería una
     tabla A-vs-B disfrazada de regla general. Leer `.name` para armar texto
     legible (p. ej. f"{ctx.candidate.name} tiene...") sí está permitido: no
-    afecta ninguna decisión de control de flujo ni de score."""
+    afecta ninguna decisión de control de flujo ni de score. Comparar el
+    `.id` de otro tipo de objeto (p. ej. `StackingMechanic.id`) tampoco es
+    lo que este guardrail prohíbe."""
 
-    source = inspect.getsource(general)
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Compare):
-            for side in [node.left, *node.comparators]:
-                if isinstance(side, ast.Attribute) and side.attr == "id":
-                    raise AssertionError("una regla general compara `.id` de un campeón (tabla A-vs-B disfrazada)")
+    for module in _GENERAL_MODULES:
+        tree = ast.parse(inspect.getsource(module))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                for side in [node.left, *node.comparators]:
+                    if _is_champion_id_access(side):
+                        raise AssertionError(f"{module.__name__} compara `.id` de un campeón (tabla A-vs-B disfrazada)")
 
 
 def test_specific_interactions_capped():

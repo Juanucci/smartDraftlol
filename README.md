@@ -16,17 +16,25 @@ el **motor de razonamiento** que sostendría todo lo demás.
 
 ## Alcance exacto de esta primera implementación
 
-Esta entrega es el primer hito de la V0: validar el flujo completo del motor
-con **dos campeones** (Darius y Mordekaiser), en ambas direcciones de
+Esta entrega cubre los hitos 1 y 1.5 de la V0: validar el flujo completo del
+motor con **dos campeones** (Darius y Mordekaiser), en ambas direcciones de
 matchup, antes de cargar los ocho restantes (Garen, Jax, Fiora, Renekton,
-Malphite, Ornn, Gwen, Kennen).
+Malphite, Ornn, Gwen, Kennen). El hito 1.5 refactorizó el modelo de
+conocimiento (schema v2, ver `docs/decisiones-tecnicas.md` §11) porque el
+del hito 1 era demasiado limitado: una habilidad solo podía tener un efecto,
+y dos afirmaciones del conocimiento resultaron directamente falsas.
 
 **Sí incluye:**
-- Propiedades semánticas de los campeones (ejes, tags, tipo de daño).
-- Efectos de habilidades e interacciones entre kits.
-- Patrones de trade, ventanas de cooldown, fortalezas/vulnerabilidades.
+- Propiedades semánticas de los campeones (ejes, mecánicas de acumulación,
+  recurso de lanzamiento).
+- Habilidades con **múltiples efectos estructurados** (`Effect`: tipo,
+  magnitud, condiciones, tipo de daño) e interacciones entre kits derivadas
+  de esos efectos, no de tags precargados.
+- Mecánicas de acumulación (`StackingMechanic`: umbral, fuentes, recompensa)
+  como objeto de primera clase, comparables entre campeones sin nombrarlos.
+- Patrones de trade (`tactical_uses` por habilidad) y ventanas de cooldown.
 - Cambios entre 4 fases de progresión: `early_lane`, `level_6`, `first_item`,
-  `side_lane_late`.
+  `side_lane_late`, con `available_from` cumplido estructuralmente.
 - Exigencia de ejecución y condiciones que podrían invertir la conclusión.
 - Ranking global y personal (ajustado por dominio del usuario), desglose por
   factor, confianza, razones/riesgos/condiciones/información faltante, todo
@@ -52,7 +60,7 @@ concreto, el motor lo señala explícitamente como información faltante (ver
 concreto de League of Legends.** Es una lectura cualitativa propia, pensada
 para poner a prueba la arquitectura del motor de razonamiento — no para
 ofrecer una recomendación competitiva actualizada. `knowledge_version`
-(`"0.1.0"`) es la versión **interna de esta base de datos**, no un número de
+(`"0.2.0"`) es la versión **interna de esta base de datos**, no un número de
 parche de LoL. La validación de kits contra fuentes actuales y el soporte de
 parches quedan como una etapa posterior independiente (ver
 `docs/backlog-v1.md`).
@@ -62,24 +70,26 @@ parches quedan como una etapa posterior independiente (ver
 ```
 src/lol_reasoner/
 ├── domain/            # Entidades: Champion, MatchupQuery, Recommendation...
-│   ├── enums.py        # Vocabulario cerrado: Axis, Tag, EffectKind, Phase, Factor...
-│   ├── champion.py      # Champion, AbilityEffect, PowerSpike, DamageProfile
+│   ├── enums.py        # Vocabulario cerrado: Axis, EffectType, TacticalUse, Phase, Factor...
+│   ├── champion.py      # Champion, Ability, Effect, StackingMechanic, PowerSpike
 │   ├── query.py          # MatchupQuery (entrada)
 │   └── result.py          # Recommendation, RecommendationSet, ReasonItem... (salida)
 │
 ├── knowledge/         # Base de conocimiento estructurada
-│   ├── champions/*.yaml  # Un YAML por campeón, comentado
+│   ├── champions/*.yaml  # Un YAML por campeón, comentado — schema v2
 │   ├── schema.py          # Validación manual (sin dependencias extra)
 │   └── loader.py           # YAML -> Champion
 │
 ├── reasoning/         # El motor de razonamiento
-│   ├── context.py       # ReasoningContext (candidato, enemigo, fase)
+│   ├── context.py       # ReasoningContext: candidate_abilities()/enemy_abilities() filtradas por fase
 │   ├── trace.py           # TraceEntry, ReasoningTrace — la evidencia
 │   ├── engine.py            # RuleEngine: reglas -> TraceEntry
 │   └── rules/
 │       ├── base.py           # Rule, RuleEffect
 │       ├── general.py          # Reglas generales (sin nombres de campeón)
-│       └── specific.py           # Excepciones puntuales, justificadas y acotadas
+│       ├── stacking.py           # StackRaceRule + derivación de StackingMechanic
+│       ├── specific.py             # Excepciones puntuales, justificadas y acotadas (hoy: vacío)
+│       └── registry.py               # Registro combinado + universo de categorías
 │
 ├── scoring/           # GlobalScore, PersonalScore, Confidence
 │   ├── weights.py        # Pesos centralizados (config/weights.yaml)
@@ -114,22 +124,28 @@ sustentan (ver `tests/test_trace_integrity.py`).
 
 ### Reglas generales vs. excepciones específicas
 
-Las reglas de `reasoning/rules/general.py` **no pueden mencionar un campeón
-por nombre**: solo leen ejes (`axes`), tags cualitativos (`tags`), tipo de
-daño (`damage_profile`) y efectos de habilidad (`kind`, `counters`,
-`countered_by`, `cooldown_class`). Esto es lo que impide que el motor
-degenere en una tabla de 90 resultados hardcodeados: `tests/test_no_hardcoded_pairs.py`
-escanea el AST del archivo y falla si aparece un literal con el id o nombre
-de un campeón, o una comparación contra `.id`.
+Las reglas de `reasoning/rules/general.py` y `reasoning/rules/stacking.py`
+**no pueden comparar el `.id` de un campeón contra un literal**: leen ejes
+(`axes`), `casting_resource`, y sobre todo `effects`/`tactical_uses` de las
+habilidades disponibles en la fase actual — siempre a través de
+`ctx.candidate_abilities()`/`ctx.enemy_abilities()`, nunca
+`champion.abilities` directo. Esto es lo que impide que el motor degenere
+en una tabla de 90 resultados hardcodeados: `tests/test_no_hardcoded_pairs.py`
+escanea el AST de ambos archivos y falla si aparece un literal con el id o
+nombre de un campeón, o una comparación contra `.id`; `tests/test_phase_availability.py`
+hace lo mismo para el acceso directo a `.abilities`.
 
-`reasoning/rules/specific.py` permite un número acotado (≤10, hoy hay 2) de
+`reasoning/rules/specific.py` permite un número acotado (≤10) de
 excepciones entre **habilidades concretas** de dos campeones concretos,
 cuando existe una interacción real que las reglas genéricas no pueden
-capturar (p. ej.: el daño verdadero de *Noxian Guillotine* ignora por
-definición el escudo de *Indestructible*, aunque el tag general
-`defensive_stance` sugeriría que sí lo mitiga). Cada excepción exige una
-`justification` explicando por qué el cruce genérico no alcanza, y una
-`condition` bajo la cual se sostiene.
+capturar. Hoy está **vacío**: las dos excepciones del hito 1 (que el daño
+verdadero ignora escudos, que un escudo revierte cargas de acumulación)
+resultaron ser afirmaciones falsas, no interacciones que las reglas
+generales no pudieran capturar. Al modelar `Effect.damage_type` y
+`SHIELD_FROM_STORED`/`CONVERT_SHIELD_TO_HEAL` estructuralmente, ambas
+quedaron cubiertas por reglas generales sin necesitar ninguna excepción —
+que el módulo pueda quedar vacío es, en sí, la validación del principio
+"primero las reglas generales".
 
 ### GlobalScore vs. PersonalScore
 
@@ -182,11 +198,11 @@ python -m lol_reasoner recommend --enemy Darius --candidates Mordekaiser --maste
 
 Produce, entre otras cosas: el `GlobalScore` y `PersonalScore` de
 Mordekaiser, el desglose por factor, el nivel de confianza y por qué, las
-ventajas mecánicas (p. ej. que *Indestructible* niega el patrón de daño
-sostenido de Darius) con el id de traza que las respalda, los riesgos (que
-*Darkness Rise* es específicamente vulnerable al daño verdadero de Darius),
-las condiciones que podrían cambiar la conclusión, y cómo cambia el panorama
-fase a fase.
+ventajas mecánicas (p. ej. que *Indestructible* puede absorber parte del
+daño de Darius, incluido su componente verdadero) con el id de traza que
+las respalda, los riesgos (que Mordekaiser llega después que Darius a su
+propio umbral de acumulación), las condiciones que podrían cambiar la
+conclusión, y cómo cambia el panorama fase a fase.
 
 ```bash
 python -m lol_reasoner recommend --enemy Mordekaiser --candidates Darius --mastery Darius=15
@@ -198,9 +214,14 @@ como enemigo, y produce razones, riesgos y confianza distintos.
 
 ## Limitaciones (honestas)
 
-- **Conocimiento no auditado**: los valores de ejes, tags y power spikes son
-  una lectura cualitativa propia sin validar contra parche, fuente estadística
-  ni comunidad. Ver `docs/decisiones-tecnicas.md`.
+- **Conocimiento no auditado**: los valores de ejes, efectos, mecánicas de
+  acumulación y power spikes son una lectura cualitativa propia sin validar
+  contra parche, fuente estadística ni comunidad. Ver `docs/decisiones-tecnicas.md`.
+- **`DisplacementVsMobilityRule` (G15) no dispara para este par**: tanto
+  Darius como Mordekaiser tienen `mobility=0`/`disengage=0`, así que la
+  regla que valora negar espacio al rival correctamente no encuentra nada
+  que negar. Es un resultado honesto (no hay ventaja marginal real ahí), no
+  vocabulario muerto — se espera que se active con campeones más móviles.
 - **Pesos sin calibrar**: `config/weights.yaml` refleja intuición de diseño,
   no datos. La curva de `required_skill` en `personal_score.py` es
   igualmente heurística.

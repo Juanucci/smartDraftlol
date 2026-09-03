@@ -1,15 +1,17 @@
-# Base de conocimiento semántica de Mordekaiser para lol_reasoner V0.
+# Base de conocimiento semántica de Mordekaiser para lol_reasoner — schema v2.
 #
 # knowledge_version es la versión INTERNA de esta base de datos, no un
 # parche de League of Legends. Estos valores son una lectura cualitativa
 # propia, no auditada contra ninguna fuente ni parche concreto. Ver
 # README > Limitaciones.
 
+schema_version: 2
+
 id: mordekaiser
 name: Mordekaiser
 archetype: juggernaut_duelist
 
-# Casi todo el daño de Mordekaiser es mágico (autos, Q, W, R).
+# Puramente descriptivo. Ninguna regla lee esto directamente.
 damage_profile:
   physical: 0.05
   magic: 0.95
@@ -18,11 +20,11 @@ damage_profile:
 axes:
   attack_range: 1        # melee corto
   mobility: 0              # sin ninguna forma de reposicionarse
-  sustain: 3                 # Darkness Rise + Indestructible generan mucho valor de "vida efectiva"
+  sustain: 3                 # Darkness Rise (aura) + Indestructible generan mucho valor de "vida efectiva"
   burst: 1                     # daño repartido en el tiempo, no explosivo
   sustained_dps: 3               # autos + Q multi-golpe sostenidos
-  cc: 1                             # Q aplica un slow leve; sin CC duro
-  durability: 4                       # HP alta + escudo pasivo + W lo hacen muy difícil de bajar 1v1
+  cc: 1                             # sin CC duro; solo el breve control de Death's Grasp
+  durability: 4                       # HP alta + escudo acumulable + W lo hacen muy difícil de bajar 1v1
   waveclear: 3                          # Q golpea en área, buen clear de wave
   early_pressure: 2                        # más lento para arrancar que un duelista clásico
   scaling: 4                                # mejora fuerte con niveles y con Realm of Death disponible
@@ -31,61 +33,157 @@ axes:
   ability_reliance: 3                                # gran parte de su valor de "1v1 garantizado" depende del R
   execution_demand: 2                                   # promedio: no requiere combos de precisión extrema
 
-trade_pattern: extended_trade
+casting_resource: resourceless
 
-tags:
-  - extended_fighter
-  - magic_damage_heavy
-  - sustained_dps_reliant
+# Descriptivo/resumen: puede pokear con Q, intercambiar corto con W, o
+# extender el intercambio para activar Darkness Rise. Las reglas NO leen
+# esto: inspeccionan `tactical_uses` de las habilidades concretas.
+trade_patterns:
+  - poke
+  - short_trade
+  - extended_trade
+
+tags: []
 
 abilities:
   - slot: P
     name: Darkness Rise
-    kind: shield
     cooldown_class: short
-    counters: []
-    countered_by:
-      - true_damage_source
     available_from: early_lane
-    note: >
-      Cada impacto de habilidad genera un escudo mágico acumulable. Es un
-      escudo convencional: como cualquier escudo, no reduce daño verdadero
-      por definición del tipo de daño, aunque su tag general de "shield"
-      sugeriría que sí lo hace frente a la mayoría de fuentes de daño.
+    effects:
+      - type: stack_application
+        magnitude: 1
+        conditions: [on_hit]
+        feeds_stack: darkness_rise
+    doc: >
+      La pasiva en sí. NO es un escudo: acumula cargas a partir de ataques
+      y habilidades relevantes (stacking_mechanics.darkness_rise) y, al
+      activarse tras 3 impactos válidos, genera un aura de daño y
+      velocidad de movimiento (ver reward_effects). No es específicamente
+      vulnerable al daño verdadero: como cualquier fuente de daño, un
+      escudo puede o no estar de por medio según la habilidad concreta que
+      lo aplique, no según su tipo.
+
+  - slot: Q
+    name: Obliterate
+    cooldown_class: medium
+    available_from: early_lane
+    tactical_uses: [poke, waveclear]
+    effects:
+      - type: damage
+        magnitude: 3
+        damage_type: magic
+      - type: damage
+        magnitude: 4
+        damage_type: magic
+        conditions: [on_isolated_target]
+        doc: "Daño aumentado si conecta sobre un objetivo aislado (sin otros campeones cerca)."
+      - type: stack_application
+        magnitude: 1
+        conditions: [on_hit]
+        feeds_stack: darkness_rise
+    doc: >
+      Sin coste de maná: permite poke y trades repetidos sin un presupuesto
+      tradicional de recurso (ver casting_resource a nivel de campeón). NO
+      aplica slow. Tiene zona y alcance definidos, con una ventana de
+      ejecución/esquive real — no modelada numéricamente en esta V0.
 
   - slot: W
     name: Indestructible
-    kind: defensive_stance
     cooldown_class: medium
-    counters:
-      - auto_attack_reliant
-      - sustained_dps_reliant
-    countered_by: []
     available_from: early_lane
-    note: >
-      Convierte un porcentaje del daño recibido durante su duración en un
-      escudo temporal; niega directamente patrones de daño sostenido o
-      basado en auto-ataques mientras está activa.
+    tactical_uses: [sustain, trade_cut]
+    effects:
+      - type: shield_from_stored
+        magnitude: 3
+        doc: >
+          Mordekaiser acumula un escudo POTENCIAL a partir del daño que
+          inflige y recibe. La primera activación convierte lo acumulado
+          en escudo real: no es un escudo instantáneo ni convierte de
+          inmediato todo el daño recibido en curación.
+      - type: convert_shield_to_heal
+        magnitude: 2
+        conditions: [on_reactivation]
+        doc: "La reactivación consume el escudo restante para recuperar vida."
+    doc: >
+      No elimina ni revierte cargas de una StackingMechanic rival ya
+      aplicadas (p. ej. Hemorrhage): solo absorbe/convierte daño desde el
+      momento en que está activa hacia adelante. Su valor depende de
+      cuánto escudo potencial se haya acumulado y del momento de
+      activación, no es un bloqueo total garantizado.
+
+  - slot: E
+    name: Death's Grasp
+    cooldown_class: medium
+    available_from: early_lane
+    tactical_uses: [initiate, setup_combo]
+    effects:
+      - type: magic_penetration
+        magnitude: 1
+        doc: "Componente pasivo de penetración mágica (sin porcentaje concreto en esta V0)."
+      - type: displace_enemy
+        magnitude: 2
+        conditions: [on_delay]
+        doc: "Pull retardado: la activación no es instantánea."
+      - type: brief_cc
+        magnitude: 1
+      - type: interrupt
+        magnitude: 1
+      - type: stack_application
+        magnitude: 1
+        conditions: [on_hit]
+        feeds_stack: darkness_rise
+    doc: >
+      Puede iniciar, reposicionar al rival e interrumpir, pero acertarla es
+      condicional al retardo de su activación: fallarla cierra la ventana
+      de trade en vez de abrirla.
 
   - slot: R
     name: Realm of Death
-    kind: isolation
     cooldown_class: long
-    counters: []
-    countered_by: []
     available_from: level_6
-    note: >
-      Arrastra a Mordekaiser y a un objetivo a una dimensión aislada
-      durante varios segundos: ninguno de los dos puede recibir ayuda ni
-      ser afectado por terceros mientras dura.
+    effects:
+      - type: isolate_duel
+        magnitude: 2
+        doc: >
+          Aísla a ambos campeones en una dimensión separada. En esta V0 el
+          contexto YA es un 1v1: no se modelan aliados ni jungla, así que
+          este efecto en sí mismo no debe generar ningún delta de score
+          por "evitar ayuda externa" — no hay ayuda externa que perder en
+          la consulta. Ver IsolationRule.
+      - type: stat_steal
+        magnitude: 3
+        doc: "Roba una porción de estadísticas del objetivo mientras dura."
+      - type: restrict_arena
+        magnitude: 2
+        doc: "Modifica el espacio disponible del duelo (geometría distinta a la lane abierta)."
+    doc: >
+      Disponible desde nivel 6. La amenaza real dentro del contexto
+      modelado (1v1 puro) viene del robo de estadísticas y de la geometría
+      restringida del duelo, no de negar ayuda externa que la consulta
+      nunca contuvo.
+
+stacking_mechanics:
+  - id: darkness_rise
+    name: Darkness Rise
+    threshold: 3
+    stacks_per_application: 1
+    applied_by: [basic_attack, Q, E]
+    reward_name: Darkness Rise (aura)
+    reward_effects:
+      - type: aura_damage
+        magnitude: 2
+        damage_type: magic
+      - type: movement_speed
+        magnitude: 2
 
 spikes:
   - phase: early_lane
     magnitude: 2
-    reason: "Arranca más lento que Darius; su valor de lane sube recién con más niveles de W/Q."
+    reason: "Arranca más lento que Darius; su valor de lane sube recién con más impactos que activan Darkness Rise."
   - phase: level_6
     magnitude: 3
-    reason: "Realm of Death garantiza un 1v1 aislado, un salto de poder importante."
+    reason: "Realm of Death agrega robo de estadísticas y un duelo en espacio restringido."
   - phase: first_item
     magnitude: 3
     reason: "Su progresión de poder temprana lo vuelve considerablemente más difícil de bajar."
@@ -93,14 +191,4 @@ spikes:
     magnitude: 4
     reason: "Escala muy bien y es especialmente temido en side lane 1v1 en fases tardías."
 
-strengths:
-  - "Muy difícil de sacar de una pelea prolongada una vez que está en rango de golpear."
-  - "Indestructible niega directamente patrones de daño sostenido o basado en auto-ataques."
-  - "Realm of Death garantiza un 1v1 aislado sin intervención externa desde nivel 6."
-
-vulnerabilities:
-  - "Sin ninguna forma de reposicionarse ni de escapar si el rival logra alcanzarlo antes de tiempo."
-  - "Su escudo pasivo, como cualquier escudo, no mitiga daño verdadero por definición del tipo de daño."
-  - "Depende en buena medida de Realm of Death para garantizar el 1v1; antes de nivel 6 es más vulnerable."
-
-knowledge_version: "0.1.0"
+knowledge_version: "0.2.0"

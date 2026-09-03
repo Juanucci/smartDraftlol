@@ -41,4 +41,12 @@ def personal_score(
 
 
 def conditional_entry_count(trace: ReasoningTrace) -> int:
-    return sum(1 for e in trace.entries if e.polarity == Polarity.CONDITIONAL)
+    """Cantidad de CONDICIONES DISTINTAS (no de entradas) de las que
+    depende el plan del candidato. Varias entradas CONDITIONAL que
+    repiten la misma condición en distintas fases (p. ej. un hecho
+    estructural del kit que no cambia fase a fase) no deben penalizar
+    `required_skill` una vez por fase — la generación de varias copias
+    de la misma condición es un detalle de implementación de la traza,
+    no una condición nueva."""
+
+    return len({e.condition for e in trace.entries if e.polarity == Polarity.CONDITIONAL and e.condition})
