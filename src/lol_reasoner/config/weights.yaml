@@ -1,0 +1,32 @@
+# Pesos centralizados del motor de scoring. Todos heurísticos (ver
+# docs/decisiones-tecnicas.md): no están calibrados contra datos reales,
+# solo reflejan qué tan seguido queremos que un factor mueva el resultado
+# final en esta V0.
+
+factors:
+  mechanical_interaction: 1.0
+  lane_pattern: 0.85
+  reliability: 0.6
+  power_spikes: 0.7
+  scaling_sidelane: 0.7
+  execution_demand: 0.5
+
+phases:
+  early_lane: 1.0
+  level_6: 0.9
+  first_item: 0.8
+  side_lane_late: 0.8
+
+# GlobalScore = clamp(50 + scale * sum(phase_w * factor_w * signed_delta), 0, 100)
+global_scale: 12.0
+
+# PersonalScore = clamp(global_score + execution_sensitivity * gap/100, 0, 100)
+# donde gap = mastery - required_skill, y
+# required_skill = base_required_skill
+#                  + execution_demand_weight * axes.execution_demand
+#                  + reliability_penalty_weight * n_entradas_condicionales_del_candidato
+personal:
+  execution_sensitivity: 22.0
+  base_required_skill: 25.0
+  execution_demand_weight: 9.0
+  reliability_penalty_weight: 5.0

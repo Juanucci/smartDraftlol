@@ -1,0 +1,106 @@
+# Base de conocimiento semántica de Mordekaiser para lol_reasoner V0.
+#
+# knowledge_version es la versión INTERNA de esta base de datos, no un
+# parche de League of Legends. Estos valores son una lectura cualitativa
+# propia, no auditada contra ninguna fuente ni parche concreto. Ver
+# README > Limitaciones.
+
+id: mordekaiser
+name: Mordekaiser
+archetype: juggernaut_duelist
+
+# Casi todo el daño de Mordekaiser es mágico (autos, Q, W, R).
+damage_profile:
+  physical: 0.05
+  magic: 0.95
+  "true": 0.0
+
+axes:
+  attack_range: 1        # melee corto
+  mobility: 0              # sin ninguna forma de reposicionarse
+  sustain: 3                 # Darkness Rise + Indestructible generan mucho valor de "vida efectiva"
+  burst: 1                     # daño repartido en el tiempo, no explosivo
+  sustained_dps: 3               # autos + Q multi-golpe sostenidos
+  cc: 1                             # Q aplica un slow leve; sin CC duro
+  durability: 4                       # HP alta + escudo pasivo + W lo hacen muy difícil de bajar 1v1
+  waveclear: 3                          # Q golpea en área, buen clear de wave
+  early_pressure: 2                        # más lento para arrancar que un duelista clásico
+  scaling: 4                                # mejora fuerte con niveles y con Realm of Death disponible
+  all_in: 4                                    # una vez dentro de rango, es muy difícil de sacar
+  disengage: 0                                    # no tiene salida si el rival logra alcanzarlo
+  ability_reliance: 3                                # gran parte de su valor de "1v1 garantizado" depende del R
+  execution_demand: 2                                   # promedio: no requiere combos de precisión extrema
+
+trade_pattern: extended_trade
+
+tags:
+  - extended_fighter
+  - magic_damage_heavy
+  - sustained_dps_reliant
+
+abilities:
+  - slot: P
+    name: Darkness Rise
+    kind: shield
+    cooldown_class: short
+    counters: []
+    countered_by:
+      - true_damage_source
+    available_from: early_lane
+    note: >
+      Cada impacto de habilidad genera un escudo mágico acumulable. Es un
+      escudo convencional: como cualquier escudo, no reduce daño verdadero
+      por definición del tipo de daño, aunque su tag general de "shield"
+      sugeriría que sí lo hace frente a la mayoría de fuentes de daño.
+
+  - slot: W
+    name: Indestructible
+    kind: defensive_stance
+    cooldown_class: medium
+    counters:
+      - auto_attack_reliant
+      - sustained_dps_reliant
+    countered_by: []
+    available_from: early_lane
+    note: >
+      Convierte un porcentaje del daño recibido durante su duración en un
+      escudo temporal; niega directamente patrones de daño sostenido o
+      basado en auto-ataques mientras está activa.
+
+  - slot: R
+    name: Realm of Death
+    kind: isolation
+    cooldown_class: long
+    counters: []
+    countered_by: []
+    available_from: level_6
+    note: >
+      Arrastra a Mordekaiser y a un objetivo a una dimensión aislada
+      durante varios segundos: ninguno de los dos puede recibir ayuda ni
+      ser afectado por terceros mientras dura.
+
+spikes:
+  - phase: early_lane
+    magnitude: 2
+    reason: "Arranca más lento que Darius; su valor de lane sube recién con más niveles de W/Q."
+  - phase: level_6
+    magnitude: 3
+    reason: "Realm of Death garantiza un 1v1 aislado, un salto de poder importante."
+  - phase: first_item
+    magnitude: 3
+    reason: "Su progresión de poder temprana lo vuelve considerablemente más difícil de bajar."
+  - phase: side_lane_late
+    magnitude: 4
+    reason: "Escala muy bien y es especialmente temido en side lane 1v1 en fases tardías."
+
+strengths:
+  - "Muy difícil de sacar de una pelea prolongada una vez que está en rango de golpear."
+  - "Indestructible niega directamente patrones de daño sostenido o basado en auto-ataques."
+  - "Realm of Death garantiza un 1v1 aislado sin intervención externa desde nivel 6."
+
+vulnerabilities:
+  - "Sin ninguna forma de reposicionarse ni de escapar si el rival logra alcanzarlo antes de tiempo."
+  - "Su escudo pasivo, como cualquier escudo, no mitiga daño verdadero por definición del tipo de daño."
+  - "Depende en buena medida de Realm of Death para garantizar el 1v1; antes de nivel 6 es más vulnerable."
+
+knowledge_version: "0.1.0"

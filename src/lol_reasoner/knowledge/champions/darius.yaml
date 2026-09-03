@@ -1,0 +1,111 @@
+# Base de conocimiento semántica de Darius para lol_reasoner V0.
+#
+# knowledge_version es la versión INTERNA de esta base de datos, no un
+# parche de League of Legends. Estos valores son una lectura cualitativa
+# propia, no auditada contra ninguna fuente ni parche concreto: sirven
+# para validar la arquitectura del motor de razonamiento, no como
+# recomendación competitiva actualizada. Ver README > Limitaciones.
+
+id: darius
+name: Darius
+archetype: bruiser_duelist_stacking
+
+# Mezcla orientativa del daño que inflige (no un cálculo real de mitigación).
+# El grueso es físico (autos + Hemorrhage); el R agrega una porción de
+# daño verdadero relevante como ejecución.
+damage_profile:
+  physical: 0.8
+  magic: 0.0
+  "true": 0.2
+
+# Ejes 0..4 = ninguno/bajo/medio/alto/extremo.
+axes:
+  attack_range: 1        # melee corto
+  mobility: 1             # sin dash; Apprehend es un tirón, no reposicionamiento propio
+  sustain: 2               # W (Decimate/Crippling Strike da AS decreciente + algo de heal on-hit)
+  burst: 1                  # su daño es acumulativo, no explosivo
+  sustained_dps: 4          # Hemorrhage se acumula con cada golpe, hasta 5 cargas
+  cc: 2                       # slow de Apprehend, sin CC duro además de eso
+  durability: 3                 # HP base alta, buen bruiser tanque-ish
+  waveclear: 2                    # Decimate limpia bien pero no es un waveclear extremo
+  early_pressure: 4                  # muy fuerte desde nivel 1-3
+  scaling: 2                            # escala pero es menos dominante tarde que en lane
+  all_in: 4                                # su plan central ES el all-in prolongado
+  disengage: 0                               # no tiene forma de desconectar
+  ability_reliance: 2                          # fuerte incluso sin combos perfectos
+  execution_demand: 2                             # promedio: hay timing en Q reset, no es extremo
+
+trade_pattern: extended_trade
+
+tags:
+  - extended_fighter
+  - physical_damage_heavy
+  - true_damage_source
+  - stacking_mechanic
+  - auto_attack_reliant
+  - sustained_dps_reliant
+  - hard_cc
+
+abilities:
+  - slot: P
+    name: Hemorrhage
+    kind: stacking_dot
+    cooldown_class: short
+    counters: []
+    countered_by: []
+    available_from: early_lane
+    note: >
+      Cada golpe (auto o E) aplica una carga de sangrado que se refresca y
+      escala hasta 5 cargas; morir con 5 cargas activa la pasiva de Noxus.
+      Es el corazón del patrón de trade extendido de Darius.
+
+  - slot: E
+    name: Apprehend
+    kind: gap_closer
+    cooldown_class: medium
+    counters: []
+    countered_by: []
+    available_from: early_lane
+    note: >
+      Tirón + slow en área que jala a los enemigos hacia Darius y aplica
+      una carga de Hemorrhage; funciona como su única herramienta de
+      control de espacio y de anti-kite parcial.
+
+  - slot: R
+    name: Noxian Guillotine
+    kind: true_damage_execute
+    cooldown_class: long
+    counters: []
+    countered_by: []
+    available_from: level_6
+    note: >
+      Daño verdadero que escala con la vida faltante del objetivo; su
+      cooldown se resetea al conseguir el remate. Al ser daño verdadero,
+      no es mitigado por reducciones de daño convencionales ni por
+      escudos genéricos.
+
+spikes:
+  - phase: early_lane
+    magnitude: 4
+    reason: "Presión de nivel 1-3 muy alta gracias a Hemorrhage + Apprehend."
+  - phase: level_6
+    magnitude: 3
+    reason: "Noxian Guillotine agrega una amenaza de ejecución y remate en cadena."
+  - phase: first_item
+    magnitude: 2
+    reason: "Se beneficia de progresión de poder temprana, pero no depende de un objeto puntual para funcionar."
+  - phase: side_lane_late
+    magnitude: 2
+    reason: "Sigue siendo peligroso en un 1v1 side lane, pero pierde parte de su ventaja relativa de early game."
+
+strengths:
+  - "Presión de lane temprana muy alta si el rival se queda dentro del alcance de Apprehend."
+  - "El daño acumulado de Hemorrhage castiga intercambios largos y descuidados."
+  - "Noxian Guillotine agrega una amenaza de remate que ignora resistencias convencionales."
+
+vulnerabilities:
+  - "Sin dash ni forma de cerrar distancia si el rival mantiene espacio de forma consistente."
+  - "Depende de mantenerse dentro de rango de auto-ataque para acumular Hemorrhage; kite sostenido licua su plan."
+  - "Apprehend tiene cooldown medio: fuera de esa ventana, su control de espacio cae notablemente."
+
+knowledge_version: "0.1.0"
