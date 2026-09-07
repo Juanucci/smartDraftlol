@@ -131,6 +131,13 @@ abilities:
         magnitude: 1
       - type: interrupt
         magnitude: 2
+        doc: >
+          Control breve, no una interrupción garantizada de cualquier
+          acción rival: solo tendría efecto sobre una acción explícitamente
+          interrumpible (p. ej. un canalizado). Mordekaiser no tiene una de
+          esas en esta V0, así que este efecto queda condicionalmente
+          silencioso para este par. Un pull no cancela por definición un
+          ataque básico, un on-hit o una pasiva: NO niega Darkness Rise.
       - type: slow
         magnitude: 2
         conditions: [on_delay]

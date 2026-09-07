@@ -24,7 +24,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from lol_reasoner.domain.enums import Factor, Phase, Polarity
+from lol_reasoner.domain.enums import ConditionKind, Factor, Phase, Polarity
 from lol_reasoner.reasoning.context import ReasoningContext
 from lol_reasoner.reasoning.trace import FactRef
 
@@ -39,6 +39,22 @@ class RuleEffect:
     condition: str | None = None
     invalidated_if: str | None = None
     category: str | None = None  # si es None, el engine usa Rule.category
+    # Identifica la fuente mecánica exacta ("dueño:slot:effect_type") de
+    # la que nace este efecto. Dos RuleEffect (de la MISMA o de distinta
+    # regla) que citen el mismo causal_key para el mismo subject se
+    # deduplican en el cálculo del score (ver
+    # ReasoningTrace.deduped_for_scoring) — evita que una sola capacidad
+    # mecánica (p. ej. el escudo de Indestructible) produzca ventajas
+    # independientes solo porque dos reglas la explican con matices
+    # distintos, o porque la misma regla la repite idéntica en varias
+    # fases. None (por defecto) = nunca se deduplica: el comportamiento
+    # de reglas basadas en ejes (sin una única fuente de efecto) no cambia.
+    causal_key: str | None = None
+    # Solo tiene sentido en entradas CONDITIONAL: de qué tipo de
+    # incertidumbre se trata (ver domain.enums.ConditionKind). Determina
+    # si esta condición puede subir required_skill (solo EXECUTION) o
+    # alimentar volatilidad (STRATEGIC) — nunca ambas.
+    condition_kind: ConditionKind | None = None
 
 
 class Rule(ABC):

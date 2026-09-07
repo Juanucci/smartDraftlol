@@ -16,13 +16,18 @@ el **motor de razonamiento** que sostendría todo lo demás.
 
 ## Alcance exacto de esta primera implementación
 
-Esta entrega cubre los hitos 1 y 1.5 de la V0: validar el flujo completo del
-motor con **dos campeones** (Darius y Mordekaiser), en ambas direcciones de
-matchup, antes de cargar los ocho restantes (Garen, Jax, Fiora, Renekton,
-Malphite, Ornn, Gwen, Kennen). El hito 1.5 refactorizó el modelo de
-conocimiento (schema v2, ver `docs/decisiones-tecnicas.md` §11) porque el
-del hito 1 era demasiado limitado: una habilidad solo podía tener un efecto,
-y dos afirmaciones del conocimiento resultaron directamente falsas.
+Esta entrega cubre los hitos 1, 1.5 y 1.6 de la V0: validar el flujo
+completo del motor con **dos campeones** (Darius y Mordekaiser), en ambas
+direcciones de matchup, antes de cargar los ocho restantes (Garen, Jax,
+Fiora, Renekton, Malphite, Ornn, Gwen, Kennen). El hito 1.5 refactorizó el
+modelo de conocimiento (schema v2, ver `docs/decisiones-tecnicas.md` §11)
+porque el del hito 1 era demasiado limitado: una habilidad solo podía
+tener un efecto, y dos afirmaciones del conocimiento resultaron
+directamente falsas. El hito 1.6 (`docs/decisiones-tecnicas.md` §12)
+corrigió un bug de reciprocidad en cuatro reglas generales, eliminó una
+inferencia falsa (`INTERRUPT` negando cargas de acumulación), introdujo
+`causal_key` para deduplicar score sin perder trazabilidad, y separó
+confianza epistémica de volatilidad/condicionalidad.
 
 **Sí incluye:**
 - Propiedades semánticas de los campeones (ejes, mecánicas de acumulación,
@@ -145,34 +150,61 @@ generales no pudieran capturar. Al modelar `Effect.damage_type` y
 `SHIELD_FROM_STORED`/`CONVERT_SHIELD_TO_HEAL` estructuralmente, ambas
 quedaron cubiertas por reglas generales sin necesitar ninguna excepción —
 que el módulo pueda quedar vacío es, en sí, la validación del principio
-"primero las reglas generales".
+"primero las reglas generales". Sigue vacío en el hito 1.6: la inferencia
+falsa "un `INTERRUPT`/pull niega una carga de acumulación rival"
+(`MitigationAndDisruptionRule`) se eliminó por ser incorrecta, no
+reemplazada por una excepción puntual (ver `docs/decisiones-tecnicas.md`
+§12.2).
 
 ### GlobalScore vs. PersonalScore
 
-- **GlobalScore**: suma, por fase y por factor, los deltas de la traza
-  (`PRO`=+1, `CONTRA`=-1, `CONDITIONAL`=0 — una ventaja puramente condicional
-  no debe inflar el número, solo aparecer como condición textual), ponderados
-  por `config/weights.yaml`. **Nunca lee `mastery`.**
+- **GlobalScore**: suma, por fase y por factor, los deltas de la traza ya
+  **deduplicados por `causal_key`** (`ReasoningTrace.deduped_for_scoring`:
+  cuando dos `TraceEntry` describen la misma fuente mecánica exacta —
+  misma habilidad, mismo efecto, aunque las cuente una regla distinta o la
+  misma regla en otra fase — se colapsan a una sola contribución de
+  score, sin perder ninguna de las dos en la traza completa que ve el
+  usuario). `PRO`=+1, `CONTRA`=-1, `CONDITIONAL`=0 — una ventaja puramente
+  condicional no debe inflar el número, solo aparecer como condición
+  textual —, ponderados por `config/weights.yaml`. **Nunca lee `mastery`
+  ni `execution_demand`.**
 - **PersonalScore**: parte del GlobalScore y lo ajusta comparando el
-  `mastery` (0-100) contra una `required_skill` derivada del propio
-  candidato (`execution_demand` + cantidad de entradas condicionales de su
-  plan). Un counter teórico con mastery 0 puede seguir siendo el mejor pick
-  *global* sin ser el mejor pick *personal*.
+  `mastery` de un `PlayerProfile` (hoy solo ese campo; interfaz pensada
+  para agregar después partidas jugadas, winrate personal, recencia,
+  experiencia en el rol) contra una `required_skill` derivada del
+  `execution_demand` del propio candidato y de cuántas condiciones
+  **`ConditionKind.EXECUTION`** distintas trae su plan — nunca de
+  información faltante ni de incertidumbre estratégica (ver Confianza,
+  abajo). Un counter teórico con mastery 0 puede seguir siendo el mejor
+  pick *global* sin ser el mejor pick *personal*.
 
 Ninguno de los dos números es una probabilidad de victoria: son un índice de
 adecuación mecánica de esta V0, y la CLI lo aclara en cada salida.
 
-### Confianza
+### Confianza: epistémica vs. volatilidad
 
-La confianza **no sube porque se dispararon muchas reglas**. Se calcula a
-partir de:
-1. **Cobertura de categorías mecánicas distintas** (no cantidad de entradas:
-   dos reglas de la misma categoría no suman cobertura extra).
-2. **Contradicción**: evidencia PRO y CONTRA de magnitud comparable en el
-   mismo factor (eso es, literalmente, un matchup condicional).
-3. **Información faltante** señalada por el motor (`invalidated_if`).
-4. **Densidad de entradas condicionales** (cuánto depende la conclusión de
-   una circunstancia particular).
+Desde el hito 1.6, "cuánto sabemos" y "cuánto puede cambiar la
+recomendación" son dos números independientes, clasificados por
+`domain.enums.ConditionKind`:
+
+- **Confianza epistémica** (`ConfidenceResult.score`): cobertura de
+  categorías mecánicas aplicables a este matchup — el denominador se
+  calcula con una **traza espejo** (candidato/enemigo invertidos), usada
+  solo para saber qué categorías eran relevantes, nunca expuesta ni
+  mezclada con el resultado del candidato — penalizada por
+  `ConditionKind.KNOWLEDGE_GAP` (información que el motor reconoce no
+  tener, p. ej. `ITEMGAP`). Una traza vacía da confianza epistémica 0.0 /
+  BAJA, sin piso artificial.
+- **Volatilidad/condicionalidad** (`ConfidenceResult.volatility_score`):
+  contradicción real (evidencia PRO y CONTRA de magnitud comparable en el
+  mismo `(fase, factor)` — un matchup genuinamente condicional) más
+  densidad de condiciones `ConditionKind.STRATEGIC` (depende de una
+  decisión/circunstancia de la partida, no de que falte información ni
+  de que el jugador ejecute algo).
+
+Que exista evidencia PRO y CONTRA sobre un mismo matchup **no** se
+interpreta automáticamente como ignorancia: es volatilidad, una señal
+distinta de "no tenemos el dato".
 
 ## Cómo ejecutarlo
 

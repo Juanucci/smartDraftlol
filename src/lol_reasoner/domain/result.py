@@ -33,13 +33,31 @@ class PhaseNote:
 
 @dataclass(frozen=True, slots=True)
 class Confidence:
-    level: str  # ConfidenceLevel.value
+    """Dos números independientes (hito 1.6): un matchup puede estar bien
+    comprendido (epistemia alta) y seguir siendo muy condicional
+    (volatilidad alta) al mismo tiempo."""
+
+    level: str  # ConfidenceLevel.value — epistémico
     score: float  # 0..1, heurístico — no es una probabilidad
     coverage_ratio: float
-    contradiction_count: int
     missing_info_count: int
-    conditional_count: int
+    volatility_level: str  # ConfidenceLevel.value
+    volatility_score: float  # 0..1
+    contradiction_count: int
+    strategic_condition_count: int
     explanation: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalScoreBreakdown:
+    """Explica PersonalScore sin pasar por TraceEntry falsos. Ver
+    scoring/personal_score.py."""
+
+    mastery: int | None
+    required_skill: float
+    execution_condition_count: int
+    gap: float
+    adjustment: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +67,7 @@ class Recommendation:
     global_score: float
     personal_score: float
     mastery: int | None
+    personal_breakdown: PersonalScoreBreakdown | None
     factor_breakdown: dict[str, float]
     confidence: Confidence
     reasons: tuple[ReasonItem, ...]

@@ -6,7 +6,10 @@ partida razonables para validar la arquitectura.
 
 Secciones 1-10: hito 1 (primera implementación, schema v1). Sección 11:
 hito 1.5 (refactor del modelo de conocimiento a schema v2 — mismo par de
-campeones, Darius y Mordekaiser).
+campeones, Darius y Mordekaiser). Sección 12: hito 1.6 (reciprocidad de
+reglas generales, causal_key/deduplicación de score, separación de
+confianza epistémica vs. volatilidad, y arquitectura provisional de
+PersonalScore).
 
 ## 1. Ejes semánticos 0..4, no 0..100
 
@@ -205,3 +208,140 @@ falta una.
 14 (13 en `general.py` + `StackRaceRule` en `stacking.py`). Es un límite
 deliberadamente estrecho para esta V0 con 2 campeones; se revisa
 explícitamente al incorporar los otros ocho.
+
+## 12. Hito 1.6 — reciprocidad, causal_key y confianza vs. volatilidad
+
+**12.1 — Bug de reciprocidad real, no solo hipotético.** La revisión del
+hito 1.5 detectó que `RangeAccessRule`, `EarlyPressureVsScalingRule`,
+`WaveclearGatingRule` y `DisplacementVsMobilityRule` solo implementaban
+la mitad de una comparación mecánica compartida: el lado favorecido
+recibía PRO como candidato, pero el mismo hecho nunca se traducía en
+CONTRA cuando ese lado quedaba del lado `enemy`. Que una regla "vuelva a
+ejecutarse" al invertir candidato/enemigo no prueba que produzca la
+amenaza correspondiente — cada mitad de la comparación necesita su
+propia rama de código, y se verificó empíricamente con campeones
+sintéticos (no solo auditando el código a ojo) antes de dar por
+corregido cada caso. Las cuatro reglas quedaron reescritas para calcular
+ambas direcciones (ver sus docstrings en `general.py`); `PokeVsSustainRule`
+se confirmó como el caso legítimamente no-recíproco (dos preguntas
+independientes, no un hecho compartido con dueño ambiguo).
+`tests/test_reciprocity.py` es el test dedicado: para cada regla
+corregida comprueba que el **mismo** `FactRef`/`causal_key` aparece con
+polaridad opuesta según de qué lado quede el campeón favorecido —no se
+conforma con "las dos trazas son distintas" (eso ya lo cubría
+`test_rules.py`).
+
+**12.2 — Eliminación de la inferencia falsa `INTERRUPT → niega
+STACK_APPLICATION`.** `MitigationAndDisruptionRule` cruzaba, de forma
+general, cualquier `INTERRUPT`/`BRIEF_CC`/`DISPLACE_ENEMY` contra
+cualquier `STACK_APPLICATION` rival y afirmaba que lo negaba. Un pull o
+un CC breve no cancela por definición un ataque básico, un efecto on-hit
+ni una pasiva — Death's Grasp y Apprehend no interrumpen Hemorrhage ni
+Darkness Rise. La regla se eliminó; los efectos reales de Death's
+Grasp/Apprehend (desplazamiento, penetración, control de espacio vía
+`DisplacementVsMobilityRule`) se conservan. `INTERRUPT` queda
+condicionalmente silencioso para este par (documentado en
+`test_vocabulary_alive.py`), no vocabulario muerto. El uso en reversa de
+Death's Grasp (Mordekaiser halándose a sí mismo) no se modela — es
+direccional/posicional, algo que esta base de conocimiento no
+representa — y queda en `docs/backlog-v1.md` como mecánica avanzada
+futura, no inferido vía `interrupt` ni generalizado como disengage.
+
+**12.3 — Crippling Strike sin score propio, pero visible en la carrera de
+stacks.** El reset de ataque y el slow de Crippling Strike (W de Darius)
+no generan una `RuleEffect`/score independiente: se citan como premisas
+(`AUTO_ATTACK_RESET`, `SLOW`) dentro de la misma entrada CONDITIONAL de
+`StackRaceRule` que compara umbrales estructurales, en ambas
+direcciones. Cuando Mordekaiser es candidato, el texto se lee
+explícitamente como riesgo ("aunque Mordekaiser activa Darkness Rise con
+menos impactos, el reset y la ralentización de Crippling Strike facilitan
+que Darius mantenga el intercambio…") — no un delta de score aparte por
+el slow, porque es la misma cadena causal.
+
+**12.4 — `ON_ISOLATED_TARGET` → `ON_SINGLE_TARGET_HIT`.** El nombre
+anterior sugería "sin campeones cerca" y se confundía con
+`EffectType.ISOLATE_DUEL` (Realm of Death). El significado real de
+Obliterate es "el impacto no se repartió con minions/otras unidades":
+`EffectCondition.ON_SINGLE_TARGET_HIT`, con un consumidor genérico nuevo
+(`DamageTypeAndShieldRule._single_target_bonus`, dentro de la regla
+fusionada G03) que produce una entrada CONDITIONAL bidireccional (PRO
+para Mordekaiser-candidato, riesgo para Darius-candidato), sin ventaja
+numérica firme, y que relaciona — sin hardcodear campeones — la
+condición con `ISOLATE_DUEL` desde `level_6` cuando ambos existen en el
+mismo par.
+
+**12.5 — Fusión G03+G04, escudo de Indestructible sin doble conteo.**
+`_shield_mitigation` (absorción genérica de cualquier daño, incluido
+verdadero) y `_damage_mitigation_of_sustained_plan` (el matiz de que
+además mitiga un plan de intercambio sostenido y puede convertir el
+remanente en curación) comparten `causal_key` sobre la misma habilidad:
+es la misma capacidad de absorción con dos matices, no dos ventajas. Se
+eliminó `trade_cut` de `tactical_uses` de Indestructible (no corta un
+intercambio por sí sola ni genera distancia: depende de posicionamiento
+y otras acciones) y se corrigió el comentario de `sustain` en el YAML
+(Darkness Rise no cura ni sostiene).
+
+**12.6 — `SpikeAlignmentRule` eliminada; `spikes`/`first_item` sin
+magnitud manual.** `spikes` queda como estructura descriptiva/futura —
+ninguna regla la lee, ninguna magnitud manual mueve score. Las
+afirmaciones `first_item=N` del hito anterior (una ventaja de objeto sin
+modelar objetos) se eliminaron sin reemplazo: `early_pressure` cubre la
+tendencia temprana, `scaling` la tardía, `available_from` los
+desbloqueos reales (p. ej. nivel 6). `ITEMGAP` sigue siendo el único
+aviso que aparece en la fase `first_item`.
+
+**12.7 — Denominador de cobertura de Confidence: traza espejo.** Antes,
+`compute_confidence` solo veía las categorías que dispararon en la
+traza del candidato — un candidato con poca evidencia (buena o mala)
+inflaba artificialmente su propia cobertura. Ahora se construye también
+`mirror_trace` (candidato/enemigo invertidos) exclusivamente para
+determinar qué categorías eran aplicables a este matchup
+(`ALL_CATEGORIES ∩ (categorías(trace) ∪ categorías(mirror_trace))`); el
+contenido de `mirror_trace` nunca se expone ni se mezcla con el
+resultado del candidato. Una traza vacía ahora da cobertura 0 y
+confianza epistémica 0.0/BAJA — antes un piso aditivo escondía este caso
+degenerado.
+
+**12.8 — `ConditionKind` separa confianza epistémica de
+volatilidad/condicionalidad.** Antes, cualquier entrada CONDITIONAL
+inflaba por igual "cuánto sabemos" y "cuánto puede cambiar la
+recomendación", mezclando falta de información con incertidumbre
+táctica legítima. `ConditionKind.EXECUTION` (depende de que el jugador
+ejecute algo) puede subir `required_skill` en PersonalScore.
+`ConditionKind.STRATEGIC` (depende de una decisión/circunstancia de la
+partida, no de ejecución) alimenta la volatilidad de Confidence, nunca
+`required_skill`. `ConditionKind.KNOWLEDGE_GAP` (el motor no tiene el
+dato, p. ej. `ITEMGAP`) reduce la confianza epistémica, no la
+volatilidad. Que exista evidencia PRO y CONTRA sobre el mismo matchup ya
+no se interpreta automáticamente como ignorancia: se cuenta como
+contradicción `(fase, factor)`, una señal de volatilidad distinta de
+"no tenemos el dato".
+
+**12.9 — `ExecutionDemandBaselineRule` eliminada de GlobalScore;
+`PlayerProfile`/`PersonalScoreBreakdown` como interfaz extensible.**
+GlobalScore mide adecuación mecánica asumiendo ejecución competente —
+nunca lee `execution_demand` ni ninguna variante de "cuán difícil es de
+ejecutar". Esa señal vive exclusivamente en PersonalScore
+(`required_skill`), junto con `execution_condition_count` (condiciones
+`EXECUTION` distintas, no todas las CONDITIONAL). `PlayerProfile` hoy
+solo trae `mastery`; su forma está pensada para agregar después partidas
+jugadas, winrate personal con tamaño de muestra, desempeño reciente,
+recencia y experiencia en el rol sin tocar la firma de
+`personal_score()` — no se inventan esos datos en este hito.
+
+**12.10 — Deltas y coeficientes: provisionales, no calibrados.** Los
+deltas reducidos y los coeficientes heurísticos de este hito (incluidos
+`config/weights.yaml`) se mantienen sin calibración competitiva: la
+prioridad de esta V0 es polaridad correcta, trazabilidad, ausencia de
+doble conteo, comportamiento contrafactual coherente y confianza
+honesta — no un ranking final ajustado a datos reales. La calibración
+queda en `docs/backlog-v1.md`.
+
+**12.11 — Daño verdadero y penetración: fortalezas reales, no
+sobrerrepresentadas.** Se mantienen en el YAML y en `DamageTypeAndShieldRule`
+sin duplicarse entre fases (mismo `causal_key` por habilidad+efecto) ni
+con la interacción de escudo (el daño verdadero es real, pero un escudo
+común puede absorber cualquier tipo de daño salvo que una habilidad
+declare explícitamente `bypasses_shields=True` — ninguna lo hace en esta
+base de conocimiento). El escudo de Indestructible mitiga el valor de
+ese daño, pero no elimina las cargas de acumulación que lo amplificaron.

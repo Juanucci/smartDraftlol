@@ -148,7 +148,15 @@ class EffectType(str, Enum):
     MAGIC_PENETRATION = "magic_penetration"
     ARMOR_PENETRATION = "armor_penetration"
     STAT_STEAL = "stat_steal"
-    ISOLATE_DUEL = "isolate_duel"                    # sin ayuda externa; en esta V0 nunca puntúa por sí solo
+    # Sin ayuda externa que perder: esta V0 modela un 1v1 puro
+    # (`pure_1v1`), así que ISOLATE_DUEL nunca puntúa por sí solo
+    # (ver IsolationRule). Igual de "inerte para pure_1v1" es
+    # COOLDOWN_RESET: el remate de Noxian Guillotine resetea su cooldown,
+    # pero en una consulta de un único enemigo ese enemigo ya murió y no
+    # hay un segundo objetivo sobre el que perpetuar la amenaza. El
+    # efecto permanece en el YAML (es real, y relevante para un futuro
+    # análisis 5v5) pero ninguna regla lo usa para puntuar en este hito.
+    ISOLATE_DUEL = "isolate_duel"
     RESTRICT_ARENA = "restrict_arena"
     COOLDOWN_RESET = "cooldown_reset"
 
@@ -161,7 +169,12 @@ class EffectCondition(str, Enum):
     ON_OUTER_ZONE = "on_outer_zone"
     ON_INNER_ZONE = "on_inner_zone"
     TARGET_IS_CHAMPION = "target_is_champion"
-    ON_ISOLATED_TARGET = "on_isolated_target"
+    # El impacto solo alcanzó a un enemigo (no se repartió entre minions
+    # u otras unidades). Deliberadamente distinto de `ISOLATE_DUEL`
+    # (EffectType de Realm of Death, "sin ayuda externa/1v1 aislado"):
+    # esto es sobre la oleada/unidades golpeadas por ESTE impacto, no
+    # sobre la geometría del duelo. Ver ObliterateSingleTargetSubRule.
+    ON_SINGLE_TARGET_HIT = "on_single_target_hit"
     ON_DELAY = "on_delay"
     ON_REACTIVATION = "on_reactivation"
     ON_TAKEDOWN = "on_takedown"
@@ -201,14 +214,19 @@ class Polarity(str, Enum):
 
 
 class Factor(str, Enum):
-    """Factores de scoring, con pesos centralizados en config/weights.yaml."""
+    """Factores de scoring, con pesos centralizados en config/weights.yaml.
+
+    NO existe un factor EXECUTION_DEMAND: GlobalScore mide adecuación
+    mecánica teórica suponiendo ejecución competente (hito 1.6). Cuánto
+    exige ejecutar el plan solo afecta PersonalScore (ver
+    scoring/personal_score.py), nunca GlobalScore.
+    """
 
     MECHANICAL_INTERACTION = "mechanical_interaction"
     LANE_PATTERN = "lane_pattern"
     RELIABILITY = "reliability"
     POWER_SPIKES = "power_spikes"
     SCALING_SIDELANE = "scaling_sidelane"
-    EXECUTION_DEMAND = "execution_demand"
 
 
 ALL_FACTORS: tuple[Factor, ...] = tuple(Factor)
@@ -218,6 +236,31 @@ class ConfidenceLevel(str, Enum):
     ALTA = "alta"
     MEDIA = "media"
     BAJA = "baja"
+
+
+class ConditionKind(str, Enum):
+    """Clasifica una `condition` (de un `RuleEffect`/`TraceEntry`) según
+    qué tipo de incertidumbre representa. Hito 1.6: antes, cualquier
+    entrada CONDITIONAL inflaba por igual `required_skill` (PersonalScore)
+    y la "densidad de condiciones" de Confidence, mezclando cosas muy
+    distintas (que el jugador falle un combo vs. que no sepamos qué
+    objeto tiene vs. que el resultado dependa de una decisión táctica).
+
+      - EXECUTION: depende de la habilidad del jugador para ejecutar
+        algo (acertar, esquivar, reaccionar a tiempo). Es la ÚNICA que
+        puede subir `required_skill` en PersonalScore.
+      - STRATEGIC: depende de una decisión o circunstancia de la partida
+        (extender vs. cortar, geometría del duelo, ventaja previa). No
+        es "el jugador ejecuta peor": alimenta volatilidad/condicionalidad,
+        no confianza epistémica ni PersonalScore.
+      - KNOWLEDGE_GAP: el motor no tiene el dato (objeto concreto, timing
+        real). Reduce confianza epistémica; no es dificultad de ejecución
+        ni un rasgo del matchup.
+    """
+
+    EXECUTION = "execution"
+    STRATEGIC = "strategic"
+    KNOWLEDGE_GAP = "knowledge_gap"
 
 
 # ---------------------------------------------------------------------------

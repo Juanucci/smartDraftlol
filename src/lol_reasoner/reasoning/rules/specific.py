@@ -17,11 +17,19 @@ de Hemorrhage") resultaron ser afirmaciones falsas — no interacciones
 reales que las reglas generales no pudieran capturar. Al modelar
 `Effect.damage_type`, `EffectType.SHIELD_FROM_STORED` y
 `EffectType.CONVERT_SHIELD_TO_HEAL` estructuralmente
-(`reasoning/rules/general.py`: `DamageTypeAndShieldRule`,
-`MitigationAndDisruptionRule`), ambas quedaron cubiertas correctamente
-por reglas generales, sin necesitar ninguna excepción. Que este módulo
-pueda quedar vacío es, en sí, la validación del principio "primero las
-reglas generales, la excepción es el último recurso".
+(`reasoning/rules/general.py`: `DamageTypeAndShieldRule`), ambas
+quedaron cubiertas correctamente por reglas generales, sin necesitar
+ninguna excepción. Que este módulo pueda quedar vacío es, en sí, la
+validación del principio "primero las reglas generales, la excepción es
+el último recurso".
+
+Sigue vacío en el hito 1.6. La regla `MitigationAndDisruptionRule`
+mencionada en versiones anteriores de este docstring fue eliminada:
+inferría "INTERRUPT niega STACK_APPLICATION" de forma general y falsa
+(un pull o un CC breve no cancela por definición un ataque básico, un
+efecto on-hit ni una pasiva). Su eliminación no dejó ninguna interacción
+real huérfana que este módulo debiera cubrir como excepción puntual —
+ver docs/decisiones-tecnicas.md, hito 1.6.
 
 `tests/test_no_hardcoded_pairs.py` obliga a que este archivo tenga como
 máximo `MAX_SPECIFIC_INTERACTIONS` entradas y que ninguna tenga campos

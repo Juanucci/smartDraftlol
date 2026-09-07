@@ -100,13 +100,23 @@ def format_human(rs: RecommendationSet) -> str:
         mastery_txt = f"{rec.mastery}/100" if rec.mastery is not None else "sin dato (se asume neutral)"
         lines.append(
             f"GlobalScore: {_fmt_score(rec.global_score)}   PersonalScore: {_fmt_score(rec.personal_score)}"
-            f"   Mastery: {mastery_txt}   Confianza: {rec.confidence.level.upper()} "
-            f"(score={rec.confidence.score})"
+            f"   Mastery: {mastery_txt}"
         )
-        lines.append("  Desglose por factor (contribución ponderada al GlobalScore):")
+        lines.append(
+            f"Confianza epistémica: {rec.confidence.level.upper()} (score={rec.confidence.score})"
+            f"   Volatilidad/condicionalidad: {rec.confidence.volatility_level.upper()} (score={rec.confidence.volatility_score})"
+        )
+        lines.append("  Desglose por factor (contribución ponderada al GlobalScore; ya deduplicado por causal_key):")
         for factor, value in rec.factor_breakdown.items():
             lines.append(f"    - {factor}: {value:+.3f}")
-        lines.append("  Por qué la confianza es esa:")
+        if rec.personal_breakdown is not None:
+            pb = rec.personal_breakdown
+            lines.append(
+                f"  Por qué el PersonalScore es ese: required_skill={pb.required_skill} "
+                f"(condiciones EXECUTION distintas: {pb.execution_condition_count}), "
+                f"mastery={pb.mastery}, gap={pb.gap:+.1f}, ajuste={pb.adjustment:+.1f}"
+            )
+        lines.append("  Por qué la confianza epistémica es esa:")
         for exp in rec.confidence.explanation:
             lines.append(f"    - {exp}")
 

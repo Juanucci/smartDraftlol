@@ -20,7 +20,7 @@ damage_profile:
 axes:
   attack_range: 1        # melee corto
   mobility: 0              # sin ninguna forma de reposicionarse
-  sustain: 3                 # Darkness Rise (aura) + Indestructible generan mucho valor de "vida efectiva"
+  sustain: 3                 # Indestructible (escudo acumulado + conversión a cura); Darkness Rise NO cura ni sostiene, solo aporta daño de aura y velocidad
   burst: 1                     # daño repartido en el tiempo, no explosivo
   sustained_dps: 3               # autos + Q multi-golpe sostenidos
   cc: 1                             # sin CC duro; solo el breve control de Death's Grasp
@@ -76,8 +76,14 @@ abilities:
       - type: damage
         magnitude: 4
         damage_type: magic
-        conditions: [on_isolated_target]
-        doc: "Daño aumentado si conecta sobre un objetivo aislado (sin otros campeones cerca)."
+        conditions: [on_single_target_hit]
+        doc: >
+          Daño aumentado si el impacto alcanza a un único enemigo. Golpear
+          también minions u otras unidades niega este aumento — no
+          significa "sin otros campeones cerca" (eso es una noción de
+          duelo/1v1, distinta y no confundir con ISOLATE_DUEL de Realm of
+          Death). El estado de la oleada no se modela numéricamente en
+          esta V0.
       - type: stack_application
         magnitude: 1
         conditions: [on_hit]
@@ -92,7 +98,7 @@ abilities:
     name: Indestructible
     cooldown_class: medium
     available_from: early_lane
-    tactical_uses: [sustain, trade_cut]
+    tactical_uses: [sustain]
     effects:
       - type: shield_from_stored
         magnitude: 3
@@ -106,11 +112,14 @@ abilities:
         conditions: [on_reactivation]
         doc: "La reactivación consume el escudo restante para recuperar vida."
     doc: >
-      No elimina ni revierte cargas de una StackingMechanic rival ya
-      aplicadas (p. ej. Hemorrhage): solo absorbe/convierte daño desde el
-      momento en que está activa hacia adelante. Su valor depende de
-      cuánto escudo potencial se haya acumulado y del momento de
-      activación, no es un bloqueo total garantizado.
+      No elimina, revierte, limpia ni reduce cargas de una StackingMechanic
+      rival ya aplicadas (p. ej. Hemorrhage): solo absorbe/convierte daño
+      desde el momento en que está activa hacia adelante. NO corta un
+      intercambio por sí sola ni genera distancia — puede ayudar a
+      sobrevivir un trade corto, pero salir de él depende del
+      posicionamiento y de otras acciones, no de esta habilidad. Su valor
+      depende de cuánto escudo potencial se haya acumulado y del momento
+      de activación, no es un bloqueo total garantizado.
 
   - slot: E
     name: Death's Grasp
@@ -129,14 +138,29 @@ abilities:
         magnitude: 1
       - type: interrupt
         magnitude: 1
+        doc: >
+          Control breve, no una interrupción garantizada de cualquier
+          acción rival: solo tendría efecto sobre una acción explícitamente
+          interrumpible (p. ej. un canalizado). Ni Darius ni Mordekaiser
+          tienen una de esas en esta V0, así que este efecto queda
+          condicionalmente silencioso para este par — ver
+          MitigationAndDisruptionRule (eliminada en el hito 1.6: un pull o
+          CC breve no cancela por definición un ataque básico, un on-hit
+          o una pasiva, así que NO niega Hemorrhage ni ninguna otra
+          STACK_APPLICATION).
       - type: stack_application
         magnitude: 1
         conditions: [on_hit]
         feeds_stack: darkness_rise
     doc: >
-      Puede iniciar, reposicionar al rival e interrumpir, pero acertarla es
-      condicional al retardo de su activación: fallarla cierra la ventana
-      de trade en vez de abrirla.
+      Puede iniciar, reposicionar al rival e interrumpir una acción
+      explícitamente interrumpible (no un ataque básico ni una pasiva),
+      pero acertarla es condicional al retardo de su activación: fallarla
+      cierra la ventana de trade en vez de abrirla. Esta V0 NO modela la
+      utilización invertida de Death's Grasp (tirar al enemigo para
+      alejarlo en vez de acercarlo): es una mecánica real, avanzada y
+      dependiente de dirección/timing/ejecución, diferida a una futura
+      capa de mecánicas avanzadas (ver docs/backlog-v1.md).
 
   - slot: R
     name: Realm of Death

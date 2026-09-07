@@ -51,3 +51,15 @@ esto está implementado en el hito actual (Darius vs Mordekaiser).
 12. Integración con Riot API / fuentes de datos en vivo — recién después de
     que los puertos de estadísticas (#4) estén definidos y probados con datos
     mock.
+13. **Mecánica avanzada/contextual: Death's Grasp en reversa** (hito 1.6).
+    Mordekaiser puede lanzar Death's Grasp hacia atrás para halarse a sí
+    mismo lejos del rival (reposicionamiento defensivo/de escape), en vez
+    de halar al rival hacia él. Esta V0 modela solo el uso ofensivo
+    (`DISPLACE_ENEMY`, penetración) porque el uso en reversa depende de
+    contexto direccional/posicional (hacia dónde apunta el cast) que esta
+    base de conocimiento no representa — modelarlo bien requeriría noción
+    de posición/orientación relativa, no solo `effects` y `axes` planos.
+    No inferir esto vía `interrupt` ni generalizarlo como "herramienta de
+    disengage" genérica: es un uso condicional y direccional de una
+    habilidad concreta, documentado acá para no perderlo de vista al
+    diseñar el modelo de posición/geometría de V1.

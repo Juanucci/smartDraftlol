@@ -120,5 +120,7 @@ class RuleEngine:
                 text=effect.text,
                 condition=effect.condition,
                 invalidated_if=effect.invalidated_if,
+                causal_key=effect.causal_key,
+                condition_kind=effect.condition_kind,
             )
         )

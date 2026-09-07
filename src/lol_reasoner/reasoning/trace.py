@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from lol_reasoner.domain.enums import Factor, Phase, Polarity
+from lol_reasoner.domain.enums import ConditionKind, Factor, Phase, Polarity, phase_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +39,8 @@ class TraceEntry:
     text: str  # descripción legible, ya construida a partir de las premisas
     condition: str | None = None  # bajo qué circunstancia se sostiene / se invierte
     invalidated_if: str | None = None  # qué información faltante podría cambiarlo
+    causal_key: str | None = None  # ver RuleEffect.causal_key
+    condition_kind: ConditionKind | None = None  # ver RuleEffect.condition_kind
 
 
 @dataclass(slots=True)
@@ -66,3 +68,35 @@ class ReasoningTrace:
 
     def get(self, entry_id: str) -> TraceEntry | None:
         return next((e for e in self.entries if e.id == entry_id), None)
+
+    def deduped_for_scoring(self, subject_id: str) -> list[TraceEntry]:
+        """Vista de las entradas de `subject_id` para cálculo de score y
+        para las listas planas de razones/riesgos: cuando varias entradas
+        comparten `causal_key` (misma fuente mecánica, citada por la
+        misma o distinta regla, en la misma o distinta fase), se conserva
+        solo la de mayor |delta| — empatada, la de fase más temprana.
+        Entradas con `causal_key=None` nunca se deduplican (se conservan
+        todas, comportamiento sin cambios).
+
+        NO usar esto para `build_phase_notes`: ahí la repetición de un
+        mismo hecho en varias fases es información real ("esto sigue
+        siendo cierto en level_6, first_item y side_lane_late"), no
+        doble conteo — se debe seguir iterando `for_phase()` crudo.
+        """
+
+        own = [e for e in self.entries if e.subject == subject_id]
+        keyed: dict[str, TraceEntry] = {}
+        unkeyed: list[TraceEntry] = []
+        for e in own:
+            if e.causal_key is None:
+                unkeyed.append(e)
+                continue
+            current = keyed.get(e.causal_key)
+            if current is None:
+                keyed[e.causal_key] = e
+                continue
+            current_rank = (abs(current.delta), -phase_index(current.phase))
+            candidate_rank = (abs(e.delta), -phase_index(e.phase))
+            if candidate_rank > current_rank:
+                keyed[e.causal_key] = e
+        return unkeyed + list(keyed.values())

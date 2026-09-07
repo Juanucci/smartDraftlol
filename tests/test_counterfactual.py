@@ -59,9 +59,10 @@ def test_removing_darius_q_heal_effect_reduces_mordekaiser_disadvantage():
 
 
 def test_shrinking_mordekaiser_shield_magnitude_reduces_the_mitigation_penalty():
-    """DamageMitigationAndDisruptionRule escala su CONTRA con la magnitud
-    del escudo de Indestructible. Bajarla debería reducir (no eliminar)
-    la penalización que sufre Darius como candidato."""
+    """DamageTypeAndShieldRule (fusionada con la ex-G04 en el hito 1.6)
+    escala su CONTRA `damage_mitigation` con la magnitud del escudo de
+    Indestructible. Bajarla debería reducir (no eliminar) la
+    penalización que sufre Darius como candidato."""
 
     original = _raw_champion_dict("mordekaiser")
     mutated = copy.deepcopy(original)
@@ -84,8 +85,8 @@ def test_shrinking_mordekaiser_shield_magnitude_reduces_the_mitigation_penalty()
 
     assert rec_after.global_score > rec_before.global_score  # menos escudo => menos mitigación => mejor para Darius
 
-    mitigation_before = next(e for e in rec_before.trace_entries if e["id"] == "G04#early_lane")
-    mitigation_after = next(e for e in rec_after.trace_entries if e["id"] == "G04#early_lane")
+    mitigation_before = next(e for e in rec_before.trace_entries if e["category"] == "damage_mitigation" and e["phase"] == "early_lane")
+    mitigation_after = next(e for e in rec_after.trace_entries if e["category"] == "damage_mitigation" and e["phase"] == "early_lane")
     assert mitigation_after["delta"] < mitigation_before["delta"]
 
 
@@ -111,9 +112,13 @@ def test_raising_candidate_execution_demand_lowers_personal_score_at_low_mastery
     rec_after = _run(mordekaiser_mutated)
 
     assert rec_after.personal_score < rec_before.personal_score
-    # execution_demand SÍ mueve el propio factor EXECUTION_DEMAND del GlobalScore (ExecutionDemandBaselineRule,
-    # G10): lo que la independencia de `mastery` garantiza es que ESTE cambio de mastery no mueve el GlobalScore
-    # (ver test_scoring.py::test_mastery_changes_personal_score_but_not_global_score), no que ningún eje lo haga.
+    # Hito 1.6: `ExecutionDemandBaselineRule` (G10) fue eliminada y ya no
+    # existe ningún `Factor.EXECUTION_DEMAND` — GlobalScore mide
+    # adecuación mecánica asumiendo ejecución competente, punto. El eje
+    # `execution_demand` solo alimenta `required_skill` (PersonalScore,
+    # ver scoring/personal_score.py), nunca el GlobalScore de nadie: se
+    # verifica explícitamente acá, no solo se infiere del docstring.
+    assert rec_after.global_score == rec_before.global_score
 
 
 def test_removing_mordekaiser_r_available_from_level_6_effects_present_before_level_6_disappear():

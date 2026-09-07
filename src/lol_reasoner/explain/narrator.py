@@ -31,13 +31,20 @@ def _dedup_by_text_strongest(entries: list) -> list:
     return sorted(best_by_text.values(), key=lambda e: e.delta, reverse=True)
 
 
-def build_reasons(trace: ReasoningTrace) -> tuple[ReasonItem, ...]:
-    entries = _dedup_by_text_strongest(list(trace.for_polarity(Polarity.PRO)))
+def build_reasons(trace: ReasoningTrace, *, subject_id: str) -> tuple[ReasonItem, ...]:
+    """Deduplica primero por `causal_key` (misma fuente mecánica citada
+    por distintas reglas o en distintas fases: ver
+    `ReasoningTrace.deduped_for_scoring`) y luego por texto — para que el
+    usuario no lea "dos razones" que en realidad son un solo hecho."""
+
+    deduped = [e for e in trace.deduped_for_scoring(subject_id) if e.polarity == Polarity.PRO]
+    entries = _dedup_by_text_strongest(deduped)
     return tuple(ReasonItem(text=e.text, entry_id=e.id) for e in entries[:_MAX_ITEMS])
 
 
-def build_risks(trace: ReasoningTrace) -> tuple[ReasonItem, ...]:
-    entries = _dedup_by_text_strongest(list(trace.for_polarity(Polarity.CONTRA)))
+def build_risks(trace: ReasoningTrace, *, subject_id: str) -> tuple[ReasonItem, ...]:
+    deduped = [e for e in trace.deduped_for_scoring(subject_id) if e.polarity == Polarity.CONTRA]
+    entries = _dedup_by_text_strongest(deduped)
     return tuple(ReasonItem(text=e.text, entry_id=e.id) for e in entries[:_MAX_ITEMS])
 
 

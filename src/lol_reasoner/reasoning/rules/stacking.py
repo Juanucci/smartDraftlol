@@ -15,19 +15,30 @@ Nada de esto se escribe a mano por campeón: se deriva de
 qué `Effect`s tienen las habilidades involucradas. La regla nunca lee
 `champion.id` ni `champion.name` para decidir — solo para el texto.
 
+Hito 1.6 — tres correcciones de honestidad:
+  1. `_first_threshold_effect` pasa a `CONDITIONAL`: la fórmula
+     (fuentes + aceleradores - aplicaciones necesarias) es un ORDEN
+     ESTRUCTURAL, no una predicción de quién activa primero en el
+     tiempo real de la partida (no modela cadencia, cooldowns, acierto
+     ni secuencia). Separa "umbral menor" de "probabilidad real de
+     activarlo primero".
+  2. El reset de cooldown al remate (`COOLDOWN_RESET`) deja de sumar a
+     la recompensa: en una consulta `pure_1v1` no hay un segundo
+     objetivo sobre el que "perpetuar la amenaza".
+  3. `_reward_magnitude_effect` reduce su delta y declara explícitamente
+     que suma magnitudes ordinales de tipos heterogéneos — una
+     aproximación cualitativa, no una equivalencia de unidades.
+
 Se emiten tres `TraceEntry` separados y nunca opuestos dentro de uno
-solo, por pedido explícito:
-  1. quién llega antes al primer umbral (`stack_race_first`)
-  2. magnitud de la recompensa si el intercambio se extiende
-     (`stack_race_reward`)
-  3. la condición de extender-vs-cortar el intercambio
-     (`stack_race_extend_cut`)
+solo: (1) comparación estructural de umbral (con la nota de
+acumulador/slow de ambos lados), (2) magnitud de recompensa si se
+extiende, (3) la condición de extender-vs-cortar el intercambio.
 """
 
 from __future__ import annotations
 
-from lol_reasoner.domain.champion import Champion, StackingMechanic
-from lol_reasoner.domain.enums import EffectType, Factor, Phase, Polarity, TacticalUse, is_available_in
+from lol_reasoner.domain.champion import Ability, Champion, StackingMechanic
+from lol_reasoner.domain.enums import ConditionKind, EffectType, Factor, Phase, Polarity, TacticalUse, is_available_in
 from lol_reasoner.reasoning.context import ReasoningContext
 from lol_reasoner.reasoning.rules.base import Rule, RuleEffect
 from lol_reasoner.reasoning.trace import FactRef
@@ -37,7 +48,8 @@ _ACCELERATOR_TYPES = frozenset({EffectType.AUTO_ATTACK_RESET, EffectType.EMPOWER
 # Tipos de efecto reconocidos como contribuyentes a la magnitud de una
 # recompensa de umbral. Dispatch explícito (en vez de sumar cualquier
 # `effect.magnitude` a ciegas) para que quede citado en código cuál
-# vocabulario alimenta esta cuenta.
+# vocabulario alimenta esta cuenta. COOLDOWN_RESET deliberadamente NO
+# está acá (ver docstring del módulo, punto 2).
 _REWARD_CONTRIBUTING_TYPES = frozenset({
     EffectType.EMPOWER_SELF,
     EffectType.AMPLIFY_ABILITY,
@@ -52,11 +64,11 @@ def _fact(champion_id: str, ability_slot: str, effect_type: EffectType, value: o
     return FactRef(f"{champion_id}.abilities.{ability_slot}.effects.{effect_type.value}", value)
 
 
-def _abilities_in_phase(champion: Champion, phase: Phase):
+def _abilities_in_phase(champion: Champion, phase: Phase) -> tuple[Ability, ...]:
     return tuple(a for a in champion.abilities if is_available_in(a.available_from, phase))
 
 
-def accelerator_abilities(champion: Champion, mechanic: StackingMechanic, phase: Phase):
+def accelerator_abilities(champion: Champion, mechanic: StackingMechanic, phase: Phase) -> tuple[Ability, ...]:
     """Habilidades YA DISPONIBLES en `phase` que aceleran la llegada al
     próximo golpe que aplica una carga (auto-reset o potenciación del
     próximo ataque). Se deriva escaneando efectos, no se declara a mano
@@ -74,31 +86,16 @@ def applications_needed(mechanic: StackingMechanic) -> int:
 
 
 def ramp_speed_rank(champion: Champion, mechanic: StackingMechanic, phase: Phase) -> int:
-    """Ordinal cualitativo de "qué tan rápido llega" — NUNCA una tasa real
-    ni una estimación de segundos. Solo sirve para comparar dos mecánicas
-    entre sí, nunca en abstracto: más fuentes + más aceleradores YA
-    DISPONIBLES en `phase` + menos aplicaciones necesarias => rank más
-    alto => llega antes."""
+    """Ordinal cualitativo de "qué tan accesible es el umbral" — NUNCA una
+    tasa real ni una estimación de segundos ni una predicción de quién
+    activa primero. Solo sirve para comparar dos mecánicas entre sí:
+    más fuentes + más aceleradores YA DISPONIBLES en `phase` + menos
+    aplicaciones necesarias => rank más alto => umbral estructuralmente
+    más accesible."""
 
     sources = len(mechanic.applied_by)
     accelerators = len(accelerator_abilities(champion, mechanic, phase))
     return sources + accelerators - applications_needed(mechanic)
-
-
-def cooldown_reset_abilities(champion: Champion, mechanic: StackingMechanic, phase: Phase):
-    """Habilidades ya disponibles en `phase` que amplifican esta mecánica
-    (`AMPLIFY_ABILITY.stack_scaling == mechanic.id`) y además resetean su
-    propio cooldown al conseguir un remate (`COOLDOWN_RESET`): la
-    recompensa de acumulación no es un evento único, se puede repetir
-    dentro de la misma pelea mientras el objetivo siga bajo el umbral."""
-
-    result = []
-    for ability in _abilities_in_phase(champion, phase):
-        amplifies_this = any(e.type == EffectType.AMPLIFY_ABILITY and e.stack_scaling == mechanic.id for e in ability.effects)
-        resets = ability.effects_of(EffectType.COOLDOWN_RESET)
-        if amplifies_this and resets:
-            result.append(ability)
-    return tuple(result)
 
 
 def reward_magnitude(champion: Champion, mechanic: StackingMechanic, phase: Phase) -> int:
@@ -106,7 +103,11 @@ def reward_magnitude(champion: Champion, mechanic: StackingMechanic, phase: Phas
     fase: un efecto que amplifica un slot (`amplifies_slot`) solo cuenta
     si esa habilidad ya está disponible en `phase` (p. ej. la
     amplificación de Noxian Might sobre R no cuenta antes de level_6,
-    aunque el propio umbral de 5 cargas sea alcanzable antes)."""
+    aunque el propio umbral de 5 cargas sea alcanzable antes). No
+    incluye `COOLDOWN_RESET`: en `pure_1v1` no hay un segundo objetivo
+    sobre el que perpetuar la amenaza (el efecto sigue en el YAML para
+    un futuro análisis 5v5, ver `ISOLATE_DUEL`/`COOLDOWN_RESET` en
+    domain/enums.py)."""
 
     total = 0
     for effect in mechanic.reward_effects:
@@ -135,7 +136,7 @@ class StackRaceRule(Rule):
     módulo para los tres TraceEntry que produce."""
 
     id = "G12"
-    summary = "Compara umbral, fuentes, aceleradores y recompensa de las StackingMechanic de ambos lados."
+    summary = "Compara umbral estructural, aceleradores y recompensa de las StackingMechanic de ambos lados; el orden real de activación no se modela."
     categories = frozenset({"stack_race"})
     category = "stack_race"
 
@@ -146,48 +147,81 @@ class StackRaceRule(Rule):
         enemy_mechanic = ctx.enemy.stacking_mechanics[0]
         effects: list[RuleEffect] = []
 
-        effects.extend(self._first_threshold_effect(ctx, candidate_mechanic, enemy_mechanic))
+        effects.extend(self._structural_threshold_effect(ctx, candidate_mechanic, enemy_mechanic))
         effects.extend(self._reward_magnitude_effect(ctx, candidate_mechanic, enemy_mechanic))
         effects.extend(self._extend_or_cut_effect(ctx, candidate_mechanic, enemy_mechanic))
         return effects
 
-    def _first_threshold_effect(self, ctx, candidate_mechanic, enemy_mechanic) -> list[RuleEffect]:
+    @staticmethod
+    def _accelerator_clause(owner, mechanic, accelerators: tuple[Ability, ...], premises: list[FactRef]) -> str:
+        """Cita el/los efecto(s) acelerador(es) REALMENTE encontrados (no
+        un tipo fijo por posición) y, si la misma habilidad también
+        ralentiza, agrega la cláusula de "conservar contacto" — sin
+        sumar un delta aparte: es la misma cadena causal."""
+
+        if not accelerators:
+            return ""
+        ability = accelerators[0]
+        matched_types = sorted(ability.effect_types() & _ACCELERATOR_TYPES, key=lambda t: t.value)
+        for t in matched_types:
+            premises.append(_fact(owner.id, ability.slot, t, "accelerator"))
+        slows = ability.effects_of(EffectType.SLOW)
+        if not slows:
+            return f" {ability.name} de {owner.name} adelanta la siguiente aplicación válida hacia {mechanic.name}."
+        premises.append(_fact(owner.id, ability.slot, EffectType.SLOW, "contact"))
+        return (
+            f" {ability.name} de {owner.name} adelanta la siguiente aplicación válida hacia {mechanic.name} "
+            f"mediante el reset del ataque, y su ralentización ayuda a {owner.name} a conservar contacto para "
+            "intentar completar las cargas posteriores."
+        )
+
+    def _structural_threshold_effect(self, ctx, candidate_mechanic, enemy_mechanic) -> list[RuleEffect]:
         candidate_accelerators = accelerator_abilities(ctx.candidate, candidate_mechanic, ctx.phase)
         enemy_accelerators = accelerator_abilities(ctx.enemy, enemy_mechanic, ctx.phase)
         candidate_rank = ramp_speed_rank(ctx.candidate, candidate_mechanic, ctx.phase)
         enemy_rank = ramp_speed_rank(ctx.enemy, enemy_mechanic, ctx.phase)
-        if candidate_rank == enemy_rank:
+        if candidate_rank == enemy_rank and not candidate_accelerators and not enemy_accelerators:
             return []
-        polarity = Polarity.PRO if candidate_rank > enemy_rank else Polarity.CONTRA
-        who = "antes" if polarity == Polarity.PRO else "después"
 
         premises = [
             FactRef(f"{ctx.candidate.id}.stacking.{candidate_mechanic.id}.applications_needed", candidate_mechanic.applications_needed),
             FactRef(f"{ctx.enemy.id}.stacking.{enemy_mechanic.id}.applications_needed", enemy_mechanic.applications_needed),
         ]
-        for ability in candidate_accelerators:
-            premises.append(_fact(ctx.candidate.id, ability.slot, EffectType.AUTO_ATTACK_RESET, "accelerator"))
-        for ability in enemy_accelerators:
-            premises.append(_fact(ctx.enemy.id, ability.slot, EffectType.EMPOWER_NEXT_ATTACK, "accelerator"))
+        candidate_clause = self._accelerator_clause(ctx.candidate, candidate_mechanic, candidate_accelerators, premises)
+        enemy_clause = self._accelerator_clause(ctx.enemy, enemy_mechanic, enemy_accelerators, premises)
 
-        accel_note = ""
-        if candidate_accelerators:
-            accel_note = f" (acelerado por {candidate_accelerators[0].name})"
+        risk_clause = ""
+        if (
+            enemy_accelerators
+            and candidate_mechanic.applications_needed < enemy_mechanic.applications_needed
+        ):
+            ability = enemy_accelerators[0]
+            risk_clause = (
+                f" Aunque {ctx.candidate.name} activa {candidate_mechanic.name} con menos impactos "
+                f"({candidate_mechanic.applications_needed} vs {enemy_mechanic.applications_needed}), el reset y "
+                f"la ralentización de {ability.name} de {ctx.enemy.name} facilitan que {ctx.enemy.name} mantenga "
+                f"el intercambio y continúe acumulando {enemy_mechanic.name}."
+            )
+
+        text = (
+            f"Estructuralmente, {candidate_mechanic.name} de {ctx.candidate.name} requiere "
+            f"{candidate_mechanic.applications_needed} aplicaciones válidas desde {len(candidate_mechanic.applied_by)} "
+            f"fuente(s), mientras que {enemy_mechanic.name} de {ctx.enemy.name} requiere "
+            f"{enemy_mechanic.applications_needed} desde {len(enemy_mechanic.applied_by)} fuente(s). Esto es un "
+            "orden estructural, no una predicción de quién activa primero: cadencia de golpes, cooldowns, acierto "
+            f"y secuencia no se modelan en esta V0.{candidate_clause}{enemy_clause}{risk_clause}"
+        )
 
         return [
             RuleEffect(
                 factor=Factor.POWER_SPIKES,
-                polarity=polarity,
-                delta=0.12,
-                text=(
-                    f"{ctx.candidate.name} alcanza el umbral de {candidate_mechanic.name} "
-                    f"({candidate_mechanic.applications_needed} aplicaciones válidas desde "
-                    f"{len(candidate_mechanic.applied_by)} fuente(s){accel_note}) {who} que {ctx.enemy.name} el de "
-                    f"{enemy_mechanic.name} ({enemy_mechanic.applications_needed} aplicaciones desde "
-                    f"{len(enemy_mechanic.applied_by)} fuente(s)); esto es un orden cualitativo, no una "
-                    "estimación de tiempo real."
-                ),
+                polarity=Polarity.CONDITIONAL,
+                delta=0.05,
+                text=text,
                 premises=tuple(premises),
+                condition="el umbral estructuralmente menor no garantiza activarse primero en el tiempo real de la partida",
+                invalidated_if="cadencia de golpes, cooldowns, acierto y secuencia de habilidades no se modelan en esta V0",
+                condition_kind=ConditionKind.STRATEGIC,
                 category="stack_race",
             )
         ]
@@ -202,39 +236,31 @@ class StackRaceRule(Rule):
             FactRef(f"{ctx.candidate.id}.stacking.{candidate_mechanic.id}.reward_magnitude@{ctx.phase.value}", candidate_reward),
             FactRef(f"{ctx.enemy.id}.stacking.{enemy_mechanic.id}.reward_magnitude@{ctx.phase.value}", enemy_reward),
         ]
-        for eff in (*candidate_mechanic.reward_effects,):
+        for eff in candidate_mechanic.reward_effects:
             premises.append(FactRef(f"{ctx.candidate.id}.stacking.{candidate_mechanic.id}.reward.{eff.type.value}", eff.magnitude))
-
-        reset_note = ""
-        resetting = cooldown_reset_abilities(ctx.candidate, candidate_mechanic, ctx.phase)
-        if resetting:
-            reset_note = (
-                f" Además, {resetting[0].name} resetea su cooldown al conseguir el remate, lo que perpetúa la "
-                "amenaza mientras el objetivo siga bajo el umbral, en vez de ser un evento único por pelea."
-            )
-            for ability in resetting:
-                premises.append(_fact(ctx.candidate.id, ability.slot, EffectType.COOLDOWN_RESET, True))
 
         return [
             RuleEffect(
                 factor=Factor.POWER_SPIKES,
                 polarity=polarity,
-                delta=0.1,
+                delta=0.06,
                 text=(
                     f"Si el intercambio se extiende lo suficiente, la recompensa de {ctx.candidate.name} al "
                     f"alcanzar {candidate_mechanic.reward_name} (magnitud agregada {candidate_reward} en esta "
                     f"fase) {'supera' if polarity == Polarity.PRO else 'queda por debajo de'} la de "
-                    f"{ctx.enemy.name} ({enemy_mechanic.reward_name}, magnitud {enemy_reward}).{reset_note}"
+                    f"{ctx.enemy.name} ({enemy_mechanic.reward_name}, magnitud {enemy_reward})."
                 ),
                 premises=tuple(premises),
+                invalidated_if=(
+                    "la magnitud agregada suma efectos ordinales de tipos heterogéneos (empoderamiento propio, "
+                    "aura, velocidad); es una comparación cualitativa aproximada, no unidades equivalentes"
+                ),
                 category="stack_race",
             )
         ]
 
     def _extend_or_cut_effect(self, ctx, candidate_mechanic, enemy_mechanic) -> list[RuleEffect]:
-        enemy_cut_tools = [
-            a for a in ctx.enemy_abilities() if TacticalUse.TRADE_CUT in a.tactical_uses
-        ]
+        enemy_cut_tools = [a for a in ctx.enemy_abilities() if TacticalUse.TRADE_CUT in a.tactical_uses]
         condition = (
             "extender el intercambio acerca a ambos lados a su propia recompensa de acumulación; "
             "alcanzar el umbral rival primero castiga seguir peleando en vez de cortar"
@@ -257,6 +283,7 @@ class StackRaceRule(Rule):
                     "el ritmo real de intercambio (auto-ataques efectivamente conectados por segundo) no se "
                     "simula en esta V0; el orden de acumulación es cualitativo"
                 ),
+                condition_kind=ConditionKind.STRATEGIC,
                 category="stack_race",
             )
         ]

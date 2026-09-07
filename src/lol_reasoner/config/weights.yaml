@@ -3,13 +3,16 @@
 # solo reflejan qué tan seguido queremos que un factor mueva el resultado
 # final en esta V0.
 
+# NO hay un factor execution_demand: GlobalScore mide adecuación mecánica
+# teórica suponiendo ejecución competente (hito 1.6). La exigencia de
+# ejecución solo afecta PersonalScore, vía `personal.execution_demand_weight`
+# más abajo, nunca este bloque.
 factors:
   mechanical_interaction: 1.0
   lane_pattern: 0.85
   reliability: 0.6
   power_spikes: 0.7
   scaling_sidelane: 0.7
-  execution_demand: 0.5
 
 phases:
   early_lane: 1.0
@@ -24,7 +27,10 @@ global_scale: 12.0
 # donde gap = mastery - required_skill, y
 # required_skill = base_required_skill
 #                  + execution_demand_weight * axes.execution_demand
-#                  + reliability_penalty_weight * n_entradas_condicionales_del_candidato
+#                  + reliability_penalty_weight * n_condiciones_EXECUTION_distintas_del_candidato
+# Solo condition_kind=EXECUTION cuenta acá (ver domain.enums.ConditionKind):
+# información faltante, ausencia de objetos o incertidumbre estratégica
+# (STRATEGIC/KNOWLEDGE_GAP) NO suben required_skill.
 personal:
   execution_sensitivity: 22.0
   base_required_skill: 25.0
