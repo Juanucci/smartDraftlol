@@ -24,7 +24,7 @@ def test_champion_axes_are_in_range(champions):
 
 def test_knowledge_version_is_internal_not_a_patch(champions):
     for champ in champions.values():
-        assert champ.knowledge_version == "0.2.0"
+        assert champ.knowledge_version == "0.2.1"
 
 
 def test_tags_are_empty_in_this_milestone(champions):
@@ -36,7 +36,7 @@ def test_tags_are_empty_in_this_milestone(champions):
 
 def _minimal_valid_dict() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "id": "test_champ",
         "name": "Test Champ",
         "archetype": "test",
@@ -64,7 +64,7 @@ def _minimal_valid_dict() -> dict:
     }
 
 
-def test_schema_requires_schema_version_2():
+def test_schema_requires_the_current_schema_version():
     data = _minimal_valid_dict()
     data["schema_version"] = 1
     with pytest.raises(KnowledgeError, match="schema_version"):

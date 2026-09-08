@@ -16,8 +16,17 @@ from __future__ import annotations
 from lol_reasoner.domain.champion import Champion
 from lol_reasoner.domain.enums import ALL_PHASES, Axis
 from lol_reasoner.domain.query import MatchupQuery
-from lol_reasoner.domain.result import Confidence, PersonalScoreBreakdown, PhaseNote, Recommendation, RecommendationSet
-from lol_reasoner.explain.narrator import build_conditions, build_missing_info, build_phase_notes, build_reasons, build_risks
+from lol_reasoner.domain.result import Confidence, PersonalScoreBreakdown, Recommendation, RecommendationSet
+from lol_reasoner.explain.narrator import (
+    build_conditions,
+    build_editorial_priors,
+    build_lean,
+    build_missing_info,
+    build_phase_notes,
+    build_reasons,
+    build_risks,
+    build_uncalibrated_observations,
+)
 from lol_reasoner.reasoning.engine import RuleEngine
 from lol_reasoner.reasoning.trace import ReasoningTrace, TraceEntry
 from lol_reasoner.scoring.confidence import compute_confidence
@@ -43,6 +52,8 @@ def _entry_to_dict(e: TraceEntry) -> dict:
         "invalidated_if": e.invalidated_if,
         "causal_key": e.causal_key,
         "condition_kind": e.condition_kind.value if e.condition_kind else None,
+        "support": e.support.value,
+        "provenance": e.provenance.value,
     }
 
 
@@ -71,14 +82,20 @@ def evaluate_candidate(
     confidence_result = compute_confidence(trace, mirror_trace)
 
     confidence = Confidence(
-        level=confidence_result.level.value,
-        score=confidence_result.score,
+        candidate_knowledge_coverage_level=confidence_result.candidate_knowledge_coverage_level.value,
+        candidate_knowledge_coverage_score=confidence_result.candidate_knowledge_coverage_score,
+        shared_matchup_confidence=confidence_result.shared_matchup_confidence.value,
+        shared_matchup_confidence_reasons=confidence_result.shared_matchup_confidence_reasons,
         coverage_ratio=confidence_result.coverage_ratio,
+        categories_hit=tuple(sorted(confidence_result.categories_hit)),
+        applicable_categories_count=confidence_result.applicable_categories_count,
         missing_info_count=confidence_result.missing_info_count,
-        volatility_level=confidence_result.volatility_level.value,
-        volatility_score=confidence_result.volatility_score,
+        shared_strategic_volatility_level=confidence_result.shared_strategic_volatility_level.value,
+        shared_strategic_volatility_score=confidence_result.shared_strategic_volatility_score,
         contradiction_count=confidence_result.contradiction_count,
         strategic_condition_count=confidence_result.strategic_condition_count,
+        shared_strategic_count=confidence_result.shared_strategic_count,
+        execution_condition_count=confidence_result.execution_condition_count,
         explanation=confidence_result.explanation,
     )
 
@@ -94,6 +111,18 @@ def evaluate_candidate(
         else None
     )
 
+    factor_breakdown = {f.value: round(v, 4) for f, v in breakdown.items()}
+    lean = build_lean(
+        trace,
+        subject_id=candidate.id,
+        candidate_name=candidate.name,
+        enemy_name=enemy.name,
+        weights=weights,
+        factor_breakdown=factor_breakdown,
+        matchup_confidence=confidence_result.shared_matchup_confidence.value,
+        volatility=confidence_result.shared_strategic_volatility_level.value,
+    )
+
     recommendation = Recommendation(
         candidate_id=candidate.id,
         candidate_name=candidate.name,
@@ -101,13 +130,18 @@ def evaluate_candidate(
         personal_score=round(p_score, 2),
         mastery=mastery,
         personal_breakdown=personal_breakdown,
-        factor_breakdown={f.value: round(v, 4) for f, v in breakdown.items()},
+        factor_breakdown=factor_breakdown,
         confidence=confidence,
-        reasons=build_reasons(trace, subject_id=candidate.id),
-        risks=build_risks(trace, subject_id=candidate.id),
+        reasons=build_reasons(trace, subject_id=candidate.id, weights=weights),
+        risks=build_risks(trace, subject_id=candidate.id, weights=weights),
+        editorial_priors=build_editorial_priors(trace, subject_id=candidate.id),
+        uncalibrated_observations=build_uncalibrated_observations(
+            trace, subject_id=candidate.id, weights=weights
+        ),
         conditions=build_conditions(trace),
         missing_info=build_missing_info(trace),
-        phase_notes=build_phase_notes(trace),
+        lean=lean,
+        phase_notes=build_phase_notes(trace, subject_id=candidate.id, weights=weights),
         trace_entries=tuple(_entry_to_dict(e) for e in trace.entries),
     )
     return recommendation, trace
@@ -154,7 +188,9 @@ def recommend(
         knowledge_version=enemy.knowledge_version,
         ranking_global=ranking_global,
         ranking_personal=ranking_personal,
-        best_global=ranking_global[0],
-        best_personal=ranking_personal[0],
+        # Con un solo candidato no hubo comparación que ganar: "mejor
+        # pick" sería una afirmación vacía (ver domain/result.py).
+        best_global=ranking_global[0] if len(ranking_global) > 1 else None,
+        best_personal=ranking_personal[0] if len(ranking_personal) > 1 else None,
         recommendations=recommendations,
     )

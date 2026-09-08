@@ -139,3 +139,37 @@ def test_mordekaiser_is_resourceless_and_q_is_poke(mordekaiser):
     q = mordekaiser.ability("Q")
     assert TacticalUse.POKE in q.tactical_uses
     assert EffectType.SLOW not in q.effect_types(), "no se debe inventar un slow en Q"
+
+
+# --- v1.6.1: Decimate no es una herramienta de poke ---
+
+
+def test_decimate_is_not_a_poke_tool(darius):
+    """Decimate es un intercambio cuerpo a cuerpo con filo exterior, no
+    poke a distancia. Tratarla como poke hacía que el motor describiera a
+    Darius como campeón de poke y que un eje editorial de sustain rival lo
+    "licuara"."""
+
+    q = darius.ability("Q")
+    assert TacticalUse.POKE not in q.tactical_uses
+    # pero conserva todo lo que sí es: sustain en el trade, waveclear y
+    # capacidad de extender el intercambio.
+    assert {TacticalUse.SUSTAIN, TacticalUse.WAVECLEAR, TacticalUse.TRADE_EXTEND} <= q.tactical_uses
+
+
+def test_pulls_declare_their_direction(darius, mordekaiser):
+    """Atraer y empujar son consecuencias opuestas del mismo EffectType:
+    sin la dirección declarada son indistinguibles."""
+
+    for champion in (darius, mordekaiser):
+        pulls = [e for e in champion.ability("E").effects if e.type == EffectType.DISPLACE_ENEMY]
+        assert pulls
+        for effect in pulls:
+            assert effect.displacement_vector == "toward_self"
+
+
+def test_trade_cut_is_no_longer_part_of_the_vocabulary():
+    """Se eliminó en v1.6.1: ningún YAML lo usaba y la única rama que lo
+    leía era inalcanzable."""
+
+    assert not any(u.value == "trade_cut" for u in TacticalUse)

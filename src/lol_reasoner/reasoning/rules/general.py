@@ -1,4 +1,4 @@
-"""Reglas generales de interacción mecánica — hito 1.6.
+"""Reglas generales de interacción mecánica — v1.6.1.
 
 RESTRICCIÓN DURA (verificada por tests/test_no_hardcoded_pairs.py):
 ninguna regla de este archivo puede comparar el `.id` de un campeón
@@ -8,34 +8,38 @@ todo, sobre `effects`/`tactical_uses` de las habilidades disponibles en
 la fase actual (vía `ctx.candidate_abilities()` / `ctx.enemy_abilities()`
 — nunca `champion.abilities` directo).
 
-Reciprocidad (hito 1.6, corrige un bug real encontrado en el hito
-anterior): una interacción mecánica DIRECTA y COMPARTIDA — un mismo eje
-enfrentado, o una habilidad de un lado contra una propiedad del otro —
-debe poder aparecer con polaridad opuesta quien sea candidato. El bug
-verificado en el hito 1.5: `RangeAccessRule`, `EarlyPressureVsScalingRule`,
-`WaveclearGatingRule` y `DisplacementVsMobilityRule` solo implementaban
-la mitad de la comparación (candidato favorecido → PRO), nunca la mitad
-en la que el ENEMIGO está favorecido → CONTRA para el candidato. Las
-cuatro quedan corregidas acá, calculando ambas direcciones dentro de un
-mismo `evaluate(ctx)` (ambos campeones ya están disponibles en `ctx`,
-no hace falta una "traza espejo"). `PokeVsSustainRule` NO tenía este bug:
-no describe un hecho compartido con un dueño ambiguo, son dos preguntas
-independientes por dirección (¿pokea el candidato? ¿tiene sustain el
-enemigo?) que ya se recalculan correctamente solas al invertir.
+RECIPROCIDAD. Una interacción mecánica DIRECTA y COMPARTIDA debe poder
+aparecer con polaridad correspondiente sea quien sea el candidato. El
+hito 1.6 corrigió cuatro reglas basadas en ejes, pero la auditoría de
+v1.6.1 encontró que dentro de la ex-G03 sobrevivían tres escaneos
+unidireccionales: el daño verdadero y la penetración solo se buscaban en
+`ctx.candidate_abilities()` (así que el remate de daño verdadero del
+rival no figuraba como riesgo de nadie), y la mitigación de un plan
+sostenido solo se buscaba en `ctx.enemy_abilities()` (así que el MISMO
+escudo valía 0.045 como ventaja propia y 0.084 como penalización ajena).
+La forma que evita reincidir es estructural, no de disciplina: cada
+submétodo recibe `owner`/`owner_abilities` y se invoca dos veces, una
+por dueño, con la MISMA fórmula de magnitud — nunca ramas separadas por
+dirección.
 
-Disciplina anti-doble-conteo: además de agrupar efectos de una misma
-habilidad en una sola RuleEffect (ver `DisplacementVsMobilityRule`),
-cuando dos causas DISTINTAS (misma regla en dos fases, o dos reglas
-distintas) describen la MISMA fuente mecánica exacta, se les asigna el
-mismo `causal_key` (`RuleEffect.causal_key`) para que
-`ReasoningTrace.deduped_for_scoring` las colapse a una sola contribución
-de score — la traza completa (todas las fases, todas las reglas) se
-conserva íntegra para trazabilidad; lo que se deduplica es el CÁLCULO,
-no la explicación disponible.
+ANTI-DOBLE-CONTEO. `causal_key` identifica la fuente mecánica exacta
+(`dueño:slot:efecto`). Toda entrada que pueda puntuar lo lleva, y también
+las observaciones sin score que representan un hecho compartido
+deduplicable, para que no inflen contradicciones ni condiciones al
+repetirse por fase. El scoring, el narrador y el cálculo de
+contradicciones leen la vista causal (`trace.deduped_for_scoring`); la
+traza cruda se conserva completa para auditoría.
 
-Guardrail temporal de esta V0 (documentado, revisable al incorporar los
-otros ocho campeones): máximo 15 clases de regla general. Este archivo
-más `stacking.py` suman 11.
+CERTEZA Y PROCEDENCIA (v1.6.1). `Support` separa "cuánta certeza hay"
+de "hacia dónde se inclina" (`Polarity`) y de "de qué depende"
+(`condition`/`ConditionKind`). `Provenance` marca si el hecho se derivó
+del kit o si es un prior editorial de un eje escrito a mano.
+
+Guardrail de complejidad (registry.py): el tope de cantidad de reglas es
+BLANDO; lo que se verifica duro es que ninguna regla acumule más de tres
+categorías y que toda entrada puntuable traiga `causal_key`. Fue el
+tope duro de 15 el que motivó fusionar la mitigación dentro de la regla
+de daño en el hito 1.6, y esa fusión es la que escondió la asimetría.
 """
 
 from __future__ import annotations
@@ -49,7 +53,9 @@ from lol_reasoner.domain.enums import (
     Factor,
     Phase,
     Polarity,
+    Provenance,
     ResourceType,
+    Support,
     TacticalUse,
 )
 from lol_reasoner.reasoning.context import ReasoningContext
@@ -64,6 +70,10 @@ _SIDE_ONLY = frozenset({Phase.SIDE_LANE_LATE})
 _CONTROL_MOMENT_TYPES = frozenset({EffectType.DISPLACE_ENEMY, EffectType.BRIEF_CC, EffectType.INTERRUPT})
 _DISPLACEMENT_QUALIFYING_USES = frozenset({TacticalUse.INITIATE, TacticalUse.ANTI_KITE, TacticalUse.SETUP_COMBO})
 _SUSTAINED_QUALIFYING_USES = frozenset({TacticalUse.TRADE_EXTEND, TacticalUse.SUSTAIN})
+_PENETRATION_TYPES = (EffectType.MAGIC_PENETRATION, EffectType.ARMOR_PENETRATION)
+
+# Un pull acerca al rival a quien lo castea (ver Effect.displacement_vector).
+_PULL_TOWARD_SELF = "toward_self"
 
 
 def _fact(champion_id: str, ability_slot: str, effect_type: EffectType, value: object) -> FactRef:
@@ -74,15 +84,27 @@ def _fact(champion_id: str, ability_slot: str, effect_type: EffectType, value: o
     return FactRef(f"{champion_id}.abilities.{ability_slot}.effects.{effect_type.value}", value)
 
 
+def _sides(ctx: ReasoningContext):
+    """Los dos dueños posibles de un hecho, con la polaridad que le
+    corresponde desde la perspectiva del candidato. Recorrer esto es lo
+    que hace imposible escribir un submétodo unidireccional por descuido:
+    la magnitud se calcula una sola vez, en un solo lugar, para ambos."""
+
+    return (
+        (ctx.candidate, ctx.candidate_abilities(), ctx.enemy, Polarity.PRO),
+        (ctx.enemy, ctx.enemy_abilities(), ctx.candidate, Polarity.CONTRA),
+    )
+
+
 class RangeAccessRule(Rule):
     """El rango y el kite castigan a quien tiene poco acceso al objetivo.
 
     Bidireccional: si el CANDIDATO tiene más rango y el enemigo no puede
     cerrarlo con un reposicionamiento propio (`SELF_DASH`) → PRO. Si es
     el ENEMIGO el que tiene más rango y es el CANDIDATO quien no puede
-    cerrarlo → CONTRA. Un efecto que desplaza al ENEMIGO (`DISPLACE_ENEMY`,
-    como Apprehend) no cuenta como acceso al objetivo para quien lo usa:
-    solo `SELF_DASH` cierra distancia para uno mismo.
+    cerrarlo → CONTRA. Un efecto que desplaza al ENEMIGO (`DISPLACE_ENEMY`)
+    no cuenta como acceso al objetivo para quien lo usa: solo `SELF_DASH`
+    cierra distancia para uno mismo.
     """
 
     id = "G01"
@@ -120,240 +142,365 @@ class RangeAccessRule(Rule):
                 FactRef(f"{behind.id}.axes.attack_range", behind.axis(Axis.ATTACK_RANGE)),
             ),
             condition="mientras se conserve el espacio y no se reciba control duro de cierre de distancia",
+            condition_kind=ConditionKind.STRATEGIC,
+            support=Support.CONDITIONED,
+            # Misma brecha de rango en early y side lane: una sola causa.
+            causal_key=f"{ahead.id}:axis:attack_range>{behind.id}",
         )
 
 
-class PokeVsSustainRule(Rule):
-    """Poke sostenido por HEAL estructural vs. sustain rival que licua el poke.
+class TradeSustainRule(Rule):
+    """Curación estructural DENTRO de un intercambio, derivada de efectos.
 
-    No trata a un campeón como "identidad de poke" por una etiqueta
-    global: inspecciona qué habilidades disponibles en la fase tienen
-    `tactical_uses` con `POKE`, sean o no el foco central del kit.
+    v1.6.1 reemplaza a la vieja `PokeVsSustainRule`, que tenía dos
+    problemas distintos:
 
-    No bidireccional por diseño: "mi poke me cura" y "el sustain rival
-    licua mi poke" son dos preguntas independientes sobre herramientas
-    propias, no un único hecho compartido con dueño ambiguo — se
-    recalculan solas y correctamente al invertir candidato/enemigo.
+      1. Leía `TacticalUse.POKE` y describía a un campeón cuerpo a cuerpo
+         como si su Q fuera poke a distancia.
+      2. Infería un CONTRA desde el eje editorial `axes.sustain >= 3` del
+         rival. Ese umbral era un acantilado: mover ese eje un solo punto
+         (2 -> 3) cambiaba el GlobalScore 2.76 puntos, doce veces la
+         diferencia total entre los dos candidatos del par evaluado. Un
+         número escrito a mano decidía el matchup.
+
+    Ahora la regla solo mira efectos: una habilidad con `HEAL` cuyo uso
+    táctico sea de intercambio (`TRADE_EXTEND`/`SUSTAIN`) sostiene a su
+    dueño dentro del trade, bajo las condiciones que ese efecto declare.
+    Bidireccional y con la misma fórmula de magnitud para ambos lados.
+
+    El concepto de "sustain" no desaparece: deja de entrar como número
+    editorial. Derivarlo de efectos reales (curación, escudo, condición,
+    disponibilidad y frecuencia) queda en docs/backlog-v1.md. Para esta
+    versión es preferible que la regla no puntúe a conservar una
+    inferencia falsa.
     """
 
     id = "G02"
-    summary = "Un poke respaldado por curación estructural sostiene la lane; el sustain rival erosiona el valor del poke."
-    category = "poke_vs_sustain"
-    categories = frozenset({"poke_vs_sustain"})
+    summary = "Una curación estructural condicionada sostiene a su dueño dentro de un intercambio extendido; el otro lado la enfrenta como riesgo."
+    category = "trade_sustain"
+    categories = frozenset({"trade_sustain"})
     phases = frozenset({Phase.EARLY_LANE, Phase.FIRST_ITEM})
 
     def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
-        poke_abilities = [a for a in ctx.candidate_abilities() if TacticalUse.POKE in a.tactical_uses]
-        if not poke_abilities:
-            return []
-
         effects: list[RuleEffect] = []
-        for ability in poke_abilities:
-            heals = ability.effects_of(EffectType.HEAL)
-            if not heals:
-                continue
-            magnitude = max(e.magnitude for e in heals)
-            effects.append(
-                RuleEffect(
-                    factor=Factor.LANE_PATTERN,
-                    polarity=Polarity.PRO,
-                    delta=0.08 * magnitude / 4,
-                    text=(
-                        f"{ability.name} de {ctx.candidate.name} no solo pokea: también lo cura al conectar "
-                        "bajo condición, lo que sostiene su presencia en la lane más allá de un poke puro."
-                    ),
-                    premises=(_fact(ctx.candidate.id, ability.slot, EffectType.HEAL, magnitude),),
-                )
-            )
+        for owner, owner_abilities, other, polarity in _sides(ctx):
+            effects.extend(self._heal_in_trade(owner, owner_abilities, other, polarity))
+        return effects
 
-        enemy_sustain = ctx.enemy.axis(Axis.SUSTAIN)
-        if enemy_sustain >= 3:
+    @staticmethod
+    def _heal_in_trade(owner, owner_abilities, other, polarity: Polarity) -> list[RuleEffect]:
+        effects: list[RuleEffect] = []
+        for ability in owner_abilities:
+            heals = ability.effects_of(EffectType.HEAL)
+            if not heals or not (ability.tactical_uses & _SUSTAINED_QUALIFYING_USES):
+                continue
+            best = max(heals, key=lambda e: e.magnitude)
+            conditions = sorted(c.value for c in best.conditions)
+            readable = ", ".join(c.replace("_", " ") for c in conditions)
+            condition_text = (
+                f"solo se cobra si {ability.name} conecta cumpliendo sus condiciones ({readable})"
+                if conditions
+                else f"solo se cobra si {ability.name} conecta"
+            )
+            if polarity == Polarity.PRO:
+                text = (
+                    f"{ability.name} de {owner.name} recupera vida dentro del propio intercambio cuando "
+                    f"conecta bajo su condición, lo que sostiene un trade extendido contra {other.name}."
+                )
+            else:
+                text = (
+                    f"{ability.name} de {owner.name} le recupera vida dentro del intercambio cuando conecta "
+                    f"bajo su condición, lo que erosiona el saldo de un trade extendido para {other.name}."
+                )
             effects.append(
                 RuleEffect(
                     factor=Factor.LANE_PATTERN,
-                    polarity=Polarity.CONTRA,
-                    delta=0.2 * enemy_sustain / 4,
-                    text=(
-                        f"El sustain alto de {ctx.enemy.name} licua buena parte del poke de {ctx.candidate.name} "
-                        "si no viene acompañado de una amenaza real de all-in."
+                    polarity=polarity,
+                    delta=0.09 * best.magnitude / 4,
+                    text=text,
+                    premises=(
+                        _fact(owner.id, ability.slot, EffectType.HEAL, best.magnitude),
+                        FactRef(f"{owner.id}.abilities.{ability.slot}.conditions", tuple(conditions)),
                     ),
-                    premises=(FactRef(f"{ctx.enemy.id}.axes.sustain", enemy_sustain),),
-                    condition="se sostiene solo si el poke no puede convertirse en un all-in cuando el rival gasta sustain",
-                    condition_kind=ConditionKind.STRATEGIC,
+                    condition=condition_text,
+                    condition_kind=ConditionKind.EXECUTION,
+                    support=Support.CONDITIONED,
+                    causal_key=f"{owner.id}:{ability.slot}:{EffectType.HEAL.value}",
                 )
             )
         return effects
 
 
-class DamageTypeAndShieldRule(Rule):
-    """Daño, mitigación por escudo, y el matiz de "impacto único" — todo lo
-    que gira en torno a cuánto valor conserva un daño frente a la
-    resistencia/absorción rival. Cuatro consideraciones, cada una con su
-    propio `causal_key` cuando corresponde:
+class DamageVsResistancesRule(Rule):
+    """Cuánto valor de daño sobrevive a la resistencia rival: daño
+    verdadero y penetración, con la cadena de acumulación cuando existe.
 
-      1. `true_damage_value`: el daño verdadero ignora resistencias —
-         solo si la habilidad que lo porta está disponible en la fase.
-      2. `penetration_value`: la penetración (mágica o de armadura)
-         conserva valor de daño contra durabilidad acumulada.
-      3. `shield_mitigation` + `damage_mitigation`: un escudo común
-         puede absorber CUALQUIER daño (verdadero incluido) — tener
-         daño verdadero no implica atravesar escudos. Cuando además el
-         escudo mitiga específicamente un plan de intercambio sostenido
-         (y puede convertir el remanente en curación), esa nota más
-         rica comparte el `causal_key` del escudo genérico: es la MISMA
-         capacidad de absorción explicada con dos matices, no dos
-         ventajas independientes (se deduplica en scoring, ver
-         `ReasoningTrace.deduped_for_scoring`). Ninguna habilidad de
-         este hito declara `bypasses_shields=True`.
-      4. `single_target_bonus_damage`: una habilidad con daño aumentado
-         condicionado a `ON_SINGLE_TARGET_HIT` no puntúa (CONDITIONAL,
-         delta no aplicado); se nombra el matiz de que estar dentro de
-         un aislamiento de duelo (`ISOLATE_DUEL`, desde que esa
-         habilidad esté disponible) facilita cumplir esa condición,
-         sin asignarle todavía una ventaja numérica firme.
+    BIDIRECCIONAL (corrección de v1.6.1). Antes este escaneo miraba solo
+    `ctx.candidate_abilities()`, así que un remate de daño verdadero del
+    rival simplemente no existía en la evaluación: al consultar por el
+    otro lado, su lista de riesgos no lo mencionaba en ninguna parte
+    mientras su propia ventaja de escudo sí decía "incluido el daño
+    verdadero". La amenaza se nombraba al pasar sin haberse registrado.
+
+    CADENA CAUSAL ÚNICA. Cuando el efecto de daño declara `stack_scaling`,
+    la habilidad no produce dos ventajas separadas ("hace daño verdadero"
+    + "escala con cargas"): produce UNA sola entrada que explica la
+    cadena completa — ignora resistencias por el tipo de daño, su valor
+    crece con las cargas ya aplicadas, la recompensa de umbral la
+    amplifica si está disponible, usarla con pocas cargas conserva el
+    tipo de daño pero sacrifica buena parte del potencial, y un escudo
+    común puede absorberla igual. Esa relación se cuenta una vez acá; la
+    comparación de recompensas de acumulación vive en StackRaceRule y no
+    vuelve a puntuar el mismo vínculo.
     """
 
     id = "G03"
-    summary = "El daño verdadero ignora resistencias, pero un escudo puede absorberlo igual; la penetración conserva valor; un escudo acumulable mitiga parcialmente un plan sostenido."
-    categories = frozenset({
-        "true_damage_value",
-        "penetration_value",
-        "shield_mitigation",
-        "damage_mitigation",
-        "single_target_bonus_damage",
-    })
+    summary = "El daño verdadero ignora resistencias y la penetración conserva valor frente a durabilidad acumulada, para el lado que los tenga."
+    categories = frozenset({"true_damage_value", "penetration_value"})
     category = "true_damage_value"
 
     def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
-        effects.extend(self._true_damage_and_penetration(ctx))
-        effects.extend(self._shield_mitigation(ctx, owner_abilities=ctx.enemy_abilities(), owner=ctx.enemy, victim=ctx.candidate, polarity=Polarity.CONTRA))
-        effects.extend(self._shield_mitigation(ctx, owner_abilities=ctx.candidate_abilities(), owner=ctx.candidate, victim=ctx.enemy, polarity=Polarity.PRO))
-        effects.extend(self._damage_mitigation_of_sustained_plan(ctx))
-        effects.extend(self._single_target_bonus(ctx, owner_abilities=ctx.candidate_abilities(), owner=ctx.candidate))
-        effects.extend(self._single_target_bonus(ctx, owner_abilities=ctx.enemy_abilities(), owner=ctx.enemy))
+        for owner, owner_abilities, other, polarity in _sides(ctx):
+            effects.extend(self._true_damage(ctx, owner, owner_abilities, other, polarity))
+            effects.extend(self._penetration(owner, owner_abilities, other, polarity))
         return effects
 
-    def _true_damage_and_penetration(self, ctx: ReasoningContext) -> list[RuleEffect]:
+    def _true_damage(self, ctx, owner, owner_abilities, other, polarity: Polarity) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
-        for ability in ctx.candidate_abilities():
+        for ability in owner_abilities:
             for effect in ability.effects_of(EffectType.DAMAGE):
                 if effect.damage_type != DamageType.TRUE:
                     continue
-                effects.append(
-                    RuleEffect(
-                        factor=Factor.MECHANICAL_INTERACTION,
-                        polarity=Polarity.PRO,
-                        delta=0.1 * effect.magnitude / 4,
-                        text=(
-                            f"El componente de daño verdadero de {ability.name} de {ctx.candidate.name} ignora "
-                            f"resistencias acumuladas por {ctx.enemy.name}, por definición del tipo de daño."
-                        ),
-                        premises=(_fact(ctx.candidate.id, ability.slot, EffectType.DAMAGE, effect.damage_type.value),),
-                        category="true_damage_value",
-                        causal_key=f"{ctx.candidate.id}:{ability.slot}:damage:true",
-                    )
+                premises = [_fact(owner.id, ability.slot, EffectType.DAMAGE, effect.damage_type.value)]
+                chain = self._stack_chain_clause(owner, ability, effect, premises)
+                shield_note = self._shield_caveat(ctx, other)
+                text = (
+                    f"El componente de daño verdadero de {ability.name} de {owner.name} ignora las "
+                    f"resistencias de {other.name} por definición del tipo de daño.{chain}{shield_note}"
                 )
-            for effect in ability.effects_of(EffectType.MAGIC_PENETRATION) + ability.effects_of(EffectType.ARMOR_PENETRATION):
                 effects.append(
                     RuleEffect(
                         factor=Factor.MECHANICAL_INTERACTION,
-                        polarity=Polarity.PRO,
-                        delta=0.06 * effect.magnitude / 4 if effect.magnitude else 0.02,
-                        text=(
-                            f"{ability.name} de {ctx.candidate.name} penetra parte de la resistencia de "
-                            f"{ctx.enemy.name}, conservando valor de daño contra su durabilidad acumulada."
-                        ),
-                        premises=(_fact(ctx.candidate.id, ability.slot, effect.type, effect.magnitude),),
-                        category="penetration_value",
-                        causal_key=f"{ctx.candidate.id}:{ability.slot}:{effect.type.value}",
+                        polarity=polarity,
+                        delta=0.1 * effect.magnitude / 4,
+                        text=text,
+                        premises=tuple(premises),
+                        condition=(
+                            "el tipo de daño no depende de nada, pero su magnitud sí depende de cuántas "
+                            "cargas se hayan aplicado antes de usarla"
+                        )
+                        if effect.stack_scaling
+                        else None,
+                        condition_kind=ConditionKind.STRATEGIC if effect.stack_scaling else None,
+                        support=Support.STRUCTURAL,
+                        category="true_damage_value",
+                        causal_key=f"{owner.id}:{ability.slot}:damage:true",
                     )
                 )
         return effects
 
-    def _shield_mitigation(self, ctx, *, owner_abilities, owner, victim, polarity: Polarity) -> list[RuleEffect]:
-        victim_damage_types = {
-            effect.damage_type
-            for ability in (ctx.candidate_abilities() if victim is ctx.candidate else ctx.enemy_abilities())
-            for effect in ability.effects_of(EffectType.DAMAGE)
-            if effect.damage_type is not None
-        }
-        if not victim_damage_types:
-            return []
+    @staticmethod
+    def _stack_chain_clause(owner, ability, effect, premises: list[FactRef]) -> str:
+        """La relación acumulación -> potencia de ESTA habilidad, citada
+        una sola vez y desde el propio efecto que escala."""
+
+        if not effect.stack_scaling:
+            return ""
+        mechanic = next((m for m in owner.stacking_mechanics if m.id == effect.stack_scaling), None)
+        if mechanic is None:
+            return ""
+        premises.append(FactRef(f"{owner.id}.abilities.{ability.slot}.effects.damage.stack_scaling", mechanic.id))
+        premises.append(FactRef(f"{owner.id}.stacking.{mechanic.id}.threshold", mechanic.threshold))
+        amplified = any(
+            e.type == EffectType.AMPLIFY_ABILITY and e.amplifies_slot == ability.slot
+            for e in mechanic.reward_effects
+        )
+        reward_clause = ""
+        if amplified:
+            premises.append(
+                FactRef(f"{owner.id}.stacking.{mechanic.id}.reward.amplifies_slot", ability.slot)
+            )
+            reward_clause = f" y alcanzar {mechanic.reward_name} la amplifica todavía más"
+        return (
+            f" Su valor crece con las cargas de {mechanic.name} ya aplicadas{reward_clause}: usarla con pocas "
+            "cargas conserva el tipo de daño pero sacrifica buena parte de su potencial, así que tenerla "
+            "disponible no implica que convenga usarla apenas se desbloquea."
+        )
+
+    @staticmethod
+    def _shield_caveat(ctx, other) -> str:
+        other_abilities = ctx.enemy_abilities() if other is ctx.enemy else ctx.candidate_abilities()
+        has_shield = any(a.effects_of(EffectType.SHIELD_FROM_STORED) for a in other_abilities)
+        if not has_shield:
+            return ""
+        return (
+            f" Ignorar resistencias no es ignorar absorción: un escudo de {other.name} puede absorber este "
+            "daño igual."
+        )
+
+    @staticmethod
+    def _penetration(owner, owner_abilities, other, polarity: Polarity) -> list[RuleEffect]:
+        """La penetración es una fortaleza REAL y se registra como tal
+        (`STRUCTURAL`, ventaja de su dueño y riesgo del rival), pero con
+        aporte efectivo CERO al score.
+
+        Por qué cero y no una magnitud pequeña: la penetración física y la
+        mágica compartían `magnitude: 1` en el KB y se cancelaban a
+        `+0.015` contra `-0.015`, como si fueran equivalentes. Compartir un
+        ordinal cualitativo no demuestra igual intensidad, ni igual
+        disponibilidad, ni igual relevancia contra las resistencias
+        concretas del rival. Cuantificar el impacto relativo exige valores
+        numéricos comparables, escalado por nivel, las resistencias del
+        objetivo y contexto de parche — nada de lo cual modela esta V0.
+
+        No es `AMBIGUOUS`: que la penetración exista y beneficie a su dueño
+        no tiene nada de ambiguo. Lo que no está calibrado es cuánto pesa.
+        """
+
+        effects: list[RuleEffect] = []
+        for ability in owner_abilities:
+            for effect_type in _PENETRATION_TYPES:
+                for effect in ability.effects_of(effect_type):
+                    resistance = (
+                        "resistencia mágica"
+                        if effect.type == EffectType.MAGIC_PENETRATION
+                        else "armadura"
+                    )
+                    effects.append(
+                        RuleEffect(
+                            factor=Factor.MECHANICAL_INTERACTION,
+                            polarity=polarity,
+                            delta=0.0,
+                            text=(
+                                f"{ability.name} de {owner.name} penetra parte de la {resistance} de "
+                                f"{other.name}, conservando valor de daño contra su durabilidad acumulada. "
+                                f"Se registra como fortaleza real, pero sin mover el score: esta V0 no puede "
+                                f"comparar la intensidad de una penetración contra la otra."
+                            ),
+                            premises=(_fact(owner.id, ability.slot, effect.type, effect.magnitude),),
+                            support=Support.STRUCTURAL,
+                            invalidated_if=(
+                                "el impacto relativo de la penetración no está calibrado: haría falta valor "
+                                "numérico, escalado por nivel, las resistencias concretas del objetivo y el "
+                                "contexto de parche"
+                            ),
+                            category="penetration_value",
+                            causal_key=f"{owner.id}:{ability.slot}:{effect.type.value}",
+                        )
+                    )
+        return effects
+
+
+class ShieldAbsorptionRule(Rule):
+    """Un escudo acumulado absorbe daño — de cualquier tipo, incluido el
+    verdadero — y puede convertir el remanente en curación.
+
+    v1.6.1 corrige la asimetría numérica: la MISMA capacidad valía 0.045
+    como ventaja de su dueño y 0.084 como penalización del rival, porque
+    la variante "rica" (la que además mencionaba el plan sostenido y la
+    conversión a curación) solo se calculaba escaneando al enemigo. Ahora
+    hay una sola fórmula, dependiente solo del kit del dueño, evaluada
+    dos veces con la misma magnitud y polaridad opuesta.
+
+    La explicación se mantiene proporcional a lo que el escudo hace: si
+    hay escudo acumulado y se activa a tiempo, absorbe parte del daño;
+    puede convertir el remanente en curación; NO elimina cargas ya
+    aplicadas, NO impide que se sigan acumulando, NO corta el intercambio
+    y NO bloquea automáticamente un all-in. No se afirma que sea grande
+    ni chico: no hay dato que lo justifique.
+    """
+
+    id = "G16"
+    summary = "Un escudo construido a partir de daño acumulado absorbe parte del daño recibido, incluido el verdadero, sin eliminar cargas ni cortar el intercambio."
+    category = "shield_mitigation"
+    categories = frozenset({"shield_mitigation"})
+
+    def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
+        effects: list[RuleEffect] = []
+        for owner, owner_abilities, other, polarity in _sides(ctx):
+            other_abilities = ctx.enemy_abilities() if other is ctx.enemy else ctx.candidate_abilities()
+            effects.extend(self._absorption(owner, owner_abilities, other, other_abilities, polarity))
+        return effects
+
+    @staticmethod
+    def _absorption(owner, owner_abilities, other, other_abilities, polarity: Polarity) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
         for ability in owner_abilities:
             shields = ability.effects_of(EffectType.SHIELD_FROM_STORED)
             if not shields:
                 continue
             magnitude = max(e.magnitude for e in shields)
-            if polarity == Polarity.CONTRA:
-                text = (
-                    f"{ability.name} de {owner.name} puede absorber parte del daño de {victim.name}, incluido "
-                    "cualquier componente de daño verdadero: un escudo común absorbe todo tipo de daño salvo que "
-                    "una habilidad concreta declare explícitamente que lo ignora, y ninguna lo hace en esta base "
-                    "de conocimiento."
-                )
-            else:
-                text = f"{ability.name} de {owner.name} puede absorber parte del daño de {victim.name}, incluido cualquier componente de daño verdadero que traiga."
+            converts = bool(ability.effects_of(EffectType.CONVERT_SHIELD_TO_HEAL))
+            # Una sola fórmula, dependiente solo del kit del DUEÑO: la
+            # magnitud no puede cambiar según quién haga la consulta.
+            delta = 0.06 * magnitude / 4 + (0.02 if converts else 0.0)
+
+            premises = [_fact(owner.id, ability.slot, EffectType.SHIELD_FROM_STORED, magnitude)]
+            convert_clause = ""
+            if converts:
+                premises.append(_fact(owner.id, ability.slot, EffectType.CONVERT_SHIELD_TO_HEAL, True))
+                convert_clause = " y puede convertir el remanente en curación al reactivarse"
+
+            other_extends = any(a.tactical_uses & _SUSTAINED_QUALIFYING_USES for a in other_abilities)
+            sustained_clause = (
+                f" Contra un plan de intercambio extendido como el de {other.name}, eso resta parte del valor "
+                "acumulado del trade."
+                if other_extends
+                else ""
+            )
+            text = (
+                f"{ability.name} de {owner.name} absorbe parte del daño recibido —incluido el verdadero— si hay "
+                f"escudo acumulado y se activa a tiempo{convert_clause}.{sustained_clause} No borra cargas ya "
+                f"aplicadas ni impide que se sigan aplicando, y no bloquea por sí sola un all-in completo."
+            )
             effects.append(
                 RuleEffect(
                     factor=Factor.MECHANICAL_INTERACTION,
                     polarity=polarity,
-                    delta=0.06 * magnitude / 4,
+                    delta=delta,
                     text=text,
-                    premises=(_fact(owner.id, ability.slot, EffectType.SHIELD_FROM_STORED, magnitude),),
-                    condition="el efecto depende de cuánto escudo haya disponible en el momento del impacto",
+                    premises=tuple(premises),
+                    condition=(
+                        "depende de cuánta capacidad de absorción se haya acumulado antes del impacto y del "
+                        "momento en que se active"
+                    ),
+                    condition_kind=ConditionKind.STRATEGIC,
+                    support=Support.CONDITIONED,
                     category="shield_mitigation",
                     causal_key=f"{owner.id}:{ability.slot}:{EffectType.SHIELD_FROM_STORED.value}",
                 )
             )
         return effects
 
-    def _damage_mitigation_of_sustained_plan(self, ctx: ReasoningContext) -> list[RuleEffect]:
-        """El matiz específico: un escudo acumulable no solo absorbe daño
-        genérico (ver `_shield_mitigation`), también mitiga en particular
-        un plan de intercambio sostenido/extendido, y puede convertir el
-        remanente en curación. Comparte `causal_key` con la entrada
-        `shield_mitigation` CONTRA de la misma habilidad — es la MISMA
-        capacidad, un matiz más rico, no una segunda ventaja."""
 
-        candidate_is_sustained = any(a.tactical_uses & _SUSTAINED_QUALIFYING_USES for a in ctx.candidate_abilities())
-        if not candidate_is_sustained:
-            return []
+class SingleTargetConditionRule(Rule):
+    """Daño aumentado cuando el impacto alcanza a UN SOLO enemigo.
+
+    `ON_SINGLE_TARGET_HIT` significa exactamente eso: el impacto no se
+    repartió con otras unidades. Los minions cuentan para negar el
+    aumento — no es "sin otros campeones cerca", ni es `ISOLATE_DUEL`.
+
+    Un aislamiento de duelo disponible en la fase facilita
+    ESTRUCTURALMENTE cumplir la condición (dentro de esa zona no están
+    las unidades normales de la línea), pero no la garantiza: la
+    habilidad todavía tiene que acertarse. Por eso la entrada se inclina
+    de forma pequeña y CONDITIONED en vez de quedarse muda o de afirmar
+    una ventaja firme. El estado de la oleada no se modela en esta V0.
+    """
+
+    id = "G17"
+    summary = "Un daño condicionado a impactar a un único enemigo se inclina levemente hacia su dueño, y más si un aislamiento retira las unidades de la línea."
+    category = "single_target_bonus_damage"
+    categories = frozenset({"single_target_bonus_damage"})
+
+    def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
-        for ability in ctx.enemy_abilities():
-            shields = ability.effects_of(EffectType.SHIELD_FROM_STORED)
-            if not shields:
-                continue
-            has_heal_conversion = bool(ability.effects_of(EffectType.CONVERT_SHIELD_TO_HEAL))
-            magnitude = max(e.magnitude for e in shields)
-            delta = 0.08 * magnitude / 4 * (1.4 if has_heal_conversion else 1.0)
-            extra = ", y además puede convertir el remanente en curación al reactivarse" if has_heal_conversion else ""
-            effects.append(
-                RuleEffect(
-                    factor=Factor.MECHANICAL_INTERACTION,
-                    polarity=Polarity.CONTRA,
-                    delta=delta,
-                    text=(
-                        f"{ability.name} de {ctx.enemy.name} acumula capacidad de absorción a partir del daño "
-                        f"propio y recibido, lo que reduce parte del valor de un intercambio extendido de "
-                        f"{ctx.candidate.name}{extra}. No elimina ni revierte cargas de acumulación ya aplicadas, "
-                        "ni corta el intercambio por sí sola: salir de él depende del posicionamiento y de otras "
-                        "acciones."
-                    ),
-                    premises=(
-                        _fact(ctx.enemy.id, ability.slot, EffectType.SHIELD_FROM_STORED, magnitude),
-                        *((_fact(ctx.enemy.id, ability.slot, EffectType.CONVERT_SHIELD_TO_HEAL, True),) if has_heal_conversion else ()),
-                    ),
-                    condition="el efecto depende de cuánta capacidad de absorción se haya acumulado y del momento en que se active",
-                    category="damage_mitigation",
-                    causal_key=f"{ctx.enemy.id}:{ability.slot}:{EffectType.SHIELD_FROM_STORED.value}",
-                )
-            )
+        for owner, owner_abilities, other, polarity in _sides(ctx):
+            effects.extend(self._single_target(ctx, owner, owner_abilities, other, polarity))
         return effects
 
-    def _single_target_bonus(self, ctx: ReasoningContext, *, owner_abilities, owner) -> list[RuleEffect]:
-        other = ctx.enemy if owner is ctx.candidate else ctx.candidate
+    def _single_target(self, ctx, owner, owner_abilities, other, polarity: Polarity) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
         for ability in owner_abilities:
             damages = ability.effects_of(EffectType.DAMAGE)
@@ -361,55 +508,58 @@ class DamageTypeAndShieldRule(Rule):
             boosted = [e for e in damages if EffectCondition.ON_SINGLE_TARGET_HIT in e.conditions]
             if not (base and boosted):
                 continue
-            isolator = next(
-                (c for c in (ctx.candidate, ctx.enemy) if any(EffectType.ISOLATE_DUEL in a.effect_types() for a in (ctx.candidate_abilities() if c is ctx.candidate else ctx.enemy_abilities()))),
-                None,
-            )
-            isolation_note = ""
-            if isolator is not None:
-                isolation_note = (
-                    f" Dentro del aislamiento de duelo de {isolator.name} no están las unidades normales de la "
-                    "línea, por lo que resulta más sencillo cumplir la condición de único objetivo — aunque la "
-                    "habilidad todavía debe acertarse."
-                )
-            if owner is ctx.candidate:
-                text = (
-                    f"{ability.name} de {owner.name} inflige más daño si el impacto alcanza a un único enemigo; "
-                    f"golpear también minions u otras unidades niega ese aumento. El estado de la oleada no está "
-                    f"modelado en esta V0.{isolation_note}"
-                )
-            else:
-                text = (
-                    f"{ability.name} de {owner.name} (rival) inflige más daño si el impacto alcanza a un único "
-                    f"enemigo; {ctx.candidate.name} enfrenta ese riesgo reforzado cuando la oleada no está presente "
-                    f"para absorberlo. El estado de la oleada no está modelado en esta V0.{isolation_note}"
-                )
+
             premises = [
                 FactRef(f"{owner.id}.abilities.{ability.slot}.effects.damage.base", max(e.magnitude for e in base)),
                 FactRef(f"{owner.id}.abilities.{ability.slot}.effects.damage.boosted", max(e.magnitude for e in boosted)),
                 FactRef(f"{owner.id}.abilities.{ability.slot}.conditions.{EffectCondition.ON_SINGLE_TARGET_HIT.value}", True),
             ]
-            if isolator is not None:
-                isolator_ability = next(
-                    a for a in (ctx.candidate_abilities() if isolator is ctx.candidate else ctx.enemy_abilities())
-                    if EffectType.ISOLATE_DUEL in a.effect_types()
+            isolation_note = self._isolation_clause(ctx, premises)
+
+            if polarity == Polarity.PRO:
+                text = (
+                    f"{ability.name} de {owner.name} inflige más daño si el impacto alcanza a un único enemigo; "
+                    f"golpear también minions u otras unidades niega ese aumento.{isolation_note}"
                 )
-                premises.append(_fact(isolator.id, isolator_ability.slot, EffectType.ISOLATE_DUEL, True))
+            else:
+                text = (
+                    f"{ability.name} de {owner.name} inflige más daño si el impacto alcanza a un único enemigo, "
+                    f"y {other.name} recibe ese aumento cuando no hay minions ni otras unidades repartiendo el "
+                    f"impacto.{isolation_note}"
+                )
             effects.append(
                 RuleEffect(
                     factor=Factor.MECHANICAL_INTERACTION,
-                    polarity=Polarity.CONDITIONAL,
-                    delta=0.05,
+                    polarity=polarity,
+                    delta=0.04,
                     text=text,
                     premises=tuple(premises),
-                    condition="depende de que el impacto no se reparta con minions u otras unidades",
-                    invalidated_if="el estado de la oleada (minions presentes) no se modela en esta V0",
+                    condition=(
+                        "depende de que el impacto no se reparta con minions u otras unidades, y la habilidad "
+                        "todavía tiene que acertarse"
+                    ),
                     condition_kind=ConditionKind.STRATEGIC,
+                    support=Support.CONDITIONED,
+                    invalidated_if="el estado de la oleada (minions presentes) no se modela en esta V0",
                     category="single_target_bonus_damage",
                     causal_key=f"{owner.id}:{ability.slot}:{EffectCondition.ON_SINGLE_TARGET_HIT.value}",
                 )
             )
         return effects
+
+    @staticmethod
+    def _isolation_clause(ctx, premises: list[FactRef]) -> str:
+        for champion, abilities in ((ctx.candidate, ctx.candidate_abilities()), (ctx.enemy, ctx.enemy_abilities())):
+            ability = next((a for a in abilities if EffectType.ISOLATE_DUEL in a.effect_types()), None)
+            if ability is None:
+                continue
+            premises.append(_fact(champion.id, ability.slot, EffectType.ISOLATE_DUEL, True))
+            return (
+                f" Dentro del aislamiento de {ability.name} de {champion.name} no están las unidades normales "
+                "de la línea, así que la condición de único objetivo resulta más fácil de cumplir — aunque la "
+                "habilidad todavía debe acertarse."
+            )
+        return ""
 
 
 class IsolationRule(Rule):
@@ -421,11 +571,10 @@ class IsolationRule(Rule):
 
     `restrict_arena` no es una ventaja automática para quien posee el
     aislamiento: es de doble filo. Favorece a su dueño al mantener al
-    rival dentro de la zona (acompañando el robo de estadísticas), pero
-    también puede facilitar que el lado que busca un intercambio
-    extendido (`TRADE_EXTEND`/`SUSTAIN`) mantenga contacto y complete su
-    propia mecánica de acumulación. Por eso queda `CONDITIONAL`
-    (`STRATEGIC`), citada en ambas direcciones, sin delta de score.
+    rival dentro de la zona, pero también puede facilitar que el lado que
+    busca un intercambio extendido mantenga contacto y complete su propia
+    mecánica de acumulación. Por eso queda `AMBIGUOUS`: aporta cero al
+    score y se conserva entera en la explicación.
     """
 
     id = "G05"
@@ -435,19 +584,18 @@ class IsolationRule(Rule):
 
     def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
-        effects.extend(self._stat_steal(ctx, owner_abilities=ctx.enemy_abilities(), owner=ctx.enemy, victim=ctx.candidate, polarity=Polarity.CONTRA))
-        effects.extend(self._stat_steal(ctx, owner_abilities=ctx.candidate_abilities(), owner=ctx.candidate, victim=ctx.enemy, polarity=Polarity.PRO))
-        effects.extend(self._restrict_arena(ctx, owner_abilities=ctx.enemy_abilities(), owner=ctx.enemy, other=ctx.candidate))
-        effects.extend(self._restrict_arena(ctx, owner_abilities=ctx.candidate_abilities(), owner=ctx.candidate, other=ctx.enemy))
+        for owner, owner_abilities, other, polarity in _sides(ctx):
+            effects.extend(self._stat_steal(owner, owner_abilities, other, polarity))
+            effects.extend(self._restrict_arena(ctx, owner, owner_abilities, other))
         return effects
 
     @staticmethod
-    def _stat_steal(ctx, *, owner_abilities, owner, victim, polarity: Polarity) -> list[RuleEffect]:
+    def _stat_steal(owner, owner_abilities, other, polarity: Polarity) -> list[RuleEffect]:
         effects = []
         for ability in owner_abilities:
-            # ISOLATE_DUEL: deliberadamente sin RuleEffect (ver docstring):
-            # no hay ayuda externa que perder en pure_1v1. Se referencia
-            # para dejar constancia de que fue considerado a propósito.
+            # ISOLATE_DUEL: deliberadamente sin RuleEffect propio (ver
+            # docstring). Se referencia para dejar constancia de que fue
+            # considerado a propósito; su consumidor real es G17.
             _ = EffectType.ISOLATE_DUEL in ability.effect_types()
             for effect in ability.effects_of(EffectType.STAT_STEAL):
                 effects.append(
@@ -456,11 +604,12 @@ class IsolationRule(Rule):
                         polarity=polarity,
                         delta=0.1 * effect.magnitude / 4,
                         text=(
-                            f"{ability.name} de {owner.name} roba parte de las estadísticas de {victim.name} "
+                            f"{ability.name} de {owner.name} roba parte de las estadísticas de {other.name} "
                             "mientras dura: una consecuencia directa dentro del propio 1v1, no de perder ayuda "
                             "externa."
                         ),
                         premises=(_fact(owner.id, ability.slot, EffectType.STAT_STEAL, effect.magnitude),),
+                        support=Support.STRUCTURAL,
                         category="isolation_stat_steal",
                         causal_key=f"{owner.id}:{ability.slot}:{EffectType.STAT_STEAL.value}",
                     )
@@ -468,32 +617,96 @@ class IsolationRule(Rule):
         return effects
 
     @staticmethod
-    def _restrict_arena(ctx, *, owner_abilities, owner, other) -> list[RuleEffect]:
+    def _restrict_arena(ctx, owner, owner_abilities, other) -> list[RuleEffect]:
+        """La geometría del aislamiento, no solo el robo de estadísticas.
+
+        Restringir el espacio del duelo tiene consecuencias que van más
+        allá de quién lo creó: cortar o espaciar el intercambio se vuelve
+        más difícil PARA LOS DOS, el trade tiende a extenderse, no está la
+        oleada para repartir un impacto que exige objetivo único, y ambos
+        lados quedan más cerca de completar sus acumulaciones. Nada de eso
+        favorece automáticamente a quien posee el aislamiento: la misma
+        zona que sostiene su plan puede darle al otro el contacto que
+        necesitaba.
+
+        No se vuelve a puntuar "quitar ayuda externa": esta consulta ya
+        representa un 1v1, así que no hay ayuda que quitar.
+        """
+
         effects = []
+        other_abilities = ctx.enemy_abilities() if other is ctx.enemy else ctx.candidate_abilities()
         for ability in owner_abilities:
             for effect in ability.effects_of(EffectType.RESTRICT_ARENA):
-                other_extends = any(a.tactical_uses & _SUSTAINED_QUALIFYING_USES for a in (ctx.candidate_abilities() if other is ctx.candidate else ctx.enemy_abilities()))
-                condition = (
-                    f"favorece a {owner.name} al mantener a {other.name} dentro de la zona, acompañando el robo "
-                    "de estadísticas"
-                )
-                if other_extends:
-                    condition += (
-                        f", pero también puede ayudar a {other.name} a mantener contacto y completar su propio "
-                        "plan de intercambio extendido"
+                premises = [_fact(owner.id, ability.slot, EffectType.RESTRICT_ARENA, effect.magnitude)]
+                clauses = [
+                    f"{ability.name} de {owner.name} restringe el espacio del duelo respecto de la lane abierta: "
+                    f"con menos espacio, cortar o espaciar el intercambio se vuelve más difícil para los dos "
+                    f"lados, y el trade tiende a extenderse."
+                ]
+
+                # Quién busca extender: puede ser cualquiera de los dos.
+                extenders = [
+                    champion.name
+                    for champion, abilities in ((owner, owner_abilities), (other, other_abilities))
+                    if any(a.tactical_uses & _SUSTAINED_QUALIFYING_USES for a in abilities)
+                ]
+                if extenders:
+                    clauses.append(
+                        f"Eso favorece a quien quiera sostener el contacto ({', '.join(extenders)}), no "
+                        f"necesariamente a quien creó la zona."
                     )
+
+                # Sin oleada, la condición de objetivo único es más fácil de cumplir.
+                for champion, abilities in ((owner, owner_abilities), (other, other_abilities)):
+                    single_target = next(
+                        (
+                            a
+                            for a in abilities
+                            if any(EffectCondition.ON_SINGLE_TARGET_HIT in e.conditions for e in a.effects)
+                        ),
+                        None,
+                    )
+                    if single_target is not None:
+                        premises.append(
+                            FactRef(
+                                f"{champion.id}.abilities.{single_target.slot}.conditions."
+                                f"{EffectCondition.ON_SINGLE_TARGET_HIT.value}",
+                                True,
+                            )
+                        )
+                        clauses.append(
+                            f"Dentro de la zona no están las unidades normales de la línea, así que la condición "
+                            f"de objetivo único de {single_target.name} de {champion.name} resulta más fácil de "
+                            f"cumplir — sigue habiendo que acertarla."
+                        )
+
+                # Ambos pueden llegar a completar su acumulación.
+                if owner.stacking_mechanics and other.stacking_mechanics:
+                    owner_mech = owner.stacking_mechanics[0]
+                    other_mech = other.stacking_mechanics[0]
+                    premises.append(FactRef(f"{owner.id}.stacking.{owner_mech.id}.threshold", owner_mech.threshold))
+                    premises.append(FactRef(f"{other.id}.stacking.{other_mech.id}.threshold", other_mech.threshold))
+                    clauses.append(
+                        f"Un intercambio que se extiende acerca a los dos a su recompensa: tanto {owner_mech.name} "
+                        f"como {other_mech.name} pueden llegar a completarse."
+                    )
+
                 effects.append(
                     RuleEffect(
                         factor=Factor.MECHANICAL_INTERACTION,
                         polarity=Polarity.CONDITIONAL,
                         delta=0.04,
-                        text=(
-                            f"{ability.name} de {owner.name} restringe el espacio del duelo respecto de la lane "
-                            "abierta: el efecto es de doble filo, no una ventaja automática."
+                        text=" ".join(clauses),
+                        premises=tuple(premises),
+                        condition=(
+                            f"la geometría de la zona no favorece automáticamente a {owner.name}: qué lado "
+                            f"aprovecha mejor un intercambio extendido y sin oleada es lo que decide el saldo"
                         ),
-                        premises=(_fact(owner.id, ability.slot, EffectType.RESTRICT_ARENA, effect.magnitude),),
-                        condition=condition,
                         condition_kind=ConditionKind.STRATEGIC,
+                        support=Support.CONDITIONED,
+                        invalidated_if=(
+                            "el estado de la oleada y la geometría real del terreno no se modelan en esta V0"
+                        ),
                         category="isolation_arena",
                         causal_key=f"{owner.id}:{ability.slot}:{EffectType.RESTRICT_ARENA.value}",
                     )
@@ -501,58 +714,98 @@ class IsolationRule(Rule):
         return effects
 
 
-class EarlyPressureVsScalingRule(Rule):
-    """Presión temprana y escalado tardío pueden favorecer a lados opuestos
-    de la lane. Bidireccional: el lado con más presión temprana recibe
-    PRO en `early_lane` y el otro CONTRA (mismo hecho, polaridad
-    correspondiente); simétrico para `scaling` en `side_lane_late`."""
+class EditorialAxisPriorRule(Rule):
+    """Presión temprana y escalado tardío: priors EDITORIALES, no
+    conclusiones derivadas del kit.
+
+    v1.6.1. `axes.early_pressure` y `axes.scaling` son valoraciones
+    escritas a mano en el YAML. En el hito 1.6 producían entre el 40 % y
+    el 64 % de todo el movimiento de score del motor, presentadas al
+    consumidor como si fueran conclusiones mecánicas ("tiene más scaling
+    que X, 4 vs 2"). Ahora:
+
+      * ambas se marcan `Provenance.EDITORIAL_PRIOR`, lo que las pondera
+        con el peso reducido de `config/weights.yaml` y las etiqueta
+        explícitamente en el texto;
+      * `scaling` NO mueve el score en absoluto (`CONDITIONAL`): esta V0
+        no modela objetos, duración de partida ni teamfights, así que no
+        tiene con qué derivar una comparación de escalado. Queda como
+        dato descriptivo declarado;
+      * `early_pressure` conserva una inclinación pequeña, porque la fase
+        temprana sí está dentro de lo que el motor modela, pero acotada
+        para que no vuelva a decidir el matchup sola.
+
+    Los valores numéricos siguen en las premisas (auditables); el texto
+    no los presenta como conclusión objetiva. Derivar estos ejes del kit
+    está en docs/backlog-v1.md.
+    """
 
     id = "G07"
-    summary = "La presión temprana y el escalado tardío favorecen al lado con el eje más alto en esa fase; el otro lado recibe la contrapartida."
-    category = "phase_transition"
-    categories = frozenset({"phase_transition"})
+    summary = "Los ejes editoriales de presión temprana y escalado se declaran como valoración manual: se etiquetan, pesan poco y el escalado no mueve el score."
+    category = "editorial_axis_prior"
+    categories = frozenset({"editorial_axis_prior"})
     phases = frozenset({Phase.EARLY_LANE, Phase.SIDE_LANE_LATE})
 
     def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
         if ctx.phase == Phase.EARLY_LANE:
-            return self._compare(ctx, axis=Axis.EARLY_PRESSURE, factor=Factor.LANE_PATTERN, condition=None, condition_kind=None)
+            return self._prior(
+                ctx,
+                axis=Axis.EARLY_PRESSURE,
+                factor=Factor.LANE_PATTERN,
+                scores=True,
+                condition=(
+                    "es una valoración manual de la base de conocimiento sobre la fase temprana, no una "
+                    "conclusión derivada de las habilidades modeladas"
+                ),
+            )
         if ctx.phase == Phase.SIDE_LANE_LATE:
-            return self._compare(
+            return self._prior(
                 ctx,
                 axis=Axis.SCALING,
                 factor=Factor.SCALING_SIDELANE,
-                condition="depende de que la partida se extienda y de la ventaja de objetos acumulada",
-                condition_kind=ConditionKind.STRATEGIC,
+                scores=False,
+                condition=(
+                    "esta V0 no modela objetos, duración de partida ni combates de equipo: no puede derivar "
+                    "una comparación de escalado, así que este dato no mueve el score"
+                ),
             )
         return []
 
     @staticmethod
-    def _compare(ctx, *, axis: Axis, factor: Factor, condition, condition_kind) -> list[RuleEffect]:
+    def _prior(ctx, *, axis: Axis, factor: Factor, scores: bool, condition: str) -> list[RuleEffect]:
         diff = ctx.candidate.axis(axis) - ctx.enemy.axis(axis)
         if diff == 0:
             return []
-        polarity = Polarity.PRO if diff > 0 else Polarity.CONTRA
         ahead, behind = (ctx.candidate, ctx.enemy) if diff > 0 else (ctx.enemy, ctx.candidate)
-        # Solo la entrada CONTRA (candidato atrasado) lleva `condition`:
-        # es la que introduce la incertidumbre ("depende de que se
-        # extienda..."); la entrada PRO simplemente reporta el hecho.
-        effect_condition = condition if polarity == Polarity.CONTRA else None
-        effect_condition_kind = condition_kind if effect_condition else None
+        polarity = (Polarity.PRO if diff > 0 else Polarity.CONTRA) if scores else Polarity.CONDITIONAL
+        readable = axis.value.replace("_", " ")
         return [
             RuleEffect(
                 factor=factor,
                 polarity=polarity,
                 delta=0.15 * abs(diff),
                 text=(
-                    f"{ahead.name} tiene más {axis.value.replace('_', ' ')} que {behind.name} "
-                    f"({ahead.axis(axis)} vs {behind.axis(axis)})."
+                    f"La base de conocimiento estima a mano que {ahead.name} supera a {behind.name} en "
+                    f"{readable}. Es una valoración editorial cargada en el YAML, no algo que el motor haya "
+                    f"derivado de las habilidades modeladas"
+                    + (
+                        ". Se declara y se conserva en la traza, pero NO mueve el score: un eje escrito a mano "
+                        "no puede decidir un veredicto mecánico."
+                        if scores
+                        else ", y no mueve el score."
+                    )
                 ),
                 premises=(
                     FactRef(f"{ahead.id}.axes.{axis.value}", ahead.axis(axis)),
                     FactRef(f"{behind.id}.axes.{axis.value}", behind.axis(axis)),
                 ),
-                condition=effect_condition,
-                condition_kind=effect_condition_kind,
+                condition=condition,
+                condition_kind=ConditionKind.STRATEGIC,
+                support=Support.STRUCTURAL if scores else Support.AMBIGUOUS,
+                provenance=Provenance.EDITORIAL_PRIOR,
+                # Un mismo prior no puede multiplicarse por reaparecer en
+                # varias fases: una causa, una contribución.
+                causal_key=f"{ahead.id}:editorial_axis:{axis.value}>{behind.id}",
             )
         ]
 
@@ -597,7 +850,12 @@ class WaveclearGatingRule(Rule):
             premises=(
                 FactRef(f"{behind.id}.axes.waveclear", behind.axis(Axis.WAVECLEAR)),
                 FactRef(f"{ahead.id}.axes.waveclear", ahead.axis(Axis.WAVECLEAR)),
+                _fact(ahead.id, tool.slot, EffectType.DAMAGE, tool.name),
             ),
+            support=Support.CONDITIONED,
+            condition="depende de que el side lane se juegue con prioridad de wave, no de un duelo directo",
+            condition_kind=ConditionKind.STRATEGIC,
+            causal_key=f"{ahead.id}:axis:waveclear>{behind.id}",
         )
 
 
@@ -627,6 +885,9 @@ class AbilityRelianceReliabilityRule(Rule):
                     condition="si el rival puede esquivar, bloquear o forzar el uso en vacío de esa habilidad, la ventaja cae",
                     invalidated_if="no se modela la habilidad individual del jugador para ejecutar el combo",
                     condition_kind=ConditionKind.EXECUTION,
+                    support=Support.AMBIGUOUS,
+                    provenance=Provenance.EDITORIAL_PRIOR,
+                    causal_key=f"{ctx.candidate.id}:editorial_axis:ability_reliance",
                 )
             ]
         return []
@@ -657,51 +918,74 @@ class AllInFragilityRule(Rule):
                     ),
                     condition="el riesgo baja si el all-in llega con ventaja previa de vida o de objetos",
                     condition_kind=ConditionKind.STRATEGIC,
+                    support=Support.AMBIGUOUS,
+                    provenance=Provenance.EDITORIAL_PRIOR,
+                    causal_key=f"{ctx.candidate.id}:editorial_axis:all_in_fragility",
                 )
             ]
         return []
 
 
 class ResourceAttritionRule(Rule):
-    """Un poke repetible sin coste de maná tiene una limitación de recurso
-    distinta a la de un kit que sí paga maná — pero sigue limitado por
-    cooldown, acierto, rango/exposición y el riesgo de que el rival
-    castigue la aproximación. `EXECUTION`: acertar el poke a distancia
-    es, ante todo, una cuestión de ejecución del jugador."""
+    """Una habilidad repetible que no paga un recurso limitado.
+
+    Es el consumidor real de `TacticalUse.POKE`, y deliberadamente NO
+    convierte a nadie en "campeón de poke": describe una habilidad
+    concreta, con su cooldown, su exposición y su necesidad de acertar. No
+    puntúa mientras no se modelen cooldowns reales, acierto, secuencia ni
+    estado de la oleada.
+    """
 
     id = "G13"
-    summary = "Un poke sin coste de maná se sostiene de forma distinta, pero sigue limitado por cooldown, acierto y el riesgo de exponerse."
+    summary = "Una habilidad sin coste de recurso puede intentarse cada vez que esté disponible, pero sigue atada al cooldown, a la exposición y al acierto."
     category = "resource_attrition"
     categories = frozenset({"resource_attrition"})
     phases = frozenset({Phase.EARLY_LANE, Phase.FIRST_ITEM})
 
     def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
-        if ctx.candidate.casting_resource != ResourceType.RESOURCELESS:
+        effects: list[RuleEffect] = []
+        for owner, owner_abilities, other, _polarity in _sides(ctx):
+            effects.extend(self._resourceless(owner, owner_abilities, other))
+        return effects
+
+    @staticmethod
+    def _resourceless(owner, owner_abilities, other) -> list[RuleEffect]:
+        if owner.casting_resource != ResourceType.RESOURCELESS:
             return []
-        poke_abilities = [a for a in ctx.candidate_abilities() if TacticalUse.POKE in a.tactical_uses]
-        if not poke_abilities:
+        repeatable = [a for a in owner_abilities if TacticalUse.POKE in a.tactical_uses]
+        if not repeatable:
             return []
-        ability = poke_abilities[0]
+        ability = repeatable[0]
         punish_note = ""
-        if ctx.enemy.axis(Axis.ALL_IN) >= 3 or ctx.enemy.axis(Axis.EARLY_PRESSURE) >= 3:
-            punish_note = f" Acercarse a poquear también expone a {ctx.candidate.name} a que {ctx.enemy.name} castigue esa aproximación."
+        if other.axis(Axis.ALL_IN) >= 3 or other.axis(Axis.EARLY_PRESSURE) >= 3:
+            punish_note = (
+                f" Acercarse lo suficiente para lanzarla también expone a {owner.name} a que {other.name} "
+                f"castigue esa aproximación."
+            )
         return [
             RuleEffect(
                 factor=Factor.LANE_PATTERN,
                 polarity=Polarity.CONDITIONAL,
                 delta=0.1,
                 text=(
-                    f"{ctx.candidate.name} puede repetir {ability.name} sin gastar un recurso de lanzamiento "
-                    f"tradicional, lo que sostiene su poke más allá de lo que permitiría un presupuesto de "
-                    f"maná.{punish_note}"
+                    f"{ability.name} de {owner.name} no consume un recurso limitado como maná, así que "
+                    f"{owner.name} puede intentar repetirla mientras esté disponible; su valor real sigue "
+                    f"dependiendo del cooldown, de la exposición que exige y de acertarla.{punish_note}"
                 ),
                 premises=(
-                    FactRef(f"{ctx.candidate.id}.casting_resource", ctx.candidate.casting_resource.value),
-                    FactRef(f"{ctx.enemy.id}.axes.all_in", ctx.enemy.axis(Axis.ALL_IN)),
+                    FactRef(f"{owner.id}.casting_resource", owner.casting_resource.value),
+                    FactRef(f"{owner.id}.abilities.{ability.slot}.tactical_uses", TacticalUse.POKE.value),
+                    FactRef(f"{other.id}.axes.all_in", other.axis(Axis.ALL_IN)),
                 ),
-                condition="sigue limitado por cooldown, rango/exposición y por acertarla: no es daño infinito",
-                invalidated_if="esta V0 no modela cooldowns reales en segundos ni la precisión efectiva del jugador",
+                condition="sigue limitado por cooldown, exposición y acierto: no es daño repetible sin coste real",
+                invalidated_if=(
+                    "esta V0 no modela cooldowns en segundos, ni el acierto efectivo, ni la secuencia de "
+                    "habilidades, ni el estado de la oleada"
+                ),
                 condition_kind=ConditionKind.EXECUTION,
+                support=Support.AMBIGUOUS,
+                category="resource_attrition",
+                causal_key=f"{owner.id}:{ability.slot}:resource_attrition",
             )
         ]
 
@@ -725,8 +1009,8 @@ class DisplacementVsMobilityRule(Rule):
 
     def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
         effects: list[RuleEffect] = []
-        effects.extend(self._one_direction(ctx.candidate, ctx.candidate_abilities(), ctx.enemy, Polarity.PRO))
-        effects.extend(self._one_direction(ctx.enemy, ctx.enemy_abilities(), ctx.candidate, Polarity.CONTRA))
+        for mover, mover_abilities, target, polarity in _sides(ctx):
+            effects.extend(self._one_direction(mover, mover_abilities, target, polarity))
         return effects
 
     def _one_direction(self, mover, mover_abilities, target, polarity: Polarity) -> list[RuleEffect]:
@@ -756,6 +1040,7 @@ class DisplacementVsMobilityRule(Rule):
                         f"{', '.join(sorted(t.value for t in control_hit))}."
                     ),
                     premises=tuple(_fact(mover.id, ability.slot, t, True) for t in sorted(control_hit, key=lambda t: t.value)),
+                    support=Support.STRUCTURAL,
                     category="displacement_control",
                     causal_key=f"{mover.id}:{ability.slot}:{EffectType.DISPLACE_ENEMY.value}",
                 )
@@ -775,6 +1060,7 @@ class DisplacementVsMobilityRule(Rule):
                     delta=0.06 * magnitude / 4,
                     text=f"{ability.name} de {mover.name} ralentiza a {target.name} y reduce el espacio que su movilidad podría generar.",
                     premises=(_fact(mover.id, ability.slot, EffectType.SLOW, magnitude),),
+                    support=Support.STRUCTURAL,
                     category="displacement_control",
                     causal_key=f"{mover.id}:{ability.slot}:{EffectType.SLOW.value}",
                 )
@@ -782,15 +1068,128 @@ class DisplacementVsMobilityRule(Rule):
         return effects
 
 
+class PullTowardEngageRule(Rule):
+    """Atraer al rival hacia uno mismo: habilita la jugada propia y, a la
+    vez, le da acceso a un duelista peligroso de corta distancia.
+
+    Generalizable a cualquier pull futuro, no una excepción para un par:
+    dispara cuando una habilidad tiene `DISPLACE_ENEMY` con
+    `displacement_vector == "toward_self"` y el objetivo es una amenaza
+    de corta distancia (all-in alto, movilidad baja) — exactamente el
+    perfil al que acercarse le conviene.
+
+    La conclusión es deliberadamente de DOBLE FILO y no se inclina:
+    quién sale ganando de reducir la distancia depende de quién gane ese
+    rango, que es la pregunta que el motor está tratando de responder.
+    Afirmar una dirección sería circular. Por eso `Polarity.CONDITIONAL`
+    (aporte cero) con `Support.CONDITIONED`, y toda la información útil
+    en el texto y la condición.
+
+    La cadena causal del pull se cuenta UNA vez: acercar + preparar la
+    habilidad que combea + aportar una aplicación a la propia mecánica de
+    acumulación son consecuencias del mismo casteo, no ventajas
+    separadas; y comparte `causal_key` con `DisplacementVsMobilityRule`
+    para que, si alguna vez disparan las dos sobre la misma habilidad, la
+    vista causal las colapse.
+
+    NO modela el uso invertido (castear el pull hacia atrás para
+    alejarse): depende de la geometría del casteo, que esta V0 no
+    representa. Queda en docs/backlog-v1.md como mecánica avanzada.
+    """
+
+    id = "G18"
+    summary = "Atraer al rival hacia uno habilita el combo propio y a la vez le concede el rango que un duelista de corta distancia busca; el saldo depende de quién gane ese rango."
+    category = "pull_engage_tradeoff"
+    categories = frozenset({"pull_engage_tradeoff"})
+
+    def evaluate(self, ctx: ReasoningContext) -> list[RuleEffect]:
+        effects: list[RuleEffect] = []
+        for owner, owner_abilities, other, _polarity in _sides(ctx):
+            effects.extend(self._pull(owner, owner_abilities, other))
+        return effects
+
+    @staticmethod
+    def _is_short_range_threat(champion) -> bool:
+        return champion.axis(Axis.ALL_IN) >= 3 and champion.axis(Axis.MOBILITY) <= 1
+
+    def _pull(self, owner, owner_abilities, other) -> list[RuleEffect]:
+        if not self._is_short_range_threat(other):
+            return []
+        effects: list[RuleEffect] = []
+        for ability in owner_abilities:
+            pulls = [
+                e
+                for e in ability.effects_of(EffectType.DISPLACE_ENEMY)
+                if e.displacement_vector == _PULL_TOWARD_SELF
+            ]
+            if not pulls:
+                continue
+            magnitude = max(e.magnitude for e in pulls)
+            premises = [
+                FactRef(
+                    f"{owner.id}.abilities.{ability.slot}.effects.displace_enemy.displacement_vector",
+                    _PULL_TOWARD_SELF,
+                ),
+                FactRef(f"{other.id}.axes.all_in", other.axis(Axis.ALL_IN)),
+                FactRef(f"{other.id}.axes.mobility", other.axis(Axis.MOBILITY)),
+            ]
+            # Misma cadena causal: el casteo que acerca también prepara lo
+            # que combea y puede aportar una aplicación a la acumulación
+            # propia. No son ventajas separadas.
+            setup_clause = ""
+            if TacticalUse.SETUP_COMBO in ability.tactical_uses:
+                premises.append(
+                    FactRef(f"{owner.id}.abilities.{ability.slot}.tactical_uses", TacticalUse.SETUP_COMBO.value)
+                )
+                setup_clause = f" El mismo casteo prepara el resto del combo de {owner.name}."
+            stack_clause = ""
+            stack_effects = ability.effects_of(EffectType.STACK_APPLICATION)
+            if stack_effects:
+                mechanic_id = next((e.feeds_stack for e in stack_effects if e.feeds_stack), None)
+                mechanic = next((m for m in owner.stacking_mechanics if m.id == mechanic_id), None)
+                if mechanic is not None:
+                    premises.append(_fact(owner.id, ability.slot, EffectType.STACK_APPLICATION, mechanic.id))
+                    stack_clause = f" y aporta una aplicación hacia {mechanic.name}"
+
+            effects.append(
+                RuleEffect(
+                    factor=Factor.LANE_PATTERN,
+                    polarity=Polarity.CONDITIONAL,
+                    delta=0.03,
+                    text=(
+                        f"{ability.name} de {owner.name} atrae a {other.name} hacia {owner.name}{stack_clause}."
+                        f"{setup_clause} Es de doble filo: {other.name} es una amenaza de corta distancia con "
+                        f"all-in alto y poca movilidad, así que reducir la distancia también le entrega el rango "
+                        f"en el que quiere pelear. Fallarla o usarla a destiempo cierra la ventana de "
+                        f"intercambio en vez de abrirla."
+                    ),
+                    premises=tuple(premises),
+                    condition=(
+                        f"el saldo depende de quién gane el intercambio a corta distancia una vez cerrada la "
+                        f"brecha, que es justamente lo que el resto del análisis intenta establecer"
+                    ),
+                    condition_kind=ConditionKind.STRATEGIC,
+                    support=Support.CONDITIONED,
+                    category="pull_engage_tradeoff",
+                    # Compartido con G15: un mismo casteo, una sola causa.
+                    causal_key=f"{owner.id}:{ability.slot}:{EffectType.DISPLACE_ENEMY.value}",
+                )
+            )
+        return effects
+
+
 GENERAL_RULES: tuple[Rule, ...] = (
     RangeAccessRule(),
-    PokeVsSustainRule(),
-    DamageTypeAndShieldRule(),
+    TradeSustainRule(),
+    DamageVsResistancesRule(),
+    ShieldAbsorptionRule(),
+    SingleTargetConditionRule(),
     IsolationRule(),
-    EarlyPressureVsScalingRule(),
+    EditorialAxisPriorRule(),
     WaveclearGatingRule(),
     AbilityRelianceReliabilityRule(),
     AllInFragilityRule(),
     ResourceAttritionRule(),
     DisplacementVsMobilityRule(),
+    PullTowardEngageRule(),
 )

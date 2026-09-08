@@ -83,14 +83,21 @@ def format_human(rs: RecommendationSet) -> str:
     lines: list[str] = []
     lines.append(f"Matchup: candidatos vs {rs.enemy_name} (knowledge_version={rs.knowledge_version})")
     lines.append(
-        "Los scores son un índice de adecuación mecánica 0-100 de esta V0, NO una probabilidad de victoria "
-        "ni un winrate."
+        "El MatchupScore es un índice heurístico SIN CALIBRAR de adecuación mecánica relativa (0-100) de esta "
+        "V0: no es un winrate ni una probabilidad de victoria. La conclusión útil es la dirección, la "
+        "intensidad y la estabilidad; el número es un dato técnico secundario."
     )
     lines.append("")
-    lines.append(f"Ranking global:   {' > '.join(_label(rs, c, 'global') for c in rs.ranking_global)}")
-    lines.append(f"Ranking personal: {' > '.join(_label(rs, c, 'personal') for c in rs.ranking_personal)}")
-    lines.append(f"Mejor pick global:   {rs.recommendations[rs.best_global].candidate_name}")
-    lines.append(f"Mejor pick personal: {rs.recommendations[rs.best_personal].candidate_name}")
+    if len(rs.ranking_global) > 1:
+        lines.append(f"Ranking global:   {' > '.join(_label(rs, c, 'global') for c in rs.ranking_global)}")
+        lines.append(f"Ranking personal: {' > '.join(_label(rs, c, 'personal') for c in rs.ranking_personal)}")
+        lines.append(f"Mejor pick global:   {rs.recommendations[rs.best_global].candidate_name}")
+        lines.append(f"Mejor pick personal: {rs.recommendations[rs.best_personal].candidate_name}")
+    else:
+        # Un solo candidato: no ganó ninguna comparación, así que no se
+        # anuncia como "mejor pick" (v1.6.1).
+        only = rs.recommendations[rs.ranking_global[0]]
+        lines.append(f"Candidato evaluado: {only.candidate_name} (sin comparación: es el único candidato de la consulta)")
     lines.append("=" * 72)
 
     for cid in rs.ranking_global:
@@ -98,15 +105,24 @@ def format_human(rs: RecommendationSet) -> str:
         lines.append("")
         lines.append(f"## {rec.candidate_name}  (candidate_id={rec.candidate_id})")
         mastery_txt = f"{rec.mastery}/100" if rec.mastery is not None else "sin dato (se asume neutral)"
+
+        # Lo primero es la conclusión cualitativa; el número queda como
+        # dato técnico secundario (es un índice heurístico sin calibrar,
+        # no un winrate).
+        lines.append(f"CONCLUSIÓN: {rec.lean.summary}")
+        if rec.lean.main_factors:
+            lines.append(f"  Factores principales: {', '.join(rec.lean.main_factors)}")
         lines.append(
-            f"GlobalScore: {_fmt_score(rec.global_score)}   PersonalScore: {_fmt_score(rec.personal_score)}"
-            f"   Mastery: {mastery_txt}"
+            f"  Cobertura epistémica interna (cuánto miró el motor, NO certeza del veredicto): "
+            f"{rec.confidence.candidate_knowledge_coverage_level.upper()} "
+            f"({rec.confidence.candidate_knowledge_coverage_score})"
         )
+        lines.append("")
         lines.append(
-            f"Confianza epistémica: {rec.confidence.level.upper()} (score={rec.confidence.score})"
-            f"   Volatilidad/condicionalidad: {rec.confidence.volatility_level.upper()} (score={rec.confidence.volatility_score})"
+            f"  [dato técnico] MatchupScore mecánico: {_fmt_score(rec.global_score)}   "
+            f"PersonalScore: {_fmt_score(rec.personal_score)}   Mastery: {mastery_txt}"
         )
-        lines.append("  Desglose por factor (contribución ponderada al GlobalScore; ya deduplicado por causal_key):")
+        lines.append("  Desglose por factor (evidencia mecánica DERIVADA, deduplicada por causal_key):")
         for factor, value in rec.factor_breakdown.items():
             lines.append(f"    - {factor}: {value:+.3f}")
         if rec.personal_breakdown is not None:
@@ -116,18 +132,26 @@ def format_human(rs: RecommendationSet) -> str:
                 f"(condiciones EXECUTION distintas: {pb.execution_condition_count}), "
                 f"mastery={pb.mastery}, gap={pb.gap:+.1f}, ajuste={pb.adjustment:+.1f}"
             )
-        lines.append("  Por qué la confianza epistémica es esa:")
+        lines.append("  Señales de confianza (cuatro preguntas distintas, no fusionadas):")
         for exp in rec.confidence.explanation:
             lines.append(f"    - {exp}")
 
         if rec.reasons:
-            lines.append("  Ventajas mecánicas (evidencia: id de traza):")
+            lines.append("  Ventajas mecánicas derivadas del kit (evidencia: id de traza):")
             for r in rec.reasons:
                 lines.append(f"    + {r.text}  [{r.entry_id}]")
         if rec.risks:
-            lines.append("  Riesgos / debilidades:")
+            lines.append("  Riesgos / debilidades derivados del kit:")
             for r in rec.risks:
                 lines.append(f"    - {r.text}  [{r.entry_id}]")
+        if rec.editorial_priors:
+            lines.append("  Priors editoriales (valoraciones manuales del YAML — NO puntúan, no las derivó el motor):")
+            for r in rec.editorial_priors:
+                lines.append(f"    ~ {r.text}  [{r.entry_id}]")
+        if rec.uncalibrated_observations:
+            lines.append("  Observaciones estructurales sin calibrar (reales, pero sin impacto cuantificable aún):")
+            for r in rec.uncalibrated_observations:
+                lines.append(f"    · {r.text}  [{r.entry_id}]")
         if rec.conditions:
             lines.append("  Condiciones que podrían cambiar la recomendación:")
             for r in rec.conditions:
@@ -137,16 +161,37 @@ def format_human(rs: RecommendationSet) -> str:
             for r in rec.missing_info:
                 lines.append(f"    · {r.text}  [{r.entry_id}]")
 
-        lines.append("  Por fase de la partida:")
+        lines.append("  Por fase (vista cruda vs. causas NUEVAS que la fase desbloquea):")
         for phase in ALL_PHASES:
             note = rec.phase_notes[phase.value]
             lines.append(f"    [{phase.value}] {note.summary}")
+            if note.effective_contributions_by_factor:
+                detail = ", ".join(
+                    f"{factor}: {value:+.3f}" for factor, value in sorted(note.effective_contributions_by_factor.items())
+                )
+                lines.append(f"        causas nuevas que aportan -> {detail}")
+
+        lines.append("")
+        lines.append(f"  SÍNTESIS: {rec.lean.summary}")
+        if rec.lean.conditions_against_favored and rec.lean.favored_name:
+            lines.append(f"    Qué podría reducir la ventaja estimada de {rec.lean.favored_name}:")
+            for cond in rec.lean.conditions_against_favored:
+                lines.append(f"      - {cond}")
+        if rec.lean.conditions_favoring_other and rec.lean.other_name:
+            lines.append(f"    Qué podría mejorar la posición de {rec.lean.other_name}:")
+            for cond in rec.lean.conditions_favoring_other:
+                lines.append(f"      - {cond}")
 
     lines.append("")
     lines.append("=" * 72)
     lines.append(
         "Nota: el conocimiento mecánico cargado es una lectura cualitativa propia, no auditada contra un "
         "parche concreto de LoL. Ver README > Limitaciones."
+    )
+    lines.append(
+        "Nota: los scores de las dos direcciones de un mismo matchup son antisimétricos respecto de 50 por el "
+        "invariante de reciprocidad (toda causa compartida pesa igual con signo opuesto). Que sumen 100 NO los "
+        "convierte en probabilidades complementarias ni en un margen de victoria."
     )
     return "\n".join(lines)
 

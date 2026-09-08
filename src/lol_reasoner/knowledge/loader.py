@@ -28,6 +28,8 @@ def _build_effect(e: dict) -> Effect:
         magnitude=e["magnitude"],
         conditions=frozenset(EffectCondition(c) for c in e.get("conditions", [])),
         damage_type=DamageType(e["damage_type"]) if e.get("damage_type") else None,
+        displacement_vector=e.get("displacement_vector"),
+        scope=e.get("scope"),
         feeds_stack=e.get("feeds_stack"),
         stack_scaling=e.get("stack_scaling"),
         amplifies_slot=e.get("amplifies_slot"),

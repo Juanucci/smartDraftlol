@@ -24,7 +24,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from lol_reasoner.domain.enums import ConditionKind, Factor, Phase, Polarity
+from lol_reasoner.domain.enums import ConditionKind, Factor, Phase, Polarity, Provenance, Support
 from lol_reasoner.reasoning.context import ReasoningContext
 from lol_reasoner.reasoning.trace import FactRef
 
@@ -50,6 +50,18 @@ class RuleEffect:
     # fases. None (por defecto) = nunca se deduplica: el comportamiento
     # de reglas basadas en ejes (sin una única fuente de efecto) no cambia.
     causal_key: str | None = None
+    # Cuánta certeza respalda la inclinación (ver domain.enums.Support).
+    # STRUCTURAL: se sostiene siempre que ambos kits estén en la fase.
+    # CONDITIONED: dirección clara pero condicionada -> inclina el score
+    # amortiguado por `support.conditioned` de config/weights.yaml, y su
+    # condición alimenta volatilidad. AMBIGUOUS: doble filo real, aporta
+    # cero (exige Polarity.CONDITIONAL) pero se conserva en la explicación.
+    support: Support = Support.STRUCTURAL
+    # De dónde sale el hecho (ver domain.enums.Provenance): DERIVED del
+    # kit modelado, o EDITORIAL_PRIOR de un eje 0..4 escrito a mano. Un
+    # prior editorial se etiqueta ante el consumidor y se pondera con un
+    # peso reducido; nunca se presenta como conclusión derivada.
+    provenance: Provenance = Provenance.DERIVED
     # Solo tiene sentido en entradas CONDITIONAL: de qué tipo de
     # incertidumbre se trata (ver domain.enums.ConditionKind). Determina
     # si esta condición puede subir required_skill (solo EXECUTION) o

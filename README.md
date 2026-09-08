@@ -27,7 +27,13 @@ directamente falsas. El hito 1.6 (`docs/decisiones-tecnicas.md` §12)
 corrigió un bug de reciprocidad en cuatro reglas generales, eliminó una
 inferencia falsa (`INTERRUPT` negando cargas de acumulación), introdujo
 `causal_key` para deduplicar score sin perder trazabilidad, y separó
-confianza epistémica de volatilidad/condicionalidad.
+confianza epistémica de volatilidad/condicionalidad. **v1.6.1** (§13)
+encontró tres escaneos unidireccionales que habían sobrevivido dentro de
+la regla de daño, separó certeza (`Support`) y procedencia
+(`Provenance`) de la dirección (`Polarity`), sacó del score a los ejes
+editoriales (se muestran, no deciden), partió la regla monolítica de daño en tres y reemplazó la
+suma de magnitudes ordinales de la carrera de acumulaciones por una
+comparación de capacidades estructurales.
 
 **Sí incluye:**
 - Propiedades semánticas de los campeones (ejes, mecánicas de acumulación,
@@ -65,7 +71,7 @@ concreto, el motor lo señala explícitamente como información faltante (ver
 concreto de League of Legends.** Es una lectura cualitativa propia, pensada
 para poner a prueba la arquitectura del motor de razonamiento — no para
 ofrecer una recomendación competitiva actualizada. `knowledge_version`
-(`"0.2.0"`) es la versión **interna de esta base de datos**, no un número de
+(`"0.2.1"`) es la versión **interna de esta base de datos**, no un número de
 parche de LoL. La validación de kits contra fuentes actuales y el soporte de
 parches quedan como una etapa posterior independiente (ver
 `docs/backlog-v1.md`).
@@ -81,7 +87,7 @@ src/lol_reasoner/
 │   └── result.py          # Recommendation, RecommendationSet, ReasonItem... (salida)
 │
 ├── knowledge/         # Base de conocimiento estructurada
-│   ├── champions/*.yaml  # Un YAML por campeón, comentado — schema v2
+│   ├── champions/*.yaml  # Un YAML por campeón, comentado — schema v3
 │   ├── schema.py          # Validación manual (sin dependencias extra)
 │   └── loader.py           # YAML -> Champion
 │
@@ -96,7 +102,7 @@ src/lol_reasoner/
 │       ├── specific.py             # Excepciones puntuales, justificadas y acotadas (hoy: vacío)
 │       └── registry.py               # Registro combinado + universo de categorías
 │
-├── scoring/           # GlobalScore, PersonalScore, Confidence
+├── scoring/           # MatchupScore, PersonalScore, Confidence
 │   ├── weights.py        # Pesos centralizados (config/weights.yaml)
 │   ├── global_score.py     # Traza -> score sin leer mastery
 │   ├── personal_score.py     # GlobalScore + mastery -> PersonalScore
@@ -166,8 +172,13 @@ reemplazada por una excepción puntual (ver `docs/decisiones-tecnicas.md`
   score, sin perder ninguna de las dos en la traza completa que ve el
   usuario). `PRO`=+1, `CONTRA`=-1, `CONDITIONAL`=0 — una ventaja puramente
   condicional no debe inflar el número, solo aparecer como condición
-  textual —, ponderados por `config/weights.yaml`. **Nunca lee `mastery`
-  ni `execution_demand`.**
+  textual —, ponderados por `config/weights.yaml`. Sobre ese signo se
+  aplican dos multiplicadores configurables y visibles entrada por
+  entrada en la traza: `Support` (cuánta certeza respalda la
+  inclinación: `STRUCTURAL` entera, `CONDITIONED` amortiguada,
+  `AMBIGUOUS` cero) y `Provenance` (si el hecho se derivó del kit o es un
+  prior editorial de un eje escrito a mano). **Nunca lee `mastery` ni
+  `execution_demand`.**
 - **PersonalScore**: parte del GlobalScore y lo ajusta comparando el
   `mastery` de un `PlayerProfile` (hoy solo ese campo; interfaz pensada
   para agregar después partidas jugadas, winrate personal, recencia,
@@ -179,7 +190,40 @@ reemplazada por una excepción puntual (ver `docs/decisiones-tecnicas.md`
   pick *global* sin ser el mejor pick *personal*.
 
 Ninguno de los dos números es una probabilidad de victoria: son un índice de
-adecuación mecánica de esta V0, y la CLI lo aclara en cada salida.
+adecuación mecánica de esta V0, y la CLI lo aclara en cada salida. Los
+GlobalScore de las dos direcciones de un mismo matchup son hoy
+**antisimétricos** respecto de 50 (suman 100) como consecuencia del
+invariante de reciprocidad — toda causa compartida pesa igual con signo
+opuesto —, no porque sean probabilidades complementarias. Dejarán de
+sumar 100 exactamente en cuanto un hecho propio del candidato mueva el
+score.
+
+La explicación cierra con un `Lean`: dirección, intensidad, confianza,
+factores principales y condiciones que podrían reducirla o invertirla.
+Cuando hay evidencia suficiente el motor se inclina; no se refugia en una
+lista de condiciones.
+
+### Dirección, condición y certeza son tres cosas distintas
+
+Un motor que solo tiene `Polarity` para expresarlas termina obligando a
+elegir entre afirmar una ventaja entera o no afirmarla: en el hito 1.6,
+casi la mitad de las entradas que sobrevivían a la deduplicación
+aportaban cero al score. v1.6.1 las separa en tres ejes ortogonales:
+
+| Eje | Pregunta | Valores |
+|---|---|---|
+| `Polarity` | ¿hacia qué lado se inclina? | PRO / CONTRA / CONDITIONAL |
+| `condition` + `ConditionKind` | ¿de qué depende? | EXECUTION / STRATEGIC / KNOWLEDGE_GAP |
+| `Support` | ¿cuánta certeza hay? | STRUCTURAL / CONDITIONED / AMBIGUOUS |
+
+Una ventaja condicionada (`PRO` + `CONDITIONED`) inclina el score de
+forma amortiguada **y** aumenta la volatilidad; una interacción de doble
+filo real (`AMBIGUOUS`) aporta cero pero se conserva entera en la
+explicación. A eso se suma `Provenance`, que distingue un hecho derivado
+del kit de un prior editorial: los ejes escritos a mano se muestran
+íntegros y etiquetados, en su propio canal de salida, pero **aportan cero**
+al MatchupScore. Un eje 0..4 escrito a mano no puede decidir un veredicto
+mecánico; ocultarlo tampoco sería honesto.
 
 ### Confianza: epistémica vs. volatilidad
 
@@ -195,12 +239,19 @@ recomendación" son dos números independientes, clasificados por
   `ConditionKind.KNOWLEDGE_GAP` (información que el motor reconoce no
   tener, p. ej. `ITEMGAP`). Una traza vacía da confianza epistémica 0.0 /
   BAJA, sin piso artificial.
-- **Volatilidad/condicionalidad** (`ConfidenceResult.volatility_score`):
+- **Volatilidad estratégica compartida** (`ConfidenceResult.volatility_score`):
   contradicción real (evidencia PRO y CONTRA de magnitud comparable en el
-  mismo `(fase, factor)` — un matchup genuinamente condicional) más
-  densidad de condiciones `ConditionKind.STRATEGIC` (depende de una
-  decisión/circunstancia de la partida, no de que falte información ni
-  de que el jugador ejecute algo).
+  mismo `(fase, factor)`, contada sobre la vista causal deduplicada) más
+  densidad de condiciones `ConditionKind.STRATEGIC` que también aparecen
+  al invertir la consulta. Una tensión del matchup —la geometría del
+  duelo, el ritmo del intercambio, la carrera de acumulaciones— no puede
+  evaporarse porque cambie quién es el candidato. Las condiciones
+  estratégicas cuentan **sin importar la polaridad** de la entrada que
+  las lleva.
+- **Exigencia de ejecución del candidato** (`execution_condition_count`):
+  condiciones `EXECUTION`, que sí pueden ser asimétricas porque dependen
+  del kit del candidato. Alimentan `required_skill` en PersonalScore y no
+  se mezclan con la volatilidad del matchup.
 
 Que exista evidencia PRO y CONTRA sobre un mismo matchup **no** se
 interpreta automáticamente como ignorancia: es volatilidad, una señal
@@ -249,6 +300,14 @@ como enemigo, y produce razones, riesgos y confianza distintos.
 - **Conocimiento no auditado**: los valores de ejes, efectos, mecánicas de
   acumulación y power spikes son una lectura cualitativa propia sin validar
   contra parche, fuente estadística ni comunidad. Ver `docs/decisiones-tecnicas.md`.
+- **Los ejes de fase (`early_pressure`, `scaling`) son valoraciones
+  manuales**, no conclusiones derivadas del kit, y no mueven el score:
+  se muestran etiquetados en un canal aparte. Derivarlos está en
+  `docs/backlog-v1.md`.
+- **La penetración física y la mágica se registran pero no puntúan**:
+  compartir un ordinal cualitativo no demuestra igual intensidad ni
+  relevancia. Cuantificarlas exige valores numéricos, escalado por nivel,
+  resistencias del objetivo y contexto de parche.
 - **`DisplacementVsMobilityRule` (G15) no dispara para este par**: tanto
   Darius como Mordekaiser tienen `mobility=0`/`disengage=0`, así que la
   regla que valora negar espacio al rival correctamente no encuentra nada

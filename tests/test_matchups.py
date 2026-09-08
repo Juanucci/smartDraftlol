@@ -57,17 +57,65 @@ def test_recommendation_can_differ_between_early_and_side_lane(champions):
     assert rec_early.global_score != rec_side.global_score
 
 
-def test_side_lane_note_reflects_mordekaiser_scaling_advantage(champions):
+def test_scaling_axis_is_declared_editorial_and_does_not_move_the_score(champions):
+    """REEMPLAZA a `test_side_lane_note_reflects_mordekaiser_scaling_advantage`,
+    que exigía que el eje editorial `scaling` moviera el score en contra
+    de Darius. Ese test congelaba como conclusión mecánica lo que es una
+    valoración escrita a mano: el motor no derivó que Mordekaiser escale
+    mejor, se lo declararon en el YAML. Esta V0 no modela objetos,
+    duración de partida ni combates de equipo, así que no puede sostener
+    esa comparación — y ahora el dato se declara sin puntuar."""
+
     rec = _recommend("mordekaiser", "darius", champions)
+    scaling_entries = [e for e in rec.trace_entries if e["category"] == "editorial_axis_prior" and "scaling" in e["text"]]
+    assert scaling_entries, "el dato editorial debe seguir declarándose, no borrarse"
+    for entry in scaling_entries:
+        assert entry["provenance"] == "editorial_prior"
+        assert entry["polarity"] == "conditional", "un prior editorial de escalado no puede mover el score"
+        assert "valoración editorial" in entry["text"]
+
     side_note = rec.phase_notes["side_lane_late"]
-    # Mordekaiser escala mejor: el neto de scaling_sidelane para Darius-candidato debería ser negativo
-    assert side_note.net_delta_by_factor.get("scaling_sidelane", 0.0) < 0
+    assert side_note.effective_contributions_by_factor.get("scaling_sidelane", 0.0) == 0.0
 
 
-def test_darius_has_early_lane_pressure_advantage_noted(champions):
+def test_early_pressure_prior_is_labelled_and_bounded(champions):
+    """REEMPLAZA a `test_darius_has_early_lane_pressure_advantage_noted`,
+    que verificaba el signo del ganador editorial. Lo que se exige ahora
+    no es quién gana, sino que el prior se identifique como valoración
+    manual y entre con peso reducido."""
+
     rec = _recommend("mordekaiser", "darius", champions)
-    early_note = rec.phase_notes["early_lane"]
-    assert early_note.net_delta_by_factor.get("lane_pattern", 0.0) > 0
+    prior = next(e for e in rec.trace_entries if e["category"] == "editorial_axis_prior" and "early pressure" in e["text"])
+    assert prior["provenance"] == "editorial_prior"
+    assert "no algo que el motor haya derivado" in prior["text"]
+
+    early = rec.phase_notes["early_lane"].effective_contributions_by_factor
+    assert early, "la fase temprana debe seguir aportando algo al score"
+
+
+def test_single_candidate_query_declares_no_best_pick(champions):
+    """Con un solo candidato no hubo comparación que ganar."""
+
+    from lol_reasoner.domain.query import MatchupQuery
+    from lol_reasoner.recommend import recommend
+
+    rs = recommend(MatchupQuery(enemy_id="darius", candidate_ids=("mordekaiser",)), champions)
+    assert rs.best_global is None
+    assert rs.best_personal is None
+    assert rs.ranking_global == ("mordekaiser",)
+
+
+def test_engine_produces_a_synthesis_not_only_a_list_of_conditions(champions):
+    """El motor debe cerrar con una inclinación explicada cuando la
+    evidencia alcanza, en vez de terminar en una lista de condiciones."""
+
+    for enemy, candidate in (("darius", "mordekaiser"), ("mordekaiser", "darius")):
+        rec = _recommend(enemy, candidate, champions)
+        assert rec.lean.direction in {"favors_candidate", "even", "favors_enemy"}
+        assert rec.lean.summary
+        assert rec.lean.matchup_confidence == rec.confidence.shared_matchup_confidence
+        if rec.lean.direction != "even":
+            assert rec.lean.main_factors, "una inclinación debe decir qué factores la sostienen"
 
 
 def test_confidence_reflects_missing_information(champions):

@@ -6,7 +6,7 @@
 # para validar la arquitectura del motor de razonamiento, no como
 # recomendación competitiva actualizada. Ver README > Limitaciones.
 
-schema_version: 2
+schema_version: 3
 
 id: darius
 name: Darius
@@ -72,7 +72,13 @@ abilities:
     name: Decimate
     cooldown_class: medium
     available_from: early_lane
-    tactical_uses: [sustain, poke, waveclear, trade_extend]
+    tactical_uses: [sustain, waveclear, trade_extend]
+    # v1.6.1: se quitó `poke`. Decimate es una herramienta de intercambio
+    # cuerpo a cuerpo con un filo exterior que cura y aplica carga: no es
+    # poke a distancia, y tratarla como tal hacía que el motor describiera
+    # a Darius como campeón de poke y que un eje editorial de sustain rival
+    # lo 'licuara'. Los usos que quedan son los que alguna regla lee de
+    # verdad: sustain dentro del trade, waveclear y trade extendido.
     effects:
       - type: damage
         magnitude: 3
@@ -126,6 +132,7 @@ abilities:
     effects:
       - type: displace_enemy
         magnitude: 3
+        displacement_vector: toward_self
         doc: "Tira al enemigo hacia Darius. Darius NO se desplaza: esto no es un self_dash."
       - type: brief_cc
         magnitude: 1
@@ -160,12 +167,15 @@ abilities:
       - type: damage
         magnitude: 3
         damage_type: "true"
-        doc: "Daño verdadero: ignora resistencias por definición del tipo de daño (no de un flag especial)."
-      - type: amplify_ability
-        magnitude: 2
         stack_scaling: hemorrhage
-        amplifies_slot: R
-        doc: "El daño de esta misma habilidad escala con las cargas de Hemorrhage ya aplicadas al objetivo."
+        doc: >
+          Daño verdadero: ignora resistencias por definición del tipo de daño (no de un flag
+          especial), y su valor escala con las cargas de Hemorrhage ya aplicadas al objetivo.
+          v1.6.1: `stack_scaling` vive acá, sobre el efecto que realmente escala. Antes esa
+          misma relación se declaraba además como un `amplify_ability` autorreferencial
+          (amplifies_slot: R sobre la propia R), así que "las cargas potencian la R" quedaba
+          representada dos veces y se sumaba dos veces en la comparación de recompensas.
+          Un escudo común puede absorber este daño igual: verdadero no es "no mitigable".
       - type: cooldown_reset
         magnitude: 1
         conditions: [on_takedown]
@@ -185,12 +195,19 @@ stacking_mechanics:
     applied_by: [basic_attack, Q]
     reward_name: Noxian Might
     reward_effects:
-      - type: empower_self
+      - type: bonus_attack_damage
         magnitude: 4
-      - type: amplify_ability
-        magnitude: 3
-        amplifies_slot: R
-        doc: "Al alcanzar 5 cargas, además de Noxian Might, amplifica específicamente a Noxian Guillotine."
+        scope: offensive_profile
+        doc: >
+          Noxian Might: al completar las 5 cargas, Darius gana daño de ataque adicional. No es un
+          buff de una habilidad puntual — fortalece su PERFIL OFENSIVO completo: ataques básicos,
+          Decimate, Crippling Strike, el escalado de la propia Hemorrhage y el ratio de Noxian
+          Guillotine. Por eso se declara con `scope: offensive_profile` y NO como una lista de
+          amplificaciones por habilidad: una sola recompensa no debe producir una ventaja de score
+          por cada habilidad a la que llega.
+          v1.6.1 reemplaza acá dos declaraciones anteriores: un `empower_self` genérico (que no
+          decía qué empoderaba) y un `amplify_ability` sobre R (que duplicaba, como segunda
+          recompensa, lo que el bonus de AD ya explica a través del ratio de la R).
 
 spikes:
   - phase: early_lane
@@ -206,4 +223,4 @@ spikes:
     magnitude: 2
     reason: "Sigue siendo peligroso en un 1v1 side lane, pero pierde parte de su ventaja relativa de early game."
 
-knowledge_version: "0.2.0"
+knowledge_version: "0.2.1"

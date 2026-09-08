@@ -4,12 +4,24 @@ Documento breve de decisiones tomadas sin bloquear en el usuario, con su
 justificación. Ninguna de estas decisiones es definitiva: son puntos de
 partida razonables para validar la arquitectura.
 
+**Las secciones 1 a 12 son historia congelada**: describen lo que se
+decidió en cada hito, con el vocabulario y las reglas que existían
+entonces. Varias mencionan reglas que ya no existen (`G04`,
+`MitigationAndDisruptionRule`, `SpikeAlignmentRule`,
+`ExecutionDemandBaselineRule`, `PokeVsSustainRule`) o afirmaciones que un
+hito posterior corrigió. Para el estado ACTUAL del motor, la sección
+vigente es la última (§13, v1.6.1); si una sección anterior contradice a
+la última, manda la última.
+
 Secciones 1-10: hito 1 (primera implementación, schema v1). Sección 11:
 hito 1.5 (refactor del modelo de conocimiento a schema v2 — mismo par de
 campeones, Darius y Mordekaiser). Sección 12: hito 1.6 (reciprocidad de
 reglas generales, causal_key/deduplicación de score, separación de
 confianza epistémica vs. volatilidad, y arquitectura provisional de
-PersonalScore).
+PersonalScore). Sección 13: **v1.6.1** (certeza y procedencia como ejes
+propios, división de la regla monolítica de daño, priors editoriales
+acotados, StackRace en tres situaciones, y las asimetrías que
+sobrevivieron al hito anterior).
 
 ## 1. Ejes semánticos 0..4, no 0..100
 
@@ -345,3 +357,269 @@ común puede absorber cualquier tipo de daño salvo que una habilidad
 declare explícitamente `bypasses_shields=True` — ninguna lo hace en esta
 base de conocimiento). El escudo de Indestructible mitiga el valor de
 ese daño, pero no elimina las cargas de acumulación que lo amplificaron.
+
+
+## 13. v1.6.1 — certeza, procedencia y las asimetrías que sobrevivieron
+
+Esta sección es la vigente. Nació de una auditoría empírica del hito 1.6
+sobre el par ya cargado, no de una revisión de código a ojo: cada punto
+de abajo se verificó ejecutando el motor y midiendo.
+
+**13.1 — Tres escaneos unidireccionales sobrevivieron al hito 1.6.** El
+hito anterior corrigió la reciprocidad de cuatro reglas basadas en ejes y
+declaró el problema resuelto. Dentro de la regla de daño quedaban tres
+casos:
+
+  * `_true_damage_and_penetration` recorría solo `candidate_abilities()`.
+    Consecuencia observable: al evaluar a Mordekaiser como candidato, el
+    remate de daño verdadero de Noxian Guillotine **no aparecía en
+    ninguna parte de sus riesgos**, mientras su propia ventaja de escudo
+    sí decía "incluido el daño verdadero". La amenaza se nombraba al
+    pasar sin haberse registrado nunca.
+  * `_damage_mitigation_of_sustained_plan` recorría solo
+    `enemy_abilities()`. Consecuencia: el MISMO escudo de Indestructible
+    valía `0.045` como ventaja de su dueño y `0.084` como penalización del
+    rival.
+
+La corrección no es de disciplina sino estructural: existe un helper
+`_sides(ctx)` que devuelve los dos dueños con su polaridad, y cada
+submétodo se invoca dos veces con la MISMA fórmula de magnitud. No hay
+ramas separadas por dirección donde esconder una asimetría. El test
+`test_every_shared_cause_is_reciprocal_in_both_directions` barre TODAS
+las causas de la traza, no las reglas que alguien se acordó de auditar, y
+exige misma clave, mismas premisas, polaridad opuesta y misma magnitud
+absoluta; las asimetrías legítimas (hechos del kit del propio candidato,
+como la exigencia de ejecución) están en una allowlist justificada.
+
+**13.2 — `Support`: la certeza como eje propio.** El hito 1.6 tenía un
+solo eje de expresión, `Polarity`, para tres preguntas distintas: hacia
+dónde se inclina algo, bajo qué condición se sostiene, y cuánta certeza
+hay. El resultado medido: 11 de 24 entradas de la vista causal aportaban
+cero, porque la única forma de decir "esto es real pero condicionado" era
+refugiarse en `CONDITIONAL`. Ahora `Support` distingue `STRUCTURAL`
+(se sostiene siempre que ambos kits estén en la fase), `CONDITIONED`
+(inclina amortiguado, sin volverse certeza) y `AMBIGUOUS` (doble filo
+real: aporta cero, pero se conserva entero en la explicación). El
+multiplicador vive en `config/weights.yaml`, viaja en cada entrada de la
+traza y está documentado como heurístico sin calibrar.
+
+**13.3 — `Provenance`: un prior editorial no es una conclusión derivada.**
+Medición del hito 1.6: los dos ejes escritos a mano (`early_pressure` y
+`scaling`) producían el 40 % del movimiento de score en una dirección y
+el 64 % en la otra. Y un solo punto editorial de `sustain` (2 → 3) movía
+el GlobalScore **2.76 puntos**, doce veces la diferencia total entre los
+dos candidatos (0.23). La primera versión de v1.6.1 los bajó a un peso reducido (0.25); la
+revisión de las trazas mostró que no alcanzaba (ver §13.15) y hoy **ningún
+prior editorial puntúa**: se declaran, se etiquetan y se muestran en su
+propio canal, con aporte cero.
+
+**13.4 — La regla monolítica de daño, partida en tres.** La ex-G03
+declaraba cinco categorías y 226 líneas (las demás reglas declaraban una
+o dos): daño verdadero, penetración, dos formas de mitigación por escudo
+y daño a objetivo único. Ahí adentro se escondieron los escaneos
+unidireccionales de 13.1 durante todo un hito. Queda dividida en
+`DamageVsResistancesRule` (G03), `ShieldAbsorptionRule` (G16) y
+`SingleTargetConditionRule` (G17).
+
+**13.5 — El guardrail de cantidad de reglas era el incentivo equivocado.**
+`MAX_GENERAL_RULES = 15` era un `assert` en import time, y fue el
+argumento que justificó fusionar la mitigación dentro de la regla de
+daño en el hito 1.6 — es decir, un guardrail pensado para contener la
+complejidad terminó causándola. Pasa a ser **blando** (tope holgado,
+verificado en tests con un mensaje que invita a revisar) y se lo
+reemplaza por dos controles que sí miden complejidad real:
+`MAX_CATEGORIES_PER_RULE = 3` (habría detectado la ex-G03 el día que se
+fusionó) y la obligación de que toda entrada declare `causal_key`.
+
+**13.6 — `causal_key` obligatorio; una causa, una contribución.** Nueve
+de veinte construcciones de `RuleEffect` no lo traían, y eso producía
+doble conteo real: la comparación de recompensas de acumulación aportaba
+**tres veces** (una por fase disponible) y era el 100 % de su factor; la
+regla de sustain aportaba dos. Un test AST exige la clave en toda
+entrada. El scoring, el narrador y el cálculo de contradicciones leen la
+vista causal; la traza cruda se conserva íntegra para auditoría, y
+`PhaseNote` muestra las dos vistas por separado y etiquetadas.
+
+**13.7 — StackRace: tres situaciones, sin sumar ordinales.** El hito 1.6
+publicaba "magnitud agregada 9 vs 4". Dos de los tres sumandos de ese 9
+eran la MISMA relación causal —las cargas potencian la definitiva—
+declarada dos veces: una como `stack_scaling` en un `amplify_ability`
+autorreferencial de la R, y otra como amplificación de la recompensa. El
+KB ahora declara esa relación una sola vez, sobre el efecto que
+realmente escala (el daño de la R). La comparación pasa a un
+`RewardProfile` tipado con dos capacidades estructurales
+(`amplifies_available_ability`, `scales_with_stack_count`) y **dominancia
+parcial**: si un perfil cubre estrictamente al otro se inclina, y si las
+recompensas son distintas pero ninguna domina, el resultado es
+`AMBIGUOUS`. No hay jerarquía de tipos de recompensa. Las tres
+situaciones se emiten por separado: A (quién activa primero — no
+predecible, aporta cero), B (si el intercambio se corta — favorece al de
+menor umbral, `CONDITIONED`), C (si ambos completan — se inclina solo si
+la traza demuestra la cadena entera umbral → recompensa propia →
+amplificación de una habilidad disponible).
+
+**13.8 — `ramp_speed_rank` era un cálculo muerto.** Se computaba solo
+como guarda de early-return: el aporte de los aceleradores no era
+observable en ninguna parte de la traza. Es la misma clase de problema
+que el hito 1.5 eliminó de los campos del YAML, reaparecida como
+función. Ahora se cita en premisas y texto de la situación A.
+
+**13.9 — Decimate deja de ser poke.** Es un intercambio cuerpo a cuerpo
+con filo exterior que cura y aplica carga. La vieja `PokeVsSustainRule`
+la trataba como poke y además infería un CONTRA desde el eje editorial
+`sustain >= 3` del rival — un acantilado sobre un número escrito a mano.
+La reemplaza `TradeSustainRule`, que solo mira efectos: una curación
+condicionada en una habilidad de intercambio sostiene a su dueño y
+erosiona el saldo del otro, recíprocamente. El concepto de sustain no
+desaparece: deja de entrar como número editorial, y derivarlo de efectos
+reales queda en el backlog. `TacticalUse.POKE` conserva un consumidor
+real en `ResourceAttritionRule`, que describe una habilidad concreta con
+su exposición y su cooldown, no una identidad de kit.
+
+**13.10 — `PullTowardEngageRule` y la dirección del desplazamiento.**
+Atraer y empujar son consecuencias opuestas del mismo `EffectType` e
+indistinguibles sin declararlo, así que `Effect.displacement_vector`
+(`toward_self` / `away`) entra al schema. La regla es generalizable a
+cualquier pull futuro: dispara cuando el objetivo es una amenaza de corta
+distancia (all-in alto, movilidad baja), y **no se inclina** — quién gana
+al cerrar la distancia es justamente lo que el resto del análisis intenta
+establecer, así que afirmar una dirección sería circular. El uso
+invertido (castear el pull hacia atrás para alejarse) sigue sin
+modelarse: depende de la geometría del casteo.
+
+**13.11 — Confidence: cuatro señales, no dos.** Las contradicciones se
+cuentan sobre la vista causal (una misma tensión repetida en tres fases
+valía tres); las condiciones `STRATEGIC` cuentan sin importar la
+polaridad de su entrada (antes se descartaban las colgadas de un PRO o un
+CONTRA, justo las que v1.6.1 empezó a producir); se separa la volatilidad
+estratégica COMPARTIDA —presente en ambas direcciones— de la exigencia de
+ejecución propia del candidato; y la penalización por información
+faltante dejó de saturar en 5.
+
+**13.12 — Presentación: síntesis, no solo condiciones.** Con un solo
+candidato ya no se anuncia un "mejor pick" (no hubo comparación que
+ganar): se dice "candidato evaluado". Se agrega `Lean` — dirección,
+intensidad, confianza, factores principales y condiciones de reversión —
+derivado de la misma vista causal, sin números nuevos. Las razones y
+riesgos se ordenan por aporte efectivo, no por delta crudo.
+
+**13.13 — Los dos scores suman 100, y eso no los vuelve probabilidades.**
+En el hito 1.6 sumaban 98.69 por acumulación de asimetrías (los escaneos
+unidireccionales de 13.1). Corregida la reciprocidad, la antisimetría es
+ahora EXACTA: toda causa compartida aparece en las dos direcciones con la
+misma magnitud y signo opuesto, y los únicos hechos asimétricos —los del
+kit del propio candidato— hoy no puntúan. Es una consecuencia mecánica
+del invariante, no una medida de probabilidad complementaria, y dejará de
+ser exacta en cuanto un hecho propio del candidato mueva el score. Queda
+documentado en `domain/result.py`, en el README y en la salida de la CLI
+para que nadie lea ese 100 como un reparto de victoria.
+
+**13.14 — `TacticalUse.TRADE_CUT` eliminado.** Ningún YAML lo usaba desde
+el hito 1.6 y la única rama que lo leía era inalcanzable. Se documenta
+como concepto descartado en `domain/enums.py`, no como vocabulario
+potencial: conservarlo "por compatibilidad" es exactamente el vocabulario
+muerto que la disciplina del hito 1.5 prohíbe.
+
+
+### 13.15 — Ronda final de revisión de v1.6.1
+
+Correcciones posteriores a la primera lectura de las trazas completas.
+
+**Un prior editorial ya no puntúa, punto.** El peso reducido (0.25) no
+alcanzaba: `early_pressure` aportaba `+0.0638`, más que toda la diferencia
+mecánica entre los dos candidatos, así que la ventaja publicada se
+invertía al quitarlo. Un peso "pequeño pero decisivo" es peor que ninguno,
+porque disfraza de conclusión derivada algo que nadie derivó.
+`editorial_prior` pasa a `0.0`. El prior se conserva íntegro, con su
+procedencia visible, en un canal de salida propio (`editorial_priors`),
+separado de la evidencia derivada. La derivación de estos ejes desde el
+kit está en el backlog; no se agregó ninguna heurística de reemplazo.
+`SOURCED_PRIOR` (dato externo con fuente, parche, fecha y confianza) queda
+documentado en `domain/enums.py` como candidato futuro y NO implementado:
+sin los puertos de estadísticas sería un miembro de enum sin consumidor.
+
+**Las dos penetraciones existen y no puntúan.** Compartían `magnitude: 1`
+y se cancelaban a `+0.015` contra `-0.015`, como si fueran equivalentes.
+Un ordinal cualitativo compartido no demuestra igual intensidad,
+disponibilidad ni relevancia contra las resistencias concretas del rival.
+Se conservan como evidencia `STRUCTURAL` —ventaja de su dueño, riesgo del
+otro, recíprocas— con aporte cero y un `invalidated_if` que dice qué
+faltaría para cuantificarlas. No son `AMBIGUOUS`: que la penetración
+exista no tiene nada de ambiguo; lo que no está calibrado es su peso.
+Aparecen en el canal `uncalibrated_observations`.
+
+**Noxian Might es bonus AD sobre el perfil ofensivo.** Antes era un
+`empower_self` genérico (que no decía qué empoderaba) más un
+`amplify_ability` sobre R (que duplicaba lo que el bonus de AD ya explica
+vía el ratio). Ahora es un solo efecto `bonus_attack_damage` con
+`scope: offensive_profile`, que llega a ataques básicos, Decimate,
+Crippling Strike, el escalado de Hemorrhage y el ratio de la R **sin
+generar una entrada de score por cada uno**. Quedan dos mecanismos
+distintos con dos causas distintas: el empoderamiento ofensivo general
+(recompensa al umbral, factor `stacking_payoff`) y el escalado directo del
+daño de la R con las cargas (factor `mechanical_interaction`).
+
+**Cómo se inclina el subproblema de recompensas, y por qué no por
+dominancia.** Al derivar las capacidades con el mismo criterio para los
+dos lados, la recompensa de daño persistente + velocidad tiene las suyas
+igual que la de empoderamiento ofensivo, y **ninguna domina a la otra**.
+Desempatar por conjuntos exigiría ordenar tipos de efecto entre sí, que es
+justamente lo que este motor no hace. La inclinación viene de UNA relación
+concreta y verificable, que cualquiera de los dos lados podría tener:
+`compounds_with_accumulation` — que la recompensa alcance a una habilidad
+que YA escalaba con el conteo de la MISMA mecánica. La narración describe
+ambas recompensas en sus propios términos y nunca dice que una "no
+amplifica ninguna habilidad".
+
+**Realm of Death: geometría, no solo robo de estadísticas.** La
+observación ahora cubre que con menos espacio cortar o espaciar el
+intercambio es más difícil PARA LOS DOS, que el trade tiende a extenderse,
+que sin oleada la condición de objetivo único es más fácil de cumplir, y
+que ambos pueden llegar a completar su acumulación. `CONDITIONED`, sin
+score, y explícitamente sin afirmar que la zona favorece a quien la creó.
+
+**La Q sin maná es una observación propia.** Antes la diferencia de
+recurso quedaba escondida en la condición de otra regla. Ahora se enuncia
+sola, sin score, sin convertir a nadie en campeón de poke y sin sugerir
+daño repetible sin coste.
+
+**Confianza: cobertura no es certeza.** `ALTA` resultaba engañoso. Se
+separan cuatro señales: `candidate_knowledge_coverage_*` (cuánto miró el
+motor para ESTE candidato, puede diferir por dirección),
+`shared_matchup_confidence` (certeza del veredicto, **simétrica** por
+construcción: "A tiene ventaja sobre B" es la misma afirmación se consulte
+desde donde se consulte), `shared_strategic_volatility_*` y las
+condiciones de ejecución propias, que van a PersonalScore. La confianza
+del veredicto tiene un techo declarado (`_UNAUDITED_KB_CEILING = MEDIA`)
+mientras la KB no esté auditada y los pesos no estén calibrados, y baja a
+BAJA si la volatilidad compartida es alta. No es una fórmula nueva: es un
+techo, una condición y las razones enumeradas en la salida.
+
+**Presentación.** La síntesis se redacta desde la perspectiva del
+candidato evaluado ("en contra de Mordekaiser y a favor de Darius", no
+"hacia Darius" en una consulta sobre Mordekaiser), y las condiciones se
+reparten con sujeto explícito: qué reduciría la ventaja estimada de quien
+la tiene, y qué mejoraría la posición del otro. La conclusión cualitativa
+—dirección, intensidad, confianza, volatilidad, factores— va primero; el
+número queda como dato técnico secundario. Las fases reportan "causas
+NUEVAS que esta fase desbloquea": cero no significa que las interacciones
+anteriores dejen de existir.
+
+**Un bug que encontró un test conductual.** Al exigir que quitar en
+memoria el reset o el slow de Crippling Strike cambiara la resolución de
+la situación B (y no solo que ciertas palabras aparecieran), salió a la
+luz que el texto decía "mediante el reset del ataque" de forma fija: seguía
+afirmando un reset aunque el KB dejara de declararlo. La frase ahora se
+construye con los aceleradores realmente encontrados.
+
+**Semántica del score y versionado.** El número se documenta como
+`MatchupScore`: relativo, antisimétrico por el invariante de reciprocidad,
+heurístico y sin calibrar. Un `GlobalScore` futuro —matchup + composición
++ meta + loadout + PersonalScore— no tendrá obligación de sumar 100 con el
+rival; queda documentado, no implementado. `knowledge_version` sube a
+`0.2.1` por el cambio de contenido semántico. `schema_version` sube a
+**3**: no por los campos nuevos (`displacement_vector`, `scope`, que son
+opcionales y aditivos) sino porque se ELIMINARON miembros de vocabulario
+(`trade_cut`, `empower_self`), y un documento v2 que los usara ya no
+valida. Quitar valores permitidos rompe la compatibilidad hacia atrás;
+agregar campos opcionales no.

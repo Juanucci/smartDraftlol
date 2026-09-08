@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Sequence
 
 from lol_reasoner.domain.champion import Champion
-from lol_reasoner.domain.enums import Factor, Phase, Polarity
+from lol_reasoner.domain.enums import ConditionKind, Factor, Phase, Polarity, Support
 from lol_reasoner.reasoning.context import ReasoningContext
 from lol_reasoner.reasoning.rules.base import Rule, RuleEffect
 from lol_reasoner.reasoning.rules.registry import ALL_GENERAL_RULES
@@ -84,6 +84,8 @@ class RuleEngine:
                         ),
                         condition="depende del objeto concreto comprado, fuera de alcance de esta V0",
                         invalidated_if="objetos y su timing no se modelan en esta V0",
+                        condition_kind=ConditionKind.KNOWLEDGE_GAP,
+                        support=Support.AMBIGUOUS,
                         category="missing_item_data",
                     ),
                 )
@@ -122,5 +124,7 @@ class RuleEngine:
                 invalidated_if=effect.invalidated_if,
                 causal_key=effect.causal_key,
                 condition_kind=effect.condition_kind,
+                support=effect.support,
+                provenance=effect.provenance,
             )
         )

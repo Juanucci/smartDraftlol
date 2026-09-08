@@ -27,8 +27,8 @@ def test_mastery_changes_personal_score_but_not_global_score(champions):
     assert rec_high.personal_score > rec_low.personal_score
     # Y tampoco toca Confidence (epistemia ni volatilidad): mastery es un
     # dato del jugador, no del matchup.
-    assert rec_low.confidence.score == rec_high.confidence.score
-    assert rec_low.confidence.volatility_score == rec_high.confidence.volatility_score
+    assert rec_low.confidence.candidate_knowledge_coverage_score == rec_high.confidence.candidate_knowledge_coverage_score
+    assert rec_low.confidence.shared_strategic_volatility_score == rec_high.confidence.shared_strategic_volatility_score
 
 
 def test_no_mastery_given_personal_equals_global(champions):
@@ -103,15 +103,15 @@ def test_confidence_drops_with_contradictory_evidence_but_only_volatility(darius
     rs = recommend(query, {"darius": darius, "mordekaiser": mordekaiser})
     rec = rs.recommendations["darius"]
     assert rec.confidence.contradiction_count > 0
-    assert rec.confidence.volatility_score > 0
+    assert rec.confidence.shared_strategic_volatility_score > 0
 
 
 def test_confidence_score_is_bounded(champions):
     query = MatchupQuery(enemy_id="darius", candidate_ids=("mordekaiser",))
     rs = recommend(query, champions)
     rec = rs.recommendations["mordekaiser"]
-    assert 0.0 <= rec.confidence.score <= 1.0
-    assert 0.0 <= rec.confidence.volatility_score <= 1.0
+    assert 0.0 <= rec.confidence.candidate_knowledge_coverage_score <= 1.0
+    assert 0.0 <= rec.confidence.shared_strategic_volatility_score <= 1.0
 
 
 def test_empty_trace_gives_zero_epistemic_confidence():
@@ -122,8 +122,8 @@ def test_empty_trace_gives_zero_epistemic_confidence():
     empty = ReasoningTrace(candidate_id="x", enemy_id="y")
     empty_mirror = ReasoningTrace(candidate_id="y", enemy_id="x")
     result = compute_confidence(empty, empty_mirror)
-    assert result.score == 0.0
-    assert result.level.value == "baja"
+    assert result.candidate_knowledge_coverage_score == 0.0
+    assert result.candidate_knowledge_coverage_level.value == "baja"
 
 
 def test_confidence_coverage_denominator_is_mirror_based_not_global_registry(darius, mordekaiser):
@@ -215,7 +215,7 @@ def test_contradiction_and_pro_contra_evidence_is_not_conflated_with_ignorance()
     # Misma cobertura (una categoría con evidencia) => misma epistemia;
     # la contradicción no la penaliza.
     assert result_with_contradiction.contradiction_count == 1
-    assert result_with_contradiction.volatility_score > result_without.volatility_score
+    assert result_with_contradiction.shared_strategic_volatility_score > result_without.shared_strategic_volatility_score
 
 
 def test_knowledge_gap_condition_kind_is_not_defined_as_a_condition_kind_used_by_rules():
@@ -296,3 +296,92 @@ def test_player_profile_is_the_extensible_interface_for_personal_score(darius):
     )
     assert breakdown is not None
     assert breakdown.mastery == 50
+
+
+# ---------------------------------------------------------------- v1.6.1
+
+
+def test_missing_info_penalty_does_not_saturate():
+    """Antes la penalización era `0.35 * min(1, missing/5)`: 5 y 7 huecos
+    penalizaban exactamente igual, así que una diferencia real de
+    ignorancia era invisible."""
+
+    def _trace_with(n_missing: int) -> ReasoningTrace:
+        t = ReasoningTrace(candidate_id="x", enemy_id="y")
+        for i in range(n_missing):
+            t.add(TraceEntry(
+                id=f"a{i}", rule_id="RX", rule_summary="s", category="true_damage_value",
+                phase=Phase.EARLY_LANE, factor=Factor.MECHANICAL_INTERACTION, polarity=Polarity.PRO,
+                delta=0.1, premises=(), subject="x", text="t", invalidated_if=f"hueco {i}",
+                causal_key=f"k{i}",
+            ))
+        return t
+
+    mirror = ReasoningTrace(candidate_id="y", enemy_id="x")
+    five = compute_confidence(_trace_with(5), mirror).candidate_knowledge_coverage_score
+    seven = compute_confidence(_trace_with(7), mirror).candidate_knowledge_coverage_score
+    assert seven < five, "más información faltante debe penalizar más, sin techo prematuro"
+
+
+def test_strategic_condition_counts_regardless_of_polarity():
+    """Una condición estratégica colgada de un PRO o un CONTRA no puede
+    descartarse en silencio: era el caso de las tres condiciones que el
+    hito 1.6 perdía."""
+
+    mirror = ReasoningTrace(candidate_id="y", enemy_id="x")
+    trace = ReasoningTrace(candidate_id="x", enemy_id="y")
+    for i, polarity in enumerate((Polarity.PRO, Polarity.CONTRA, Polarity.CONDITIONAL)):
+        trace.add(TraceEntry(
+            id=f"a{i}", rule_id="RX", rule_summary="s", category="true_damage_value", phase=Phase.EARLY_LANE,
+            factor=Factor.MECHANICAL_INTERACTION, polarity=polarity, delta=0.1, premises=(), subject="x",
+            text="t", condition=f"condición {i}", condition_kind=ConditionKind.STRATEGIC, causal_key=f"k{i}",
+        ))
+    assert compute_confidence(trace, mirror).strategic_condition_count == 3
+
+
+def test_shared_volatility_is_separated_from_candidate_execution_demand(champions):
+    """Tres señales distintas que antes se mezclaban: tensión estratégica
+    compartida (no puede evaporarse al invertir la consulta), exigencia de
+    ejecución propia del candidato (sí puede ser asimétrica) e
+    información faltante."""
+
+    engine = RuleEngine()
+    d = engine.build_trace(champions["darius"], champions["mordekaiser"], ALL_PHASES)
+    m = engine.build_trace(champions["mordekaiser"], champions["darius"], ALL_PHASES)
+
+    forward = compute_confidence(d, m)
+    backward = compute_confidence(m, d)
+
+    assert forward.shared_strategic_count > 0
+    assert forward.shared_strategic_count == backward.shared_strategic_count, (
+        "una tensión compartida del matchup no puede desaparecer al invertir la consulta"
+    )
+    assert forward.execution_condition_count >= 0
+    assert forward.strategic_condition_count >= forward.shared_strategic_count
+
+
+def test_volatility_asymmetry_is_bounded_after_dedup(champions):
+    """La volatilidad daba 0.833 en una dirección y 0.333 en la inversa
+    para el mismo núcleo estratégico, por contar causas duplicadas."""
+
+    engine = RuleEngine()
+    d = engine.build_trace(champions["darius"], champions["mordekaiser"], ALL_PHASES)
+    m = engine.build_trace(champions["mordekaiser"], champions["darius"], ALL_PHASES)
+    forward = compute_confidence(d, m).shared_strategic_volatility_score
+    backward = compute_confidence(m, d).shared_strategic_volatility_score
+    assert abs(forward - backward) < 0.34, (
+        f"volatilidad demasiado asimétrica para un núcleo estratégico compartido: {forward} vs {backward}"
+    )
+
+
+def test_coverage_numerator_and_denominator_are_serialized(champions):
+    """El denominador basado en traza espejo era la corrección central del
+    hito 1.6 y no se serializaba: no había forma de auditarlo desde el
+    JSON."""
+
+    rs = recommend(MatchupQuery(enemy_id="mordekaiser", candidate_ids=("darius",)), champions)
+    conf = rs.recommendations["darius"].confidence
+    assert conf.applicable_categories_count > 0
+    assert conf.categories_hit
+    assert len(conf.categories_hit) <= conf.applicable_categories_count
+    assert conf.coverage_ratio == round(len(conf.categories_hit) / conf.applicable_categories_count, 3)

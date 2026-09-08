@@ -5,7 +5,7 @@
 # propia, no auditada contra ninguna fuente ni parche concreto. Ver
 # README > Limitaciones.
 
-schema_version: 2
+schema_version: 3
 
 id: mordekaiser
 name: Mordekaiser
@@ -132,6 +132,7 @@ abilities:
         doc: "Componente pasivo de penetración mágica (sin porcentaje concreto en esta V0)."
       - type: displace_enemy
         magnitude: 2
+        displacement_vector: toward_self
         conditions: [on_delay]
         doc: "Pull retardado: la activación no es instantánea."
       - type: brief_cc
@@ -215,4 +216,4 @@ spikes:
     magnitude: 4
     reason: "Escala muy bien y es especialmente temido en side lane 1v1 en fases tardías."
 
-knowledge_version: "0.2.0"
+knowledge_version: "0.2.1"

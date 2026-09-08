@@ -25,11 +25,16 @@ def _raw_champion_dict(champion_id: str) -> dict:
         return yaml.safe_load(p.read_text(encoding="utf-8"))
 
 
-def test_removing_darius_q_heal_effect_reduces_mordekaiser_disadvantage():
-    """PokeVsSustainRule (G02) da un PRO a Darius-candidato por el heal
-    condicional de Decimate. Si esa curación no existiera, esa ventaja
-    debería desaparecer y su GlobalScore como candidato contra Mordekaiser
-    debería bajar."""
+def test_removing_darius_q_heal_effect_reduces_his_trade_sustain():
+    """`TradeSustainRule` (G02) da un PRO a Darius-candidato por el heal
+    condicionado de Decimate. Si esa curación no existiera, esa ventaja
+    debería desaparecer y su GlobalScore debería bajar.
+
+    v1.6.1: este test verificaba antes el texto "también lo cura al
+    conectar", que venía de la vieja regla de poke y describía a Decimate
+    como herramienta de poke. Se reescribe contra la evidencia
+    estructural (categoría y premisa del efecto HEAL), no contra una
+    frase que codificaba una caracterización incorrecta del kit."""
 
     original = _raw_champion_dict("darius")
     mutated = copy.deepcopy(original)
@@ -47,22 +52,32 @@ def test_removing_darius_q_heal_effect_reduces_mordekaiser_disadvantage():
 
     assert rec_after.global_score < rec_before.global_score
 
-    before_texts = " | ".join(r.text for r in rec_before.reasons)
-    after_texts = " | ".join(r.text for r in rec_after.reasons)
-    assert "también lo cura al conectar" in before_texts
-    assert "también lo cura al conectar" not in after_texts
+    def _heal_entries(rec):
+        return [
+            e
+            for e in rec.trace_entries
+            if e["category"] == "trade_sustain"
+            and any(p["path"].endswith("effects.heal") for p in e["premises"])
+        ]
 
-    heal_entries_before = [e for e in rec_before.trace_entries if e["rule_id"] == "G02" and "también lo cura" in e["text"]]
-    heal_entries_after = [e for e in rec_after.trace_entries if e["rule_id"] == "G02" and "también lo cura" in e["text"]]
-    assert heal_entries_before
-    assert not heal_entries_after
+    assert _heal_entries(rec_before), "la curación condicionada debe sostener el trade"
+    assert not _heal_entries(rec_after), "sin efecto HEAL no puede quedar evidencia de sustain de intercambio"
+
+    # Y en ningún caso el motor describe a Darius como campeón de poke.
+    all_text = " ".join(r.text for r in (*rec_before.reasons, *rec_before.risks, *rec_before.conditions))
+    assert "poke" not in all_text.lower()
 
 
 def test_shrinking_mordekaiser_shield_magnitude_reduces_the_mitigation_penalty():
-    """DamageTypeAndShieldRule (fusionada con la ex-G04 en el hito 1.6)
-    escala su CONTRA `damage_mitigation` con la magnitud del escudo de
-    Indestructible. Bajarla debería reducir (no eliminar) la
-    penalización que sufre Darius como candidato."""
+    """`ShieldAbsorptionRule` (G16) escala su CONTRA `shield_mitigation`
+    con la magnitud del escudo de Indestructible. Bajarla debería reducir
+    (no eliminar) la penalización que sufre Darius como candidato.
+
+    v1.6.1: además se exige RECIPROCIDAD numérica — la misma capacidad
+    debe valer lo mismo en las dos direcciones de la consulta. Antes
+    valía 0.045 como ventaja propia de Mordekaiser y 0.084 como
+    penalización de Darius, porque la variante "rica" de la regla solo se
+    calculaba escaneando al enemigo."""
 
     original = _raw_champion_dict("mordekaiser")
     mutated = copy.deepcopy(original)
@@ -85,9 +100,17 @@ def test_shrinking_mordekaiser_shield_magnitude_reduces_the_mitigation_penalty()
 
     assert rec_after.global_score > rec_before.global_score  # menos escudo => menos mitigación => mejor para Darius
 
-    mitigation_before = next(e for e in rec_before.trace_entries if e["category"] == "damage_mitigation" and e["phase"] == "early_lane")
-    mitigation_after = next(e for e in rec_after.trace_entries if e["category"] == "damage_mitigation" and e["phase"] == "early_lane")
+    mitigation_before = next(e for e in rec_before.trace_entries if e["category"] == "shield_mitigation" and e["phase"] == "early_lane")
+    mitigation_after = next(e for e in rec_after.trace_entries if e["category"] == "shield_mitigation" and e["phase"] == "early_lane")
     assert mitigation_after["delta"] < mitigation_before["delta"]
+
+    # Reciprocidad numérica: mismo escudo, misma magnitud, polaridad opuesta.
+    query_inverse = MatchupQuery(enemy_id="darius", candidate_ids=("mordekaiser",))
+    rec_owner = recommend(query_inverse, {"darius": darius, "mordekaiser": mordekaiser_original}).recommendations["mordekaiser"]
+    owner_entry = next(e for e in rec_owner.trace_entries if e["category"] == "shield_mitigation" and e["phase"] == "early_lane")
+    assert owner_entry["causal_key"] == mitigation_before["causal_key"]
+    assert owner_entry["delta"] == mitigation_before["delta"]
+    assert {owner_entry["polarity"], mitigation_before["polarity"]} == {"pro", "contra"}
 
 
 def test_raising_candidate_execution_demand_lowers_personal_score_at_low_mastery():

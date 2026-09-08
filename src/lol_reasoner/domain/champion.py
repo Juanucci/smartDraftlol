@@ -61,6 +61,25 @@ class Effect:
     # slot de habilidad amplifica, para poder filtrar por disponibilidad
     # de fase (p. ej. Noxian Might amplifica R, disponible desde level_6).
     amplifies_slot: str | None = None
+    # Alcance de un efecto de empoderamiento: qué parte del kit mejora.
+    # "offensive_profile" = el perfil ofensivo completo (ataques básicos,
+    # habilidades que escalan con esa estadística y los ratios de las
+    # demás), no una habilidad puntual. Es lo que permite distinguir una
+    # recompensa que compone con el resto del kit de una que se agota en
+    # sí misma, sin enumerar habilidad por habilidad ni generar una
+    # entrada de score por cada una.
+    scope: str | None = None
+    # Solo para EffectType.DISPLACE_ENEMY: hacia dónde mueve al rival.
+    # "toward_self" = lo atrae hacia quien castea (un pull: Apprehend,
+    # Death's Grasp); "away" = lo empuja lejos (knockback). No es un
+    # detalle cosmético: atraer a un duelista de corta distancia le da
+    # acceso al que lo atrajo, mientras que empujarlo se lo niega — dos
+    # consecuencias opuestas del mismo EffectType, indistinguibles sin
+    # este campo (ver PullTowardEngageRule). El uso INVERTIDO (castear el
+    # pull hacia atrás para reposicionarse uno mismo) NO se modela: es
+    # direccional respecto de la geometría del casteo, que esta V0 no
+    # representa — ver docs/backlog-v1.md.
+    displacement_vector: str | None = None
     # Por defecto, CUALQUIER daño (incluido el verdadero) es absorbible
     # por un escudo genérico: ver ShieldAbsorbsAnyDamageRule. Este flag
     # existe para que una habilidad FUTURA y concreta pueda declarar

@@ -140,7 +140,13 @@ class EffectType(str, Enum):
     EMPOWER_NEXT_ATTACK = "empower_next_attack"
     STACK_APPLICATION = "stack_application"
     AMPLIFY_ABILITY = "amplify_ability"          # escala otra habilidad (ver `amplifies_slot`)
-    EMPOWER_SELF = "empower_self"
+    # Bonus de daño de ataque que fortalece el PERFIL OFENSIVO completo
+    # (ver `Effect.scope`): ataques básicos, las habilidades que escalan
+    # con AD y los ratios de las demás. Reemplaza en v1.6.1 al genérico
+    # `empower_self`, que no decía QUÉ empoderaba y obligaba a compararlo
+    # como una magnitud opaca. Un efecto concreto se puede razonar; uno
+    # genérico solo se puede sumar.
+    BONUS_ATTACK_DAMAGE = "bonus_attack_damage"
     SHIELD_FROM_STORED = "shield_from_stored"      # escudo construido a partir de un recurso acumulado
     CONVERT_SHIELD_TO_HEAL = "convert_shield_to_heal"
     AURA_DAMAGE = "aura_damage"
@@ -198,7 +204,6 @@ class TacticalUse(str, Enum):
     WAVECLEAR = "waveclear"
     SUSTAIN = "sustain"
     TRADE_EXTEND = "trade_extend"
-    TRADE_CUT = "trade_cut"
 
 
 class CooldownClass(str, Enum):
@@ -213,6 +218,70 @@ class Polarity(str, Enum):
     CONDITIONAL = "conditional"
 
 
+class Support(str, Enum):
+    """Cuánta CERTEZA respalda la inclinación de una entrada — un eje
+    independiente de la DIRECCIÓN (`Polarity`) y del TIPO de
+    incertidumbre (`ConditionKind`). v1.6.1 separa los tres conceptos que
+    antes se apretaban dentro de `Polarity`:
+
+      - hacia qué lado se inclina la interacción  -> `Polarity`
+      - bajo qué condición se sostiene            -> `condition` + `ConditionKind`
+      - cuánta certeza hay sobre esa inclinación  -> `Support` (esto)
+
+    Antes, una ventaja real pero condicionada solo podía elegir entre
+    afirmarse entera (PRO, con toda su magnitud) o refugiarse en
+    CONDITIONAL y no mover nada. El resultado observado en el hito 1.6
+    fue que casi la mitad de las entradas pesaban cero y el motor no
+    producía ninguna síntesis.
+
+      - STRUCTURAL: se sostiene siempre que ambos kits estén presentes en
+        la fase (p. ej. "esta habilidad roba estadísticas mientras dura").
+      - CONDITIONED: la dirección es clara, pero requiere una
+        circunstancia (que el intercambio se extienda, que haya escudo
+        acumulado). Inclina el score de forma amortiguada — NO se vuelve
+        certeza — y su condición alimenta volatilidad.
+      - AMBIGUOUS: doble filo real, sin dirección neta derivable. Aporta
+        CERO al score (obliga `Polarity.CONDITIONAL`), pero se conserva
+        íntegra en la explicación: que el motor no pueda inclinarse no es
+        motivo para ocultar el hecho.
+
+    El multiplicador de cada nivel vive en `config/weights.yaml`
+    (`support:`), es configurable, viaja en la traza y está documentado
+    como heurístico sin calibrar — no es una probabilidad.
+    """
+
+    STRUCTURAL = "structural"
+    CONDITIONED = "conditioned"
+    AMBIGUOUS = "ambiguous"
+
+
+class Provenance(str, Enum):
+    """De dónde sale un hecho: del kit modelado o de un juicio humano.
+
+    v1.6.1. En el hito 1.6, dos ejes escritos a mano (`early_pressure` y
+    `scaling`) producían el 40-64 % de todo el movimiento de score, y un
+    solo punto editorial de `sustain` movía el GlobalScore 2.76 puntos —
+    doce veces la diferencia total entre los dos candidatos. Eso no es
+    razonamiento mecánico derivado: es una valoración manual entrando al
+    número sin identificarse como tal.
+
+      - DERIVED: se deriva de la estructura del kit (`effects`,
+        `tactical_uses`, `StackingMechanic`, disponibilidad por fase).
+      - EDITORIAL_PRIOR: sale de un eje 0..4 escrito a mano en el YAML.
+        Se etiqueta explícitamente ante el consumidor, se pondera con un
+        peso reducido (`provenance:` en config/weights.yaml) y está
+        acotado por un guardrail de participación máxima en el score.
+
+    La meta es que los priors editoriales se vayan derivando del kit a
+    medida que el modelo lo permita (ver docs/backlog-v1.md), no que se
+    borren: un prior identificado es honesto, un prior disfrazado de
+    conclusión derivada no.
+    """
+
+    DERIVED = "derived"
+    EDITORIAL_PRIOR = "editorial_prior"
+
+
 class Factor(str, Enum):
     """Factores de scoring, con pesos centralizados en config/weights.yaml.
 
@@ -225,7 +294,13 @@ class Factor(str, Enum):
     MECHANICAL_INTERACTION = "mechanical_interaction"
     LANE_PATTERN = "lane_pattern"
     RELIABILITY = "reliability"
-    POWER_SPIKES = "power_spikes"
+    # Recompensa comparada de las mecánicas de acumulación (StackRaceRule).
+    # Renombrado en v1.6.1: se llamaba `power_spikes`, pero NUNCA leyó
+    # `Champion.spikes` — describía exclusivamente el pago de una
+    # StackingMechanic. Un campeón sin acumulaciones también puede tener
+    # spikes (desbloqueo, transformación, nivel, breakpoint, sinergia);
+    # ese modelo genérico está documentado en docs/backlog-v1.md.
+    STACKING_PAYOFF = "stacking_payoff"
     SCALING_SIDELANE = "scaling_sidelane"
 
 
@@ -286,8 +361,30 @@ class ConditionKind(str, Enum):
 #   - short_trader: identidad de trade corto/hit-and-run como patrón
 #     dominante (ninguno de Darius/Mordekaiser lo es).
 #
+# Conceptos DESCARTADOS (no vocabulario potencial: no vuelven salvo que
+# aparezca un dato real que los justifique):
+#   - trade_cut: existió como TacticalUse hasta v1.6.1. Se le había puesto
+#     a Indestructible, y el hito 1.6 se lo quitó al comprobar que un
+#     escudo no corta un intercambio por sí solo (salir depende del
+#     posicionamiento y de otras acciones). Desde entonces ningún YAML lo
+#     usaba y la única rama que lo leía era inalcanzable. Se elimina en
+#     lugar de conservarse "por compatibilidad": un miembro de enum que
+#     ningún dato ni regla legítima consume es exactamente el vocabulario
+#     muerto que la disciplina del hito 1.5 prohíbe.
+#
 # Candidato a `TacticalUse`:
 #   - disengage: una herramienta que de verdad permite desconectar un
 #     intercambio (romper línea de visión, ganar distancia neta). Apprehend
 #     NO calza: desplaza al rival, no crea espacio para quien la usa.
+#
+# Candidato a `Provenance` (documentado, NO implementado en v1.6.1):
+#   - SOURCED_PRIOR: un dato traído de una fuente externa (winrate, tasa
+#     de matchup, tier list), con fuente, parche, fecha, tamaño de muestra
+#     y confianza del dato. Sería un tercer nivel entre DERIVED y
+#     EDITORIAL_PRIOR: no lo derivó el motor, pero tampoco es la opinión
+#     de quien cargó el YAML. Requiere los puertos de estadísticas del
+#     backlog (#4) y un modelo de parche; agregar hoy el miembro del enum
+#     sin esos puertos sería exactamente el vocabulario muerto que la
+#     disciplina del hito 1.5 prohíbe. Debe quedar separado del
+#     razonamiento mecánico, nunca fundido con él.
 # ---------------------------------------------------------------------------

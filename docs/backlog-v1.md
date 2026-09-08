@@ -18,6 +18,79 @@ esto está implementado en el hito actual (Darius vs Mordekaiser).
    patrones (poke real, disengage real, waveclear extremo) que las reglas
    actuales no cubren bien porque Darius/Mordekaiser no los ejercitan.
 
+## Derivar lo que hoy es editorial (abierto en v1.6.1)
+
+Estos ítems son la contracara de `Provenance.EDITORIAL_PRIOR`: no se
+trata de borrar los ejes escritos a mano, sino de reemplazarlos
+progresivamente por algo derivado del kit.
+
+A. **Derivar `sustain` de efectos reales**: curación, escudo, condición
+   de activación, disponibilidad por fase y frecuencia (cooldown). En
+   v1.6.1 se eliminó toda inferencia de score desde `axes.sustain`
+   porque un solo punto editorial movía el GlobalScore doce veces más
+   que la diferencia entre los dos candidatos. La regla actual
+   (`TradeSustainRule`) solo lee efectos `HEAL`; falta el resto.
+B. **Derivar `early_pressure`**: hoy entra como prior editorial con peso
+   CERO — se muestra, no puntúa. Una derivación posible: densidad de efectos de daño
+   disponibles en `early_lane`, fuentes de acumulación alcanzables y
+   coste de recurso. Cuidado con reemplazar un número editorial por una
+   fórmula editorial disfrazada.
+C. **Modelo genérico de `PowerSpike`**: el factor que hoy se llama
+   `stacking_payoff` solo sabe de mecánicas de acumulación. Un campeón
+   sin acumulaciones también tiene spikes por desbloqueo de habilidad,
+   transformación, nivel, breakpoint de estadísticas o cooldown, y
+   sinergia concreta. `Champion.spikes` sigue siendo descriptivo y
+   ninguna regla lo lee.
+D. **Separar los ejes de juego tardío**, hoy colapsados en un único
+   `scaling` editorial que no puntúa: `duel_scaling`, `side_lane_duel`,
+   `wave_pressure`, `structure_pressure`, `collapse_resistance`,
+   `map_response`, `splitpush_value`, `teamfight_value`.
+   `splitpush_value` en particular deberá derivarse de capacidades
+   concretas (waveclear, duelo 1v1, resistencia a un colapso, movilidad
+   de rotación) y no ser otro número universal escrito a mano.
+
+## Objetos: qué habría que modelar (documentado, NO implementado)
+
+Nada de esto entra en v1.6.1. Se documenta para que, cuando se implemente,
+no se reduzca a "tiene un objeto, sube el score".
+
+**Timing y economía**
+- Quién completa primero su primer objeto, y con cuánta ventaja.
+- Coste y timing estimado de compra; el recall que lo hace posible.
+- Diferencia entre un componente y el objeto terminado: un componente
+  temprano puede cambiar un intercambio sin ser todavía el spike.
+- Spike DISCRETO al completar el objeto, no una rampa continua.
+- Estado de la partida en ese momento (oro, oleada, presión).
+- Builds completas válidas para el parche, no un objeto suelto.
+
+**Interacción con el matchup**
+- Cómo interactúa el objeto con ESTE matchup, no su fuerza en abstracto.
+- Coste de oportunidad: elegir una respuesta defensiva sacrifica otra
+  cosa, y eso también debe pesar.
+
+**Efectos contextuales a representar** (cada uno con su propia relación
+causal, no como un tag global): reducción de curación, penetración,
+resistencias, reducción o interacción con escudos, movilidad, tenacidad,
+anti-burst.
+
+**Regla de diseño que este backlog fija de antemano**: el motor NO debe
+recomendar un corta-curaciones solo porque el rival tenga una curación.
+Tiene que comparar cuánto healing relevante hay, qué parte de la defensa
+rival es ESCUDO —que el antiheal no reduce— y qué se sacrifica al comprar
+ese objeto. Es exactamente el mismo error de forma que v1.6.1 corrigió en
+otro lado: inferir una consecuencia desde la mera presencia de una
+etiqueta, sin medir la magnitud ni el contexto.
+
+## Scores por fase (documentado, NO implementado)
+
+Hoy `PhaseNote` reporta las causas NUEVAS que cada fase desbloquea, no un
+score independiente por fase: una fase sin causas nuevas muestra cero
+aportes aunque las interacciones anteriores sigan vigentes. Un modelo
+completo por fase (score propio, con las causas heredadas revaluadas bajo
+las condiciones de esa fase) requiere decidir qué significa "seguir
+vigente" para cada tipo de causa y evitar volver a multiplicar una misma
+ventaja por cuatro. Queda para después de los 10 campeones.
+
 ## Después de validar los 10 campeones
 
 4. **Puertos de estadísticas reales** (`stats/ports.py` con un `Protocol`):
@@ -51,7 +124,8 @@ esto está implementado en el hito actual (Darius vs Mordekaiser).
 12. Integración con Riot API / fuentes de datos en vivo — recién después de
     que los puertos de estadísticas (#4) estén definidos y probados con datos
     mock.
-13. **Mecánica avanzada/contextual: Death's Grasp en reversa** (hito 1.6).
+13. **Mecánica avanzada/contextual: Death's Grasp en reversa** (hito 1.6,
+    sigue abierto en v1.6.1).
     Mordekaiser puede lanzar Death's Grasp hacia atrás para halarse a sí
     mismo lejos del rival (reposicionamiento defensivo/de escape), en vez
     de halar al rival hacia él. Esta V0 modela solo el uso ofensivo
@@ -62,4 +136,10 @@ esto está implementado en el hito actual (Darius vs Mordekaiser).
     No inferir esto vía `interrupt` ni generalizarlo como "herramienta de
     disengage" genérica: es un uso condicional y direccional de una
     habilidad concreta, documentado acá para no perderlo de vista al
-    diseñar el modelo de posición/geometría de V1.
+    diseñar el modelo de posición/geometría de V1. v1.6.1 sí modeló la
+    DIRECCIÓN del desplazamiento (`Effect.displacement_vector`:
+    `toward_self` / `away`), que es lo que permite distinguir un pull de
+    un knockback y habilita `PullTowardEngageRule`. Lo que sigue sin
+    modelarse es el uso invertido: castear el pull hacia atrás para
+    reposicionarse uno mismo depende de hacia dónde apunta el casteo, no
+    solo de qué efecto tiene la habilidad.

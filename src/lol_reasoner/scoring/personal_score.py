@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from lol_reasoner.domain.enums import ConditionKind, Polarity
+from lol_reasoner.domain.enums import ConditionKind
 from lol_reasoner.reasoning.trace import ReasoningTrace
 from lol_reasoner.scoring.weights import Weights
 
@@ -94,10 +94,18 @@ def execution_condition_count(trace: ReasoningTrace) -> int:
     """Cantidad de condiciones EXECUTION DISTINTAS (no de entradas) de las
     que depende ejecutar el plan del candidato. Ni información faltante
     (KNOWLEDGE_GAP) ni incertidumbre estratégica (STRATEGIC) cuentan acá
-    — ver docstring del módulo."""
+    — ver docstring del módulo.
+
+    v1.6.1, dos ajustes: se cuenta sobre la vista causal deduplicada (una
+    misma exigencia repetida en cuatro fases es una sola exigencia), y ya
+    NO se exige que la entrada sea `CONDITIONAL`. Desde que una ventaja
+    puede afirmarse como PRO/CONTRA condicionada (ver domain.enums.Support),
+    la exigencia de ejecución suele viajar justamente en esas entradas:
+    filtrar por polaridad las descartaba en silencio.
+    """
 
     return len({
         e.condition
-        for e in trace.entries
-        if e.polarity == Polarity.CONDITIONAL and e.condition and e.condition_kind == ConditionKind.EXECUTION
+        for e in trace.deduped_for_scoring(trace.candidate_id)
+        if e.condition and e.condition_kind == ConditionKind.EXECUTION
     })

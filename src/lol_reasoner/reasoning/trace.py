@@ -10,7 +10,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from lol_reasoner.domain.enums import ConditionKind, Factor, Phase, Polarity, phase_index
+from lol_reasoner.domain.enums import (
+    ConditionKind,
+    Factor,
+    Phase,
+    Polarity,
+    Provenance,
+    Support,
+    phase_index,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +30,13 @@ class FactRef:
 
     path: str
     value: object
+
+
+_SUPPORT_ORDER = {Support.STRUCTURAL: 2, Support.CONDITIONED: 1, Support.AMBIGUOUS: 0}
+
+
+def _support_rank(support: Support) -> int:
+    return _SUPPORT_ORDER[support]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +56,8 @@ class TraceEntry:
     invalidated_if: str | None = None  # qué información faltante podría cambiarlo
     causal_key: str | None = None  # ver RuleEffect.causal_key
     condition_kind: ConditionKind | None = None  # ver RuleEffect.condition_kind
+    support: Support = Support.STRUCTURAL  # ver RuleEffect.support
+    provenance: Provenance = Provenance.DERIVED  # ver RuleEffect.provenance
 
 
 @dataclass(slots=True)
@@ -78,10 +95,16 @@ class ReasoningTrace:
         Entradas con `causal_key=None` nunca se deduplican (se conservan
         todas, comportamiento sin cambios).
 
-        NO usar esto para `build_phase_notes`: ahí la repetición de un
-        mismo hecho en varias fases es información real ("esto sigue
-        siendo cierto en level_6, first_item y side_lane_late"), no
-        doble conteo — se debe seguir iterando `for_phase()` crudo.
+        Esta es la **vista causal**: la usan el scoring, el narrador y el
+        cálculo de contradicciones de Confidence, para que una sola causa
+        mecánica no cuente varias veces por reaparecer en varias fases o
+        por ser citada por dos reglas.
+
+        La traza CRUDA (`entries`, `for_phase`) se conserva íntegra para
+        auditoría, y `build_phase_notes` muestra las dos vistas por
+        separado y etiquetadas: que un hecho siga vigente en level_6,
+        first_item y side_lane_late es información real, pero no es una
+        ventaja tres veces más grande.
         """
 
         own = [e for e in self.entries if e.subject == subject_id]
@@ -95,8 +118,12 @@ class ReasoningTrace:
             if current is None:
                 keyed[e.causal_key] = e
                 continue
-            current_rank = (abs(current.delta), -phase_index(current.phase))
-            candidate_rank = (abs(e.delta), -phase_index(e.phase))
+            # Desempate config-independiente: mayor |delta|, luego mayor
+            # certeza (STRUCTURAL > CONDITIONED > AMBIGUOUS), luego fase
+            # más temprana. No usa los pesos de config/weights.yaml para
+            # que la vista causal no dependa de la calibración.
+            current_rank = (abs(current.delta), _support_rank(current.support), -phase_index(current.phase))
+            candidate_rank = (abs(e.delta), _support_rank(e.support), -phase_index(e.phase))
             if candidate_rank > current_rank:
                 keyed[e.causal_key] = e
         return unkeyed + list(keyed.values())

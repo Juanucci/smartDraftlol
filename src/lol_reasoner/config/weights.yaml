@@ -11,7 +11,7 @@ factors:
   mechanical_interaction: 1.0
   lane_pattern: 0.85
   reliability: 0.6
-  power_spikes: 0.7
+  stacking_payoff: 0.7
   scaling_sidelane: 0.7
 
 phases:
@@ -20,7 +20,39 @@ phases:
   first_item: 0.8
   side_lane_late: 0.8
 
-# GlobalScore = clamp(50 + scale * sum(phase_w * factor_w * signed_delta), 0, 100)
+# Multiplicador por nivel de certeza (domain.enums.Support). HEURÍSTICO y
+# SIN CALIBRAR, como todo este archivo: no es una probabilidad ni una
+# frecuencia observada. Es la respuesta a "¿cuánto debería inclinar el
+# score una ventaja que es real pero depende de una circunstancia?".
+#   - structural  = 1.0: se sostiene siempre que ambos kits estén en la fase.
+#   - conditioned = 0.45: inclina, pero no se vuelve certeza. Deliberadamente
+#     por debajo de 0.5 para que una ventaja condicionada nunca pese como
+#     media ventaja estructural.
+#   - ambiguous   = 0.0: doble filo real; aporta cero al score y se conserva
+#     entera en la explicación.
+# Cada entrada de la traza expone su `support`, así que el efecto de estos
+# números es auditable entrada por entrada.
+support:
+  structural: 1.0
+  conditioned: 0.45
+  ambiguous: 0.0
+
+# Multiplicador por procedencia (domain.enums.Provenance).
+#   - derived = 1.0: el hecho se deriva del kit modelado.
+#   - editorial_prior = 0.0: un eje 0..4 escrito a mano NO mueve el score
+#     mecánico. Se conserva íntegro en la traza y en la salida, etiquetado
+#     como valoración manual, pero no decide nada.
+#
+# Por qué 0 y no un peso chico: con 0.25, el aporte de `early_pressure`
+# (+0.0638) era mayor que la diferencia mecánica real entre los dos
+# candidatos, así que la ventaja publicada NO se derivaba del kit — se
+# invertía al quitar el prior. Un peso "pequeño pero decisivo" es peor que
+# ninguno: disfraza de conclusión derivada algo que nadie derivó.
+provenance:
+  derived: 1.0
+  editorial_prior: 0.0
+
+# GlobalScore = clamp(50 + scale * sum(phase_w * factor_w * support_w * provenance_w * signed_delta), 0, 100)
 global_scale: 12.0
 
 # PersonalScore = clamp(global_score + execution_sensitivity * gap/100, 0, 100)

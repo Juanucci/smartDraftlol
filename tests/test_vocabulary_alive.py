@@ -87,18 +87,44 @@ def _tactical_uses_in_kb(champions) -> set[TacticalUse]:
     return uses
 
 
-def test_every_effect_type_in_kb_is_referenced_by_some_rule_source():
-    """Chequeo mínimo de higiene: aunque la prueba fuerte es la
-    comportamental de abajo, ningún EffectType usado en el KB debería
-    estar completamente ausente del código fuente de las reglas."""
+def test_every_effect_type_in_kb_is_consumed_by_name_or_observably(champions):
+    """Chequeo de higiene: ningún EffectType usado en el KB puede quedar
+    sin consumidor. Un tipo lo satisface de una de dos maneras:
 
-    from lol_reasoner.knowledge.loader import load_all_champions
+      a) nombrado literalmente en el código de una regla (consumo
+         específico: la regla pregunta por ESE tipo), o
+      b) citado en la traza real (consumo genérico: la regla itera una
+         colección del KB y lo cita como premisa sin enumerarlo).
 
-    used_types = _effect_types_in_kb(load_all_champions())
+    v1.6.1 admite explícitamente (b). Antes solo valía (a), y eso exigía
+    que `stacking.py` mantuviera una lista blanca de "tipos de efecto que
+    contribuyen a una recompensa" (`_REWARD_CONTRIBUTING_TYPES`, con
+    EMPOWER_SELF, AURA_DAMAGE, MOVEMENT_SPEED y AMPLIFY_ABILITY). Esa
+    lista era precisamente la jerarquía arbitraria de tipos de recompensa
+    que v1.6.1 eliminó: la comparación pasó a ser por capacidades
+    estructurales, iterando `reward_effects` sin privilegiar tipos. Exigir
+    (a) obligaría a reponer la lista blanca solo para satisfacer un test.
+
+    La garantía de fondo no se debilita: la prueba fuerte sigue siendo la
+    comportamental de abajo, que exige influencia observable en la traza,
+    y es estrictamente más difícil de satisfacer que aparecer citado en
+    un archivo fuente.
+    """
+
+    used_types = _effect_types_in_kb(champions)
     source = inspect.getsource(general) + inspect.getsource(stacking)
-    referenced = {t for t in used_types if t.name in source}
-    missing = used_types - referenced - STRUCTURALLY_CONSUMED_NOT_BY_RULES
-    assert not missing, f"EffectType usados en el KB pero nunca nombrados en una regla: {missing}"
+
+    engine = RuleEngine()
+    trace_d = engine.build_trace(champions["darius"], champions["mordekaiser"], ALL_PHASES)
+    trace_m = engine.build_trace(champions["mordekaiser"], champions["darius"], ALL_PHASES)
+    cited_paths = " ".join(p.path for t in (trace_d, trace_m) for e in t.entries for p in e.premises)
+
+    unconsumed = {
+        t
+        for t in used_types
+        if t.name not in source and t.value not in cited_paths
+    } - STRUCTURALLY_CONSUMED_NOT_BY_RULES
+    assert not unconsumed, f"EffectType usados en el KB sin ningún consumidor (ni por nombre ni observable): {unconsumed}"
 
 
 def test_every_effect_type_in_kb_influences_the_trace_or_is_documented_inert(champions):

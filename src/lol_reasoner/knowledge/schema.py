@@ -25,7 +25,7 @@ from lol_reasoner.domain.enums import (
     TradePattern,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 REQUIRED_TOP_LEVEL_KEYS = {
     "schema_version",
@@ -68,6 +68,10 @@ VALID_TRADE_PATTERNS = {t.value for t in TradePattern}
 VALID_TACTICAL_USES = {t.value for t in TacticalUse}
 VALID_RESOURCE_TYPES = {r.value for r in ResourceType}
 VALID_STACK_APPLICATION_SOURCES = {"basic_attack", "Q", "W", "E", "R"}
+# Dirección de un DISPLACE_ENEMY (ver domain/champion.py: Effect.displacement_vector).
+VALID_DISPLACEMENT_VECTORS = {"toward_self", "away"}
+# Alcance de un efecto de empoderamiento (ver domain/champion.py: Effect.scope).
+VALID_EFFECT_SCOPES = {"offensive_profile"}
 
 
 class KnowledgeError(ValueError):
@@ -214,6 +218,24 @@ def _validate_effect(effect: dict, source: str, ability_name: str, stack_ids: se
     stack_scaling = effect.get("stack_scaling")
     if stack_scaling is not None and stack_scaling not in stack_ids:
         raise KnowledgeError(f"{source}: stack_scaling '{stack_scaling}' en {ability_name} no referencia ninguna stacking_mechanic declarada")
+
+    scope = effect.get("scope")
+    if scope is not None and scope not in VALID_EFFECT_SCOPES:
+        raise KnowledgeError(
+            f"{source}: scope inválido '{scope}' en {ability_name}, debe ser uno de {sorted(VALID_EFFECT_SCOPES)}"
+        )
+
+    displacement_vector = effect.get("displacement_vector")
+    if displacement_vector is not None:
+        if displacement_vector not in VALID_DISPLACEMENT_VECTORS:
+            raise KnowledgeError(
+                f"{source}: displacement_vector inválido '{displacement_vector}' en {ability_name}, "
+                f"debe ser uno de {sorted(VALID_DISPLACEMENT_VECTORS)}"
+            )
+        if effect["type"] != EffectType.DISPLACE_ENEMY.value:
+            raise KnowledgeError(
+                f"{source}: displacement_vector solo tiene sentido en un efecto DISPLACE_ENEMY ({ability_name})"
+            )
 
     amplifies_slot = effect.get("amplifies_slot")
     if amplifies_slot is not None and amplifies_slot not in REQUIRED_SLOTS:

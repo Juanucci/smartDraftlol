@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from lol_reasoner.domain.enums import Factor, Phase
+from lol_reasoner.domain.enums import Factor, Phase, Provenance, Support
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +23,8 @@ class PersonalWeights:
 class Weights:
     factor_weights: dict[Factor, float]
     phase_weights: dict[Phase, float]
+    support_weights: dict[Support, float]
+    provenance_weights: dict[Provenance, float]
     global_scale: float
     personal: PersonalWeights
 
@@ -38,6 +40,8 @@ def load_weights(path: Path | None = None) -> Weights:
     return Weights(
         factor_weights={Factor(k): v for k, v in data["factors"].items()},
         phase_weights={Phase(k): v for k, v in data["phases"].items()},
+        support_weights={Support(k): v for k, v in data["support"].items()},
+        provenance_weights={Provenance(k): v for k, v in data["provenance"].items()},
         global_scale=data["global_scale"],
         personal=PersonalWeights(**data["personal"]),
     )
