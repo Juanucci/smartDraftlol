@@ -18,7 +18,7 @@ pasó dos rondas corrigiendo (un prior con peso, por chico que sea, termina
 decidiendo el veredicto). La separación de directorio y de loader es la
 garantía estructural, no una convención de nombres.
 
-## Ubicación propuesta
+## Ubicación propuesta y convención de archivos (elegida, no ambigua)
 
 ```
 knowledge/
@@ -27,14 +27,28 @@ knowledge/
 
 benchmarks/                    # NUEVO, top-level, fuera de knowledge/
 └── matchups/
-    └── darius__mordekaiser.yaml
+    ├── darius__mordekaiser.yaml     # Darius como candidato
+    └── mordekaiser__darius.yaml     # Mordekaiser como candidato (archivo aparte)
 ```
+
+**Decisión explícita**: archivos **direccionales**, un archivo por
+dirección (`<candidate>__<enemy>.yaml`), no un archivo de par no ordenado
+con una perspectiva por entrada. Motivo: `candidate_id`/`enemy_id` son
+campos de **archivo**, no de entrada — un sitio que reporta "la página de
+Darius contra Mordekaiser" (winrate de Darius) va en
+`darius__mordekaiser.yaml`; si algún día se registra la página propia de
+Mordekaiser para el mismo enfrentamiento (su winrate a él, no el
+complemento aritmético de 100 menos el de Darius — pueden diferir por
+metodología de la fuente), va en `mordekaiser__darius.yaml`, nunca
+mezclada como una entrada más del primer archivo con un campo de
+"perspectiva" alternativo. Esto evita que un mismo archivo necesite dos
+significados distintos de `win_rate_raw` según la fila.
 
 `benchmarks/` no lo toca `knowledge/loader.py`. Un módulo aparte
 (`benchmarks/loader.py`, a diseñar en el hito que lo implemente) lo lee para
 un reporte/CLI de comparación, nunca para `RuleEngine.build_trace`.
 
-## Esquema (un archivo por par candidato/enemigo, ambas direcciones)
+## Esquema (un archivo por dirección del par, ver convención de arriba)
 
 Campos por entrada, con su unidad:
 
@@ -47,6 +61,7 @@ Campos por entrada, con su unidad:
 | `rank_bracket` | banda de rango declarada por la fuente, o `null` | no |
 | `sample_size` | número de partidas, o `null` | no |
 | `observed_direction` | `favors_candidate` \| `favors_enemy` \| `even` | sí |
+| `direction_basis` | de qué se deriva `observed_direction` — ver enumeración abajo | sí |
 | `win_rate_raw` | fracción 0–1, tal como la reporta la fuente | sí |
 | `win_rate_normalized` | fracción 0–1, solo si la fuente publica su propia normalización; si no, `null` | no |
 | `gold_diff_at_15` | oro, diferencia del candidato menos el enemigo a los 15:00 de juego; `null` si no está disponible | no |
@@ -59,6 +74,22 @@ Campos por entrada, con su unidad:
 mismo patrón que `gold_diff_at_15`) — cualquier fuente futura que reporte
 "CSD@15"/"XPD@15" con otro nombre se mapea a estos dos campos, no se
 agregan alias nuevos.
+
+**`direction_basis`** (obligatorio, evita que un winrate bruto por encima
+de 50% se lea automáticamente como "counter"): uno de
+- `raw_winrate_over_50` — el único dato es que `win_rate_raw > 0.5`, sin
+  ninguna otra normalización de la fuente. Es la base **más débil**; no
+  alcanza por sí sola para afirmar que un campeón "countera" al otro.
+- `relative_to_baseline` — la fuente compara contra el winrate general del
+  candidato (no específico de este enemigo), y publica esa comparación.
+- `provider_normalized_delta` — la fuente publica su propia normalización
+  contra lo "esperado" para ese matchup (lo que alimenta
+  `normalized_delta_pp` cuando existe).
+- `qualitative_classification` — la fuente no publica un número sino una
+  etiqueta propia (p. ej. "counter", "even", "hard counter" en una tabla).
+
+Sin `direction_basis`, una entrada no se considera evidencia de dirección
+utilizable — solo un dato crudo archivado.
 
 ```yaml
 schema_version: 1
@@ -73,6 +104,7 @@ entries:
     rank_bracket: "emerald_plus"
     sample_size: 4314
     observed_direction: favors_candidate
+    direction_basis: raw_winrate_over_50
     win_rate_raw: 0.532
     win_rate_normalized: null
     gold_diff_at_15: null
@@ -90,6 +122,7 @@ entries:
     rank_bracket: null
     sample_size: null
     observed_direction: favors_candidate
+    direction_basis: raw_winrate_over_50
     win_rate_raw: 0.5446
     win_rate_normalized: null
     gold_diff_at_15: null
@@ -104,6 +137,7 @@ entries:
     rank_bracket: "emerald_plus"
     sample_size: 6149
     observed_direction: favors_candidate
+    direction_basis: provider_normalized_delta
     win_rate_raw: 0.527
     win_rate_normalized: null
     gold_diff_at_15: 260
@@ -122,6 +156,7 @@ entries:
     rank_bracket: null
     sample_size: 3362
     observed_direction: favors_candidate
+    direction_basis: qualitative_classification
     win_rate_raw: 0.5318
     win_rate_normalized: null
     gold_diff_at_15: 163
@@ -140,6 +175,7 @@ entries:
     rank_bracket: null
     sample_size: 6228
     observed_direction: favors_candidate
+    direction_basis: provider_normalized_delta
     win_rate_raw: 0.5409
     win_rate_normalized: null
     gold_diff_at_15: null
@@ -162,19 +198,29 @@ contradicción a resolver — es el comportamiento esperado de un "snapshot
 vivo", y es la razón por la que el esquema es `append-only` en primer
 lugar (regla 4 más abajo).
 
-**Correlación, no independencia**: las 5 entradas de arriba **no** son 5
-observaciones independientes. Las dos de Mobalytics (08-09 y 09-09) son el
-mismo proveedor, un día de diferencia — altamente correlacionadas entre sí,
-no dos fuentes distintas. De las 3 fuentes reales (Mobalytics, U.GG,
-LoLalytics), solo la de 08-09 (Mobalytics) y las dos de 09-09 (Mobalytics
-otra vez, U.GG, LoLalytics) se solapan parcialmente en proveedor. El número
-total de entradas guardadas (5, o el que sea con el tiempo) **no debe
-describirse como "N fuentes independientes"** ni usarse para inflar la
-confianza de una dirección — lo que cuenta como evidencia direccional es el
-número de **proveedores distintos** que coinciden (acá: 3), no el número de
-consultas guardadas. Cualquier reporte de comparación que lea este archivo
-debe agrupar por `source` antes de contar cuántas fuentes coinciden en
-dirección.
+**Correlación, no independencia — en dos niveles distintos**:
+
+1. **Mismo proveedor, fechas distintas**: las dos entradas de Mobalytics
+   (08-09 y 09-09) son la misma fuente, un día de diferencia —
+   correlacionadas entre sí, no dos observaciones distintas. El número
+   total de entradas guardadas (5, o el que sea con el tiempo) **no debe
+   describirse como "N fuentes independientes"** — lo mínimo es agrupar
+   por `source` antes de contar (acá: 3 proveedores, no 5 entradas).
+2. **Proveedores distintos, muestra potencialmente superpuesta**: agrupar
+   por proveedor evita el problema del punto 1, pero **no** convierte a
+   Mobalytics, U.GG y LoLalytics en observaciones estadísticamente
+   independientes entre sí — los tres agregan datos de la misma población
+   real de partidas clasificadas (con distinta metodología de captura y
+   filtrado, pero sin garantía de muestras disjuntas). Tres proveedores
+   coincidiendo en dirección es evidencia **más fuerte** que uno solo, pero
+   no equivale a tres experimentos independientes en el sentido
+   estadístico — no se debe multiplicar la confianza por el número de
+   proveedores como si lo fueran.
+
+Ningún reporte de comparación que lea este archivo puede presentar "3 (o
+N) fuentes independientes confirman X" — como mucho, "3 proveedores,
+agrupados, coinciden en dirección; no se conoce el grado de solapamiento
+de sus muestras".
 
 ## Reglas de uso (para cuando exista el módulo que lo consuma)
 

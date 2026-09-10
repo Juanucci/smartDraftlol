@@ -71,6 +71,22 @@ Si dos fuentes de distinto nivel discrepan, se documenta la contradicción
 (§3) y se prioriza la de nivel más alto — nunca se elige en silencio la que
 da el resultado esperado.
 
+**Precisión adicional sobre qué bytes existen realmente en el paquete**
+(auditado de nuevo para esta ronda, `SOURCE_MANIFEST.json`): `meraki_darius`
+y `meraki_mordekaiser` — citados en buena parte de las filas MEDIA de §2 —
+son entradas `type: community_processed_mechanics` con **solo una URL**
+(`cdn.merakianalytics.com/...`), sin `local_file` ni hash. El paquete nunca
+incluyó los bytes de Meraki; lo que cito como "`meraki_*`, MEDIA" es la
+paráfrasis que el propio paquete (`mechanics_facts.yaml`/
+`VERIFIED_FINDINGS.md`) hace de esa fuente, no un byte que yo haya podido
+inspeccionar. Lo mismo aplica a cada `riot_patch_25_XX`/`riot_patch_26_XX`:
+son URLs de notas de parche, nunca texto espejado. Esto no cambia ningún
+techo de confianza ya asignado (MEDIA ya era el techo correcto para Tier 2
+y para URLs no releídas) — se deja explícito acá porque esta ronda pidió
+releer bytes concretos de Realm of Death y la respuesta honesta es que, más
+allá del JSON crudo de Data Dragon (Tier 1, sí bundleado y hash-verificado),
+**no existen más bytes que releer** en este paquete.
+
 ---
 
 ## 2. Hechos mecánicos vigentes
@@ -80,7 +96,7 @@ da el resultado esperado.
 | 1 | Darius | Stats base (HP/AD/Armor/MR/MS/Rango de ataque) | 652 / 64 / 37 / 32 / 340 / 175 | `riot_ddragon_darius` | ALTA-cond. | FACT |
 | 2 | Darius | Recurso | Maná, base 263 (+58/nivel) | `riot_ddragon_darius` | ALTA-cond. | FACT |
 | 3 | Darius | Pasiva (Hemorrhage): duración y stacks | 5 s por aplicación, hasta 5 cargas | `riot_ddragon_darius` (tooltip) | ALTA-cond. | FACT |
-| 4 | Darius | Hemorrhage: ¿se refresca o acumula duración? | Se refresca por aplicación (no acumula duración) | `meraki_darius` | MEDIA | DERIVATION |
+| 4 | Darius | Hemorrhage: ¿se refresca o acumula duración? | Cada nueva aplicación **refresca** la ventana de 5 s de todo el conjunto de cargas activas — no hay evidencia de que cada carga decaiga con un temporizador propio e independiente. No se modela un array de N timers; el "refresco" es un **evento** de aplicación durante una ventana ya `active`, no un tercer valor de `window` (que solo distingue `active`/`expired`; ver `v1.7-sequence-state-design.md` §B.2, `StackState`) | `meraki_darius` | MEDIA | DERIVATION |
 | 5 | Darius | Recompensa a 5 cargas: existencia | Bono temporal de AD por 5 s al llegar a 5 cargas de Hemorrhage sobre el objetivo | `riot_ddragon_darius` (tooltip, sin nombrar el efecto) | ALTA-cond. | FACT |
 | 6 | Darius | Recompensa a 5 cargas: nombre y magnitud | "Noxian Might", bono de AD 30–230 según nivel | `meraki_darius` | MEDIA | DERIVATION |
 | 7 | Darius | Q (Decimate) cooldown | 9/8/7/6/5 s | `riot_ddragon_darius` | ALTA-cond. | FACT |
@@ -111,9 +127,10 @@ da el resultado esperado.
 | 32 | Mordekaiser | R: targeting | Unit-targeted / point-and-click — **no** es un skillshot, no lleva una condición genérica de "acierto" | `meraki_mordekaiser` (clasificación); tooltip crudo (redacción consistente) | MEDIA | FACT |
 | 33 | Mordekaiser | R: invalidadores del cast (~0.5 s) | Únicos respaldados por el paquete: objetivo untargetable, fuera de rango o sin visión al completarse el cast; inmunidad o interacción de spell shield. **Ningún otro invalidador está confirmado** (p. ej. que un CC/silencio sobre el propio Mordekaiser corte el cast no tiene fuente en el paquete — no se afirma) | Texto citado del paquete, sin `source_id` numérico | MEDIA | FACT (los listados) — el resto queda como ausencia declarada, no como hecho |
 | 34 | Mordekaiser | R: efecto durante los 7 s de duración | Roba 10% de las estadísticas centrales del objetivo; si lo mata dentro, conserva las estadísticas hasta que el objetivo reaparece | `riot_ddragon_mordekaiser` (tooltip) | ALTA-cond. | FACT |
-| 35 | Mordekaiser | R: ¿hay además un componente de curación/transferencia de vida separado del robo de stats? | El tooltip crudo **solo** describe robo de estadísticas — ninguna mención de curación. Un componente de vida solo aparece en fuentes no releídas / Tier 2 | Tooltip crudo (sin heal); fuente no releída + `meraki_mordekaiser` (posible heal) | ALTA-cond. (que el tooltip no lo menciona) / MEDIA (que podría existir igual) | HYPOTHESIS — regla de modelado en §4 (Nivel 6) |
+| 35 | Mordekaiser | R: ¿hay además un componente de curación/transferencia de vida máxima separado del robo de stats, para el parche 26.17/16.17.1? | El JSON crudo de Data Dragon 16.17.1 (Tier 1, hash-verificado) para `MordekaiserR` tiene `effect`/`effectBurn`/`vars` todos vacíos o en cero, y su tooltip **solo** dice "stealing X% of their core stats" — cero campos relacionados con curación o vida máxima. El paquete no incluye ningún byte de `meraki_mordekaiser` (solo una URL, ver §1) ni el texto de `riot_patch_26_15` (también solo URL) que sostendrían la hipótesis de un componente de vida — la afirmación de que existe viene únicamente de la paráfrasis del propio paquete (`VERIFIED_FINDINGS.md`/`mechanics_facts.yaml`), no de una fuente releíble. **Dato exacto que falta para confirmar o descartar**: los bytes reales de `meraki_mordekaiser` o el texto de `riot_patch_26_15`/`26.17` — ninguno de los dos está en este paquete | Tooltip crudo Data Dragon 16.17.1 (sin heal, campos vacíos); paráfrasis del paquete sin bytes verificables (posible heal) | ALTA-cond. (que el tooltip/vars de 16.17.1 no lo contienen) / BAJA (la hipótesis del heal, al no tener ni URL-releída ni bytes Tier 2 reales detrás — se baja de MEDIA a BAJA tras esta auditoría) | HYPOTHESIS, no FACT — permanece agrupada bajo la regla de modelado de §4 (Nivel 6) mientras falten esos bytes |
 | 36 | Ambos | Penetración de armadura (Darius) vs. penetración mágica (Mordekaiser) | Fortalezas paralelas contra defensas distintas — no se cancelan ni se comparan sin valores por nivel, resistencias del objetivo y contexto de daño real. Observación estructural de **aporte cero**, pendiente de calibración | `riot_ddragon_darius` (armor pen); `meraki_mordekaiser` (magic pen) | ALTA-cond. (que el % existe) | Guardrail de diseño, no causa puntuable |
 | 37 | Darius | R: ¿puede lanzarse dentro de Realm of Death de Mordekaiser? | Sí — el Realm aísla el duelo del resto de la partida, pero **no deshabilita las habilidades entre los dos combatientes**. Noxian Guillotine no está limitado a lanzarse solo antes de entrar o después de salir del Realm | Texto del paquete (síntesis, sin `source_id` numérico) | MEDIA | FACT |
+| 38 | Darius | Hemorrhage: daño por carga | `13–30 físico según nivel + 30% AD adicional` por cada carga, a lo largo de su ventana de 5 s (la fuente no desglosa si es el total de la ventana o una tasa por tick — no se asume ninguna de las dos sin más detalle) | `meraki_darius` | MEDIA | DERIVATION — magnitud registrada como fuente de daño durante el trade, no se calcula daño final tras resistencias (fuera de alcance) |
 
 Los benchmarks externos (winrate, GD@15, etc.) viven exclusivamente en
 `benchmark-format.md` — nunca en esta tabla. Mezclarlos aquí violaría la
@@ -143,9 +160,15 @@ les corresponde hasta encontrar mejor fuente):
   o ese valor pertenece solo a Q/R? (fila 30)
 - ¿Apprehend tiene una segunda fase de "rebote" tras el pull? Sin respaldo,
   no se carga al KB en ningún caso mientras siga así (fila 16).
-- ¿Existe un componente de curación en Realm of Death, distinto del robo de
-  stats? (fila 35) — la regla de modelado (§4, Nivel 6) no depende de
-  resolver esto: se modela como un único grupo causal se confirme o no.
+- ¿Existe un componente de curación/transferencia de vida máxima en Realm
+  of Death, distinto del robo de stats, para 26.17/16.17.1? (fila 35) —
+  releídos los bytes crudos de Data Dragon (única fuente con bytes reales
+  en el paquete), no hay ningún campo relacionado con curación en `R`; la
+  hipótesis depende de dos fuentes que el paquete solo cita por URL
+  (`meraki_mordekaiser`, `riot_patch_26_15`) y nunca incluyó como bytes.
+  Confianza bajada de MEDIA a BAJA tras esta auditoría. La regla de
+  modelado (§4, Nivel 6) no depende de resolver esto: se modela como un
+  único grupo causal se confirme o no.
 - Los números exactos de daño/ratios de Q de Mordekaiser y la mayoría de
   las magnitudes citadas de Meraki no tienen una fuente Tier-1 textual
   completa que los confirme carácter por carácter — límite real de lo que
@@ -198,7 +221,11 @@ llega — estado de oleada declarado como no modelado en esta V0).
 **Rama C — ninguno arriesga**: ambos animan la oleada sin exponerse; no hay
 secuencia que evaluar.
 
-**Rama D — Darius abre con W**: W es un empoderamiento del **propio próximo
+**Rama D — Darius abre con W, oleada presente, ambos full HP** (estado
+inicial declarado explícitamente, no implícito): `health_band = full` para
+ambos actores, `wave_state = {state: present_neutral}` en `shared` — sin
+esto declarado, esta rama no podría marcarse "Cubierto" en el checklist de
+§5. W es un empoderamiento del **propio próximo
 ataque** de Darius — no un hechizo dirigido a Mordekaiser, así que su
 activación no requiere que Mordekaiser esté dentro de ningún rango en ese
 instante, y no entra en un "cooldown vacío" por eso. Se desperdicia
@@ -314,31 +341,61 @@ puesta a nivel 2, cuánto Potential Shield acumulado tiene en ese momento.
 **Habilidades disponibles**: kit completo salvo la definitiva, en ambos
 lados.
 
-**Secuencia extendida de Darius (generalización de la de nivel 2, con W):
-`E → AA → W → Q exterior`**. Cuatro pasos, **tres** aplicaciones de
-Hemorrhage — Apprehend (E) es control puro y no aplica ninguna (fila 15):
+Ambas ramas de Darius de esta fase parten de **cero cargas de Hemorrhage
+previas**: no heredan cargas de una fase anterior sin que el escenario lo
+declare explícitamente como precondición (ver
+`v1.7-sequence-state-design.md` §B.5).
+
+**Rama corta — `E → AA → W-AA → Q exterior`** (generalización de la
+secuencia de nivel 2, con W agregado). Cuatro pasos, **exactamente tres**
+aplicaciones de Hemorrhage — Apprehend (E) es control puro y no aplica
+ninguna (fila 15):
 1. **E** — Apprehend conecta (misma precondición y las dos ramas de fallo
    de Nivel 2). Cero aplicaciones de Hemorrhage; habilita los pasos
    siguientes.
 2. **AA** — auto-ataque durante la ventana de control. **Primera
-   aplicación** de Hemorrhage (carga 1/5).
-3. **W** — Crippling Strike potenciando el siguiente auto-ataque: aplica su
-   empoderamiento y 90% de slow (el reset de temporizador sigue en
+   aplicación** de Hemorrhage (carga 1/5) — cada carga es también una
+   fuente de daño físico continuo durante el intercambio, no solo un
+   contador (fila 38: 13–30 según nivel + 30% AD adicional por carga,
+   MEDIA).
+3. **W-AA** — Crippling Strike potenciando el siguiente auto-ataque: aplica
+   su empoderamiento y 90% de slow (el reset de temporizador sigue en
    confianza MEDIA, fila 12 — no se asume aquí con más certeza que en
    Nivel 1). Ese auto potenciado es la **segunda aplicación** (carga 2/5).
 4. **Q exterior** — filo de Q, si su cooldown (9–5s, fila 7) ya se
    recuperó. **Tercera aplicación** (carga 3/5).
 
-Con exactamente 3 cargas aplicadas en esta secuencia, Darius queda a
-**dos** aplicaciones válidas de cinco — no a una — para alcanzar la
-recompensa de 5 cargas (fila 5/6); el umbral se activa sin necesitar la
-definitiva. Documentar una cuarta carga en esta misma apertura requeriría
-un evento explícito adicional (p. ej. un segundo auto-ataque conectado
-antes de Q) — no se asume sin declararlo.
+Con exactamente 3 cargas, Darius queda a **dos** aplicaciones válidas de
+cinco — no a una — para alcanzar la recompensa de 5 cargas (fila 5/6). Esta
+rama **no** llega a activar Noxian Might; se detiene acá.
 
-**Esta secuencia parte de cero cargas de Hemorrhage previas**: no hereda
-cargas de una fase anterior sin que el escenario lo declare explícitamente
-como precondición (ver `v1.7-sequence-state-design.md` §B.5).
+**Rama extendida — la rama corta más dos aplicaciones válidas explícitas
+adicionales, hasta 5 cargas, activando Noxian Might a mitad de la
+secuencia**. No es "la misma jugada un poco más larga": es un payoff
+mecánicamente distinto, con una recompensa que se activa DURANTE la cadena
+y modifica los pasos que vienen después — no se trata como equivalente a
+la rama corta.
+5. **AA** (cuarta aplicación, carga 4/5) — un auto-ataque adicional,
+   declarado explícitamente como evento de esta rama (no asumido por
+   default): requiere que Mordekaiser siga en `melee_contact` después del
+   paso 4, sin haberse retirado.
+6. **AA** (quinta aplicación, carga 5/5) — otro auto-ataque adicional, con
+   la misma precondición explícita de contacto sostenido. Este quinto
+   auto-ataque en sí **no** lleva el bono de Noxian Might — inflige su
+   daño normal y, **al conectar**, cruza el umbral de 5 cargas:
+   `reward_state` pasa de `inactive` a `active` (Noxian Might, bono de AD
+   por 5 s, fila 5/6) recién en ese instante, como consecuencia de esta
+   aplicación, no como una propiedad que ya tenía.
+7. **Acciones posteriores, ya con Noxian Might activo**: cualquier
+   auto-ataque adicional que Darius conecte **después** del paso 6, durante
+   esos 5 s de bono, inflige más daño que uno idéntico en los pasos 2–6 —
+   ninguno de los pasos 1–6 se beneficia de Noxian Might, solo lo que
+   ocurre después de que `reward_state` pasó a `active`. A este nivel (3–5)
+   Noxian Guillotine
+   **no está disponible todavía** (R se desbloquea recién en nivel 6) —
+   la posibilidad de cerrar con R, ya con Noxian Might activo y no solo
+   con 3 cargas, se retoma explícitamente en Nivel 6a más abajo, como una
+   rama distinta de la que abre R con solo 3 cargas.
 
 **Ramas de interrupción de Mordekaiser**: activar Indestructible si tiene
 Potential Shield suficiente (reduce el valor de los pasos 2–4 sin
@@ -351,8 +408,11 @@ herramienta disponible.
 intercambio)**: Obliterate (idealmente a un único objetivo) + auto-ataques
 aplicando Darkness Rise (activación a 3 golpes, fila 22).
 
-**Condición de éxito para Darius**: completar la secuencia y llegar a la
-recompensa de 5 cargas, aunque la definitiva siga sin desbloquear.
+**Condición de éxito para Darius**: completar la rama corta (3 cargas, dos
+aplicaciones de distancia de la recompensa) o la rama extendida (5 cargas,
+Noxian Might activo) — son dos resultados distintos, no el mismo payoff en
+dos velocidades; ninguno requiere la definitiva, que a este nivel sigue sin
+desbloquear.
 **Condición de éxito para Mordekaiser**: absorber suficiente con
 Indestructible y devolver Obliterate+Darkness Rise antes de que Darius
 llegue a las 5 cargas.
@@ -367,94 +427,175 @@ momento del intercambio.
 ### Nivel 6a — All-in neutral (cero cargas previas, vida comparable)
 
 Precondiciones declaradas: ambos llegan al intercambio sin cargas de
-Hemorrhage activas sobre el otro, con vida comparable (ninguno en
-desventaja de fase previa), y ambas definitivas disponibles.
+Hemorrhage activas sobre el otro (`stacks[hemorrhage]` en ambos en
+`count: 0`, no `unknown` — es un cero conocido, ver
+`v1.7-sequence-state-design.md` §B.2), con vida comparable (`health_band:
+high` para ambos — ninguno en desventaja de fase previa), y ambas
+definitivas disponibles.
 
-**Secuencia de Darius**: repite la cadena de Niveles 3–5 (Apprehend →
-auto → Crippling Strike → Q) desde cero, ahora con Noxian Guillotine
-disponible como cierre si logra 3+ cargas de Hemorrhage en la propia
-secuencia — el daño verdadero escala con esas cargas (fila 18).
+**Dos ramas de Darius, con payoffs distintos — no la misma jugada en dos
+velocidades**:
+- **R con 3 cargas**: la rama corta de Niveles 3–5
+  (`E → AA → W-AA → Q exterior`) deja a Mordekaiser en 3 cargas de
+  Hemorrhage; Darius cierra con Noxian Guillotine ahí mismo. El daño
+  verdadero de R escala con esas 3 cargas (fila 18) — un payoff concreto,
+  menor que el de la rama siguiente.
+- **R después de Noxian Might**: la rama extendida de Niveles 3–5 (llega a
+  5 cargas — ninguno de los golpes que construyen esas 5 cargas lleva el
+  bono, `reward_state` sigue `inactive` hasta que la quinta conecta — y
+  recién ahí `reward_state` pasa a `active`) y **entonces** cierra con R —
+  el daño verdadero escala con 5 cargas en vez de 3, y solo los
+  auto-ataques posteriores a la activación (no los que la construyeron)
+  llevan el bono de AD de Noxian Might. Este es un resultado mecánicamente
+  distinto del anterior, no una versión "mejorada" del mismo número.
 
-**Dos aperturas posibles de Mordekaiser, independientes entre sí**:
-
+**Tres aperturas posibles de Mordekaiser, con profundidad comparable a las
+de Darius**:
 - **R como iniciación directa (point-and-click)**: Mordekaiser castea
   Realm of Death sin ningún paso previo. R es unit-targeted (fila 32) —
   conecta salvo por los invalidadores específicos de fila 33; no hay una
   "ventana de esquive" genérica que Darius pueda aprovechar por diseño de
-  la habilidad en sí. Esta apertura no depende de que Q o E hayan conectado
-  antes — R es una acción independiente, siempre disponible si no está en
-  cooldown.
-- **Secuencia previa de Q/E/ataques, con R como cierre opcional**:
-  Mordekaiser busca daño, control o activar Darkness Rise primero
-  (Obliterate, Death's Grasp, auto-ataques) y decide después si castea R.
-  **Fallar Q o E en esta apertura no es una precondición estructural que
-  impida intentar R después** — son acciones independientes; solo cambia
-  el estado con el que Mordekaiser llega al intento de R (p. ej. sin el
-  daño de Q, o sin haber activado Darkness Rise todavía).
+  la habilidad en sí. No depende de que Q o E hayan conectado antes.
+- **Secuencia previa de Q/E/auto-ataques, con R como cierre opcional**:
+  Mordekaiser busca daño (Obliterate, idealmente aislado — fila 24),
+  control o activar Darkness Rise (3 golpes, fila 22) primero, y decide
+  después si castea R. **Fallar Q o E en esta apertura no es una
+  precondición estructural que impida intentar R después** — son acciones
+  independientes; solo cambia el estado con el que Mordekaiser llega al
+  intento de R.
+- **W según el estado de Potential Shield, combinada con cualquiera de las
+  dos anteriores**: si `reserves[potential_shield]` está en banda
+  `near_max` (acumulado en la propia secuencia o heredado si el escenario
+  lo declara), Indestructible puede convertir una porción real del burst
+  entrante en escudo o, con el recast, en curación (fila 27); en banda
+  `none`/`partial`, la misma activación absorbe/cura mucho menos — es la
+  misma habilidad con un resultado distinto según el estado declarado, no
+  una magnitud fija.
 
-**Darius puede lanzar su propio Noxian Guillotine mientras está dentro del
-Realm of Death de Mordekaiser** (fila 37) — no solo antes de entrar o
-después de salir; el Realm aísla el duelo pero no deshabilita las
-habilidades entre los dos combatientes.
+**Continuar dentro del Realm no es un callejón sin salida para ninguno de
+los dos**: ambos siguen pudiendo actuar dentro de él. Darius puede seguir
+aplicando Hemorrhage (auto-ataques, Q) y lanzar su propio Noxian Guillotine
+estando dentro del Realm (fila 37) — no solo antes de entrar o después de
+salir. Mordekaiser puede seguir atacando para sostener o completar
+Darkness Rise. El Realm no pausa ninguna de las dos secuencias.
 
-**Condiciones de éxito para Darius**: llegar a 3+ cargas y conectar R —ya
-sea antes de que Mordekaiser inicie su propio R, mientras está dentro del
-Realm, o al salir de él.
-**Condiciones de éxito para Mordekaiser**: conectar su R (por cualquiera de
-las dos aperturas) antes de que Darius acumule 5 cargas, capturando el
-robo de estadísticas.
-**Condiciones de fallo**: Darius gasta R sin cargas suficientes (pierde la
-mayor parte del bono de daño verdadero); Mordekaiser gasta R sin haber
-generado ninguna ventaja previa y sin invalidador en contra de Darius
-presente, sin haber podido evitar que Darius llegue a 5 cargas.
+**Cast, transformación, geometría y resultado — cuatro cosas distintas, no
+una sola "condición de éxito"** (para la apertura de R de Mordekaiser):
+1. **El cast se completa** — point-and-click, `Support.STRUCTURAL` salvo
+   invalidador presente (fila 33).
+2. **Se aplica la transformación de estadísticas** — Mordekaiser roba 10%
+   de las estadísticas centrales de Darius por 7s (fila 34); esto por sí
+   solo no termina el intercambio.
+3. **El aislamiento modifica las condiciones del intercambio** — dentro del
+   Realm ninguno recibe ayuda externa (irrelevante en un 1v1 puro) y el
+   espacio se restringe, lo que puede favorecer a quien sostenga mejor el
+   contacto — sin especificar de antemano a cuál de los dos.
+4. **El resultado del duelo sigue dependiente del estado y de las
+   secuencias posteriores** — R **no** elimina las cargas de Hemorrhage ya
+   aplicadas, **no** impide que Darius aplique más, y **no** deshabilita
+   Noxian Guillotine. Que Mordekaiser complete su cast antes de que Darius
+   llegue a 5 cargas es el paso 1 de su condición de éxito, no la condición
+   completa — el resto depende de qué pase dentro del Realm.
+
+**Condiciones de fallo**: Darius gasta R con solo 3 cargas cuando la
+secuencia extendida seguía siendo alcanzable (pierde parte del bono de
+daño verdadero disponible, aunque sigue siendo una rama válida, no un
+error); Mordekaiser falla el cast de R (invalidador presente, fila 33) y
+queda expuesto sin su herramienta principal.
 
 **Información indeterminada**: quién actúa primero (depende de posición y
-del jugador, fuera de alcance).
+del jugador, fuera de alcance); si Mordekaiser ejecuta la apertura con
+Q/E previo o R directo (decisión del jugador, ambas ramas válidas).
 
 ### Nivel 6b — All-in precondicionado (estado previo declarado)
 
-**Declaración explícita de continuidad** (requisito de
+**Simplificación de continuidad** (requisito de
 `v1.7-sequence-state-design.md` §B.5 para que un escenario pueda partir de
-estado distinto de cero): este escenario se declara **continuación directa
-de un intercambio previo dentro de la misma fase (Niveles 3–5)**, no un
-escenario nuevo que hereda estado por inferencia. El `CombatState` de
-salida de ese intercambio previo es, por esta declaración, el `CombatState`
-de entrada de 6b — nunca ocurre por defecto entre dos escenarios sin esta
-declaración.
+estado distinto de cero, sin recurrir a un evento artificial de subida de
+nivel): ambos campeones **ya están en nivel 6** desde el inicio de este
+escenario — no hay ninguna subida de nivel a mitad del intercambio, ni
+remate de minion que la dispare. El escenario declara un **checkpoint**
+explícito como estado de entrada: la rama corta de Niveles 3–5
+(`E → AA → W-AA → Q exterior`) ya se ejecutó y dejó 3 cargas de Hemorrhage
+sobre Mordekaiser, con su ventana todavía `active` (no `expired`) en el
+instante en que arranca este escenario — y el intercambio **continúa**
+desde ahí, ya con las definitivas disponibles porque ambos son nivel 6.
+Esto no es "hereda de una fase anterior" en el sentido prohibido por §B.5
+(dos escenarios distintos donde uno copia el final del otro): es un único
+escenario que **declara su propio estado de entrada** como un checkpoint
+posterior a una rama corta ya conocida, en vez de empezar todo en cero — la
+declaración de continuidad es sobre esa rama corta como parte del mismo
+escenario, no una inferencia entre dos escenarios separados.
+
+Quedan así tres momentos separados, no mezclados:
+- La **rama corta** (Niveles 3–5) que produce el checkpoint: 3 cargas,
+  ventana activa — ya descripta en esa sección, no repetida acá salvo como
+  precondición de entrada.
+- El **checkpoint declarado** de este escenario 6b: el estado inicial
+  completo, listado abajo.
+- La **continuación del intercambio** desde ese checkpoint (ver el cierre
+  de esta sección) — que puede o no llegar a una rama extendida de 5
+  cargas o a eventos posteriores a una recompensa, sin mezclarse con los
+  3 cargas del checkpoint.
 
 A diferencia de 6a, este escenario declara explícitamente un estado de
 entrada distinto de cero, como ejemplo de instanciación (no como el único
 estado previo posible). Estado inicial completo — todo lo que el checklist
 de §5 marca como "declarado" para este escenario aparece aquí, y solo eso:
 
-- **Cargas**: Darius con 3 cargas de Hemorrhage ya aplicadas sobre
-  Mordekaiser, de un intercambio previo en esta misma fase.
-- **Banda de vida**: Darius en banda **alta** (no completa; gastó algo de
-  vida en el intercambio previo); Mordekaiser en banda **parcial**.
-- **Recurso de Darius (maná)**: banda **parcial** — gastó maná en Q/E
-  durante el intercambio previo, no se recuperó del todo.
-- **Reserva de Mordekaiser (Potential Shield)**: banda **alta** — acumuló
-  daño dado/recibido en el intercambio previo, sin haberlo consumido
+Taxonomía usada abajo: exactamente la de
+`v1.7-sequence-state-design.md` §B.2 — `health_band` ∈
+{`full`,`high`,`low`}, `reserves` ∈ {`none`,`partial`,`near_max`}, sin
+sinónimos.
+
+- **Cargas**: `stacks[hemorrhage] = {count: 3, window: active}` sobre
+  Mordekaiser (Darius es quien las aplicó) — de la rama corta del
+  intercambio previo dentro de este mismo escenario continuo (no de "otra
+  fase"; ver la declaración de continuidad arriba).
+- **Banda de vida**: Darius `high` (no completa; gastó algo de vida en el
+  intercambio); Mordekaiser `low` (tomó más daño en ese mismo intercambio
+  — de ahí la diferencia con Darius, ambos usando las mismas 3 bandas
+  canónicas, no un cuarto término).
+- **Recurso de Darius**: `resource.type = mana`, `resource.band = partial`
+  — gastó maná en Q/E durante el intercambio, no se recuperó del todo.
+- **Reserva de Mordekaiser**: `reserves[potential_shield] = near_max` —
+  acumuló daño dado/recibido en el intercambio, sin haberlo consumido
   todavía.
-- **Disponibilidad de habilidades**: Apprehend de Darius **en cooldown**
-  (se usó en el intercambio previo, no se recuperó a tiempo para el
-  all-in); Death's Grasp de Mordekaiser **disponible**. Ambas
-  definitivas disponibles (precondición del escenario 6, igual que 6a).
-- **Distancia/contacto**: `melee_contact` para las acciones de rango de
-  auto-ataque (175, fila 1/20) de ambos al comenzar el escenario
-  (continuación directa del intercambio previo, sin que ninguno se haya
-  retirado); `within_ability_range` para Death's Grasp (rango 700, fila
-  28) y Realm of Death (rango 650, fila 31) de Mordekaiser desde esa misma
-  posición — la banda se declara por acción, no una sola vez para todo el
-  escenario (ver `v1.7-sequence-state-design.md` §B.2).
-- **Oleada**: `pushing_toward_enemy` desde el `CombatState` de Darius
-  (equivalente a `pushing_toward_self` desde el de Mordekaiser) — la
-  oleada avanza hacia el lado de Mordekaiser, heredada del intercambio
-  previo (ver `v1.7-sequence-state-design.md` §B.2 para la nomenclatura de
-  dirección de oleada).
-- **Aislamiento del objetivo**: contestado — no hay minions entre ambos
-  que interrumpan el contacto directo, pero tampoco una zona que aísle a
-  un tercero (no aplica en un 1v1 puro).
+- **Disponibilidad de habilidades**: Apprehend de Darius `on_cooldown` (se
+  usó en el intercambio, no se recuperó a tiempo — sin
+  `recovers_within_sequence` declarado para su slot, no se asume
+  disponible de nuevo); Death's Grasp de Mordekaiser `ready`. Ambas
+  definitivas `ready` (precondición del escenario 6, igual que 6a).
+- **`ActionContext` por acción (`shared.action_contexts`)** — rango e
+  aislamiento declarados por acción, no como un campo global (§B.2 de
+  diseño):
+  - Auto-ataque de Darius y de Mordekaiser (rango 175, fila 1/20):
+    `range_status: in_range` — continuación directa del intercambio previo,
+    sin que ninguno se haya retirado. `target_isolation: contested` (ver
+    abajo).
+  - Death's Grasp de Mordekaiser (rango 700, fila 28): `range_status:
+    in_range` desde esa misma posición.
+  - Realm of Death de Mordekaiser (rango 650, fila 31): `range_status:
+    in_range` desde esa misma posición; `invalidators`: no declarados en
+    este checkpoint (`unknown`) — a diferencia del baseline de 6a, este
+    escenario no afirma "objetivo legal, contexto normal" por defecto.
+  - Noxian Guillotine de Darius (rango 460, fila 17 — dato de §2 no listado
+    antes en este escenario): `range_status: in_range`.
+- **`target_isolation`** (mismo valor para las acciones de contacto
+  directo de esta lista, declarado una sola vez, no por actor):
+  `contested` — no hay minions entre ambos que interrumpan el contacto
+  directo, pero tampoco una zona que aísle a un tercero (no aplica en un
+  1v1 puro). Que la oleada esté presente y empujando (siguiente punto) no
+  es lo que determina este valor — se declara independientemente, como
+  exige el diseño (§B.2: "`wave_state` no determina `target_isolation`
+  automáticamente").
+- **`wave_state` (shared)**: `{state: pushing, pushing_toward: enemy}` —
+  usando los mismos roles `candidate`/`enemy` del `CombatState` (Darius
+  como candidato en este dossier): la oleada avanza hacia el lado de
+  Mordekaiser, heredada del intercambio. Una sola copia compartida, no una
+  declaración por actor que pudiera contradecirse. Cualitativo: no
+  modifica `MatchupScore` por sí solo, no determina rango ni aislamiento
+  (ya declarados arriba, independientemente).
 
 Ningún dato fuera de esta lista se declara para este escenario — si el
 checklist de §5 marcara "declarado" algo que no aparece explícitamente
@@ -468,10 +609,11 @@ cambio, no depende de que Darius tenga o no su propio control disponible:
 Apprehend es una herramienta de **Darius**, y que esté en cooldown limita
 solo las opciones de Darius, no las de Mordekaiser — Mordekaiser puede
 igualmente abrir con Death's Grasp (disponible) o con Realm of Death
-directo, como en las dos aperturas de 6a. Lo que sí cambia respecto al
-caso neutral es que el Potential Shield alto de Mordekaiser significa que
-Indestructible puede absorber una porción mayor del burst entrante que en
-6a.
+directo, como en las aperturas de 6a. Lo que sí cambia respecto al caso
+neutral es que el `reserves[potential_shield] = near_max` de Mordekaiser
+significa que Indestructible puede absorber/curar una porción mayor del
+burst entrante que en 6a (donde esa banda parte en `unknown` salvo que se
+declare).
 
 **Condiciones de éxito/fallo**: las mismas categorías que 6a, pero
 evaluadas contra el estado ya declarado, no contra cero — ninguna de las
@@ -519,3 +661,12 @@ ejecutarse, qué condición persigue cada lado y qué dato falta.
    "acierto" ni una "ventana de reacción" — solo los invalidadores
    específicos y respaldados de la fila 33 de §2. Ver
    `v1.7-sequence-state-design.md` §B.4.
+5. El estado de oleada (`wave_state`) es contexto cualitativo compartido:
+   no modifica `MatchupScore` por sí solo, puede alimentar precondiciones e
+   interpretación, y no determina por sí solo rango, aislamiento ni ganador
+   de ninguna acción — cada uno de esos tres se declara en su propio
+   `ActionContext` (§B.2 del diseño), nunca se infiere de la oleada.
+6. Un trade no siempre produce un ganador inequívoco ni requiere una
+   muerte: la evaluación de un resultado admite lecturas neutrales,
+   condicionales o no resueltas además de favorecer a un lado — ver
+   `v1.7-sequence-state-design.md` §B.8.
