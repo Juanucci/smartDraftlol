@@ -31,16 +31,21 @@ from lol_reasoner.reasoning.sequences import (
     CausalComponent,
     EffectIdentity,
     Evaluation,
+    ExecutionStatus,
     InteractionSequence,
+    PreconditionCheckKind,
+    PreconditionResult,
     PreconditionStatus,
     ScenarioOutcome,
     SequenceProgress,
     SequenceStep,
     StateDelta,
     StepResult,
+    StructuralPrecondition,
     TerminalEvent,
     TerminalEventKind,
     TradeOutcome,
+    chain_execution_status,
     chain_support,
     require_sequence_progress,
     resolve_step_support,
@@ -58,12 +63,31 @@ def _identity(
     return EffectIdentity(fact_ref=fact_ref, causal_role=causal_role, component=component)
 
 
-def _step(step_id: str = "s1", *, consumes: tuple[EffectIdentity, ...] = ()) -> SequenceStep:
-    return SequenceStep(step_id=step_id, action_ref="candidate:q", actor=ActorRole.CANDIDATE, consumes=consumes)
+def _step(
+    step_id: str = "s1", *, consumes: tuple[EffectIdentity, ...] = (), declared_support: Support = Support.STRUCTURAL
+) -> SequenceStep:
+    return SequenceStep(
+        step_id=step_id,
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=declared_support,
+        consumes=consumes,
+    )
 
 
 def _combat_state(level: int | None = None) -> CombatState:
     return CombatState(candidate=ActorState(level=level), enemy=ActorState())
+
+
+def _synthetic_precondition(reference: str = "candidate:q") -> StructuralPrecondition:
+    return StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, ActorRole.CANDIDATE, reference)
+
+
+def _precondition_results(statuses: tuple[PreconditionStatus, ...]) -> tuple[PreconditionResult, ...]:
+    return tuple(
+        PreconditionResult(precondition=_synthetic_precondition(f"candidate:ref_{i}"), status=status)
+        for i, status in enumerate(statuses)
+    )
 
 
 def _result(
@@ -71,13 +95,21 @@ def _result(
     *,
     statuses: tuple[PreconditionStatus, ...] = (PreconditionStatus.SATISFIED,),
     declared: Support = Support.STRUCTURAL,
+    inherited: ExecutionStatus = ExecutionStatus.CONFIRMED,
 ) -> StepResult:
-    return StepResult(step_id=step_id, precondition_statuses=statuses, declared_support=declared)
+    return StepResult(
+        step_id=step_id,
+        precondition_results=_precondition_results(statuses),
+        declared_support=declared,
+        inherited_execution_status=inherited,
+    )
 
 
 def _blocked_result(step_id: str = "s1") -> StepResult:
     return StepResult(
-        step_id=step_id, precondition_statuses=(PreconditionStatus.UNSATISFIED,), declared_support=Support.STRUCTURAL
+        step_id=step_id,
+        precondition_results=_precondition_results((PreconditionStatus.UNSATISFIED,)),
+        declared_support=Support.STRUCTURAL,
     )
 
 
@@ -133,12 +165,14 @@ def test_effect_identity_rejects_empty_or_wrong_typed_fields(bad_value):
 
 def test_sequence_step_rejects_empty_step_id():
     with pytest.raises(ValueError):
-        SequenceStep(step_id="   ", action_ref="candidate:q", actor=ActorRole.CANDIDATE)
+        SequenceStep(step_id="   ", action_ref="candidate:q", actor=ActorRole.CANDIDATE, declared_support=Support.STRUCTURAL)
 
 
 def test_sequence_step_rejects_wrong_typed_actor():
     with pytest.raises(TypeError):
-        SequenceStep(step_id="s1", action_ref="candidate:q", actor="candidate")  # type: ignore[arg-type]
+        SequenceStep(
+            step_id="s1", action_ref="candidate:q", actor="candidate", declared_support=Support.STRUCTURAL
+        )  # type: ignore[arg-type]
 
 
 def test_interaction_sequence_rejects_empty_sequence_id():
@@ -235,7 +269,13 @@ def test_covers_causes_cannot_be_provided_manually():
 def test_sequence_step_rejects_duplicate_consumed_identities():
     identity = _identity()
     with pytest.raises(ValueError):
-        SequenceStep(step_id="s1", action_ref="candidate:q", actor=ActorRole.CANDIDATE, consumes=(identity, identity))
+        SequenceStep(
+            step_id="s1",
+            action_ref="candidate:q",
+            actor=ActorRole.CANDIDATE,
+            declared_support=Support.STRUCTURAL,
+            consumes=(identity, identity),
+        )
 
 
 # --- 9-11. precondición satisfecha / desconocida / no satisfecha -----------
@@ -309,7 +349,7 @@ def test_step_result_cannot_elevate_effective_support_manually():
     with pytest.raises(TypeError):
         StepResult(
             step_id="s1",
-            precondition_statuses=(PreconditionStatus.UNKNOWN,),
+            precondition_results=_precondition_results((PreconditionStatus.UNKNOWN,)),
             declared_support=Support.STRUCTURAL,
             effective_support=Support.STRUCTURAL,  # type: ignore[call-arg]
         )
@@ -327,7 +367,9 @@ def test_step_result_effective_support_matches_resolve_step_support():
 def test_step_result_rejects_wrong_typed_declared_support():
     with pytest.raises(TypeError):
         StepResult(
-            step_id="s1", precondition_statuses=(PreconditionStatus.SATISFIED,), declared_support="structural"
+            step_id="s1",
+            precondition_results=_precondition_results((PreconditionStatus.SATISFIED,)),
+            declared_support="structural",
         )  # type: ignore[arg-type]
 
 
@@ -1023,3 +1065,130 @@ def test_this_file_never_imports_scoring_or_matchup_result_types():
         if isinstance(node, ast.ImportFrom) and node.module is not None
     }
     assert not any("scoring" in module or "result" in module for module in imported_modules)
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — fuente canónica única de pre/postcondiciones (§A2)
+# ---------------------------------------------------------------------------
+
+
+def test_sequence_step_serializes_its_real_typed_preconditions_and_postconditions():
+    # Ningún SequenceStep de esta ronda declara preconditions/postconditions
+    # como texto libre vacío mientras la lógica real vive escondida en otro
+    # tipo — lo que se serializa es EXACTAMENTE lo que evaluator.py evalúa.
+    precondition = _synthetic_precondition("candidate:ref")
+    from lol_reasoner.reasoning.sequences.steps import PostconditionEffectKind, StructuralPostcondition
+
+    postcondition = StructuralPostcondition(PostconditionEffectKind.ABILITY_ON_COOLDOWN, ActorRole.CANDIDATE, "slot")
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(precondition,),
+        postconditions=(postcondition,),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+
+    primitive = sequence_to_primitive(seq)["steps"][0]
+
+    assert primitive["preconditions"] != []
+    assert primitive["preconditions"][0]["kind"] == "action_connects"
+    assert primitive["preconditions"][0]["actor"] == "candidate"
+    assert primitive["preconditions"][0]["reference"] == "candidate:ref"
+    assert primitive["postconditions"] != []
+    assert primitive["postconditions"][0]["kind"] == "ability_on_cooldown"
+    assert primitive["declared_support"] == "structural"
+
+
+def test_step_without_declared_preconditions_serializes_a_genuinely_empty_list():
+    # El contraste con el test anterior: un paso que DE VERDAD no declara
+    # precondiciones serializa una lista vacía real — nunca se infla con
+    # datos inventados, y nunca se confunde con el caso de arriba (donde SÍ
+    # había precondiciones y antes se perdían).
+    step = _step("s1")
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+
+    primitive = sequence_to_primitive(seq)["steps"][0]
+    assert primitive["preconditions"] == []
+    assert primitive["postconditions"] == []
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — cada status serializado identifica su condición (§A2)
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_precondition_result_identifies_its_condition():
+    precondition = _synthetic_precondition("candidate:ref_x")
+    result = StepResult(
+        step_id="s1",
+        precondition_results=(PreconditionResult(precondition=precondition, status=PreconditionStatus.UNSATISFIED),),
+        declared_support=Support.STRUCTURAL,
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,))
+
+    primitive = scenario_outcome_to_primitive(outcome)
+    serialized_precondition_result = primitive["step_results"][0]["precondition_results"][0]
+
+    assert serialized_precondition_result["precondition"]["kind"] == "action_connects"
+    assert serialized_precondition_result["precondition"]["actor"] == "candidate"
+    assert serialized_precondition_result["precondition"]["reference"] == "candidate:ref_x"
+    assert serialized_precondition_result["status"] == "unsatisfied"
+
+
+def test_serialization_never_uses_a_bare_status_list_without_condition_identity():
+    outcome = _full_outcome_for_serialization()
+    primitive = scenario_outcome_to_primitive(outcome)
+    step_result_primitive = primitive["step_results"][0]
+
+    assert "precondition_statuses" not in step_result_primitive  # el campo viejo ya no existe
+    assert "precondition_results" in step_result_primitive
+    for entry in step_result_primitive["precondition_results"]:
+        assert "precondition" in entry and "status" in entry
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — herencia de incertidumbre visible en StepResult (§A3)
+# ---------------------------------------------------------------------------
+
+
+def test_step_result_exposes_own_and_inherited_execution_status_separately():
+    result = _result("s1", statuses=(PreconditionStatus.SATISFIED,), inherited=ExecutionStatus.HYPOTHETICAL)
+
+    assert result.own_execution_status is ExecutionStatus.CONFIRMED
+    assert result.inherited_execution_status is ExecutionStatus.HYPOTHETICAL
+    # el eslabón más débil entre ambos gana: no puede figurar como ejecución
+    # efectivamente confirmada dependiendo de un estado producido hipotéticamente
+    assert result.execution_status is ExecutionStatus.HYPOTHETICAL
+    assert result.effective_support is not Support.STRUCTURAL
+
+
+def test_step_result_rejects_blocked_as_an_inherited_execution_status():
+    with pytest.raises(ValueError):
+        StepResult(
+            step_id="s1",
+            precondition_results=_precondition_results((PreconditionStatus.SATISFIED,)),
+            declared_support=Support.STRUCTURAL,
+            inherited_execution_status=ExecutionStatus.BLOCKED,
+        )
+
+
+def test_serialized_step_result_exposes_all_three_execution_status_layers():
+    result = _result("s1", statuses=(PreconditionStatus.SATISFIED,), inherited=ExecutionStatus.HYPOTHETICAL)
+    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,))
+
+    primitive = scenario_outcome_to_primitive(outcome)["step_results"][0]
+
+    assert primitive["own_execution_status"] == "confirmed"
+    assert primitive["inherited_execution_status"] == "hypothetical"
+    assert primitive["execution_status"] == "hypothetical"
+
+
+def test_chain_execution_status_still_works_with_inherited_results():
+    strong = _result("s1", statuses=(PreconditionStatus.SATISFIED,), inherited=ExecutionStatus.CONFIRMED)
+    inherited_weak = _result("s2", statuses=(PreconditionStatus.SATISFIED,), inherited=ExecutionStatus.HYPOTHETICAL)
+
+    assert chain_execution_status((strong, inherited_weak)) is ExecutionStatus.HYPOTHETICAL

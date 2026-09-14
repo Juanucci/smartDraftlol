@@ -13,22 +13,29 @@ UN follow-up entre varias alternativas mutuamente excluyentes — nunca
 sumadas (§B4). Cada alternativa produce su propia `InteractionSequence`
 (mismos dos pasos: control + esa alternativa), todas compartiendo el
 mismo `AlternativeGroup` y cada una con su propio `alternative_id`.
-"""
+
+**Fuente canónica única** (cierre de hardening): ya no existe
+`GenericSequenceSpec`/`StepEvaluationSpec` — cada `SequenceStep` lleva
+directamente su `declared_support` y sus precondiciones/postcondiciones
+REALMENTE evaluables (`steps.py`). `ControlFollowupFamily` guarda
+`InteractionSequence` directamente, no un envoltorio con specs alineados
+aparte."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from lol_reasoner.domain.enums import Support
-from lol_reasoner.reasoning.sequences.evaluator import (
+from lol_reasoner.reasoning.sequences.sequence import AlternativeGroup, InteractionSequence
+from lol_reasoner.reasoning.sequences.steps import (
+    ActorRole,
+    EffectIdentity,
     PostconditionEffectKind,
     PreconditionCheckKind,
-    StepEvaluationSpec,
+    SequenceStep,
     StructuralPostcondition,
     StructuralPrecondition,
 )
-from lol_reasoner.reasoning.sequences.sequence import AlternativeGroup, InteractionSequence
-from lol_reasoner.reasoning.sequences.steps import ActorRole, EffectIdentity, SequenceStep
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,30 +88,6 @@ class FollowupAlternative:
 
 
 @dataclass(frozen=True, slots=True)
-class GenericSequenceSpec:
-    """Una `InteractionSequence` YA evaluable: sus pasos y el
-    `StepEvaluationSpec` de cada uno, alineados 1:1 en el mismo orden."""
-
-    sequence: InteractionSequence
-    step_specs: tuple[StepEvaluationSpec, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.sequence, InteractionSequence):
-            raise TypeError(f"GenericSequenceSpec.sequence debe ser InteractionSequence, no {self.sequence!r}")
-        if len(self.step_specs) != len(self.sequence.steps):
-            raise ValueError(
-                "GenericSequenceSpec.step_specs debe tener exactamente un StepEvaluationSpec por "
-                f"paso de sequence.steps ({len(self.sequence.steps)}), recibió {len(self.step_specs)}"
-            )
-        for step, spec in zip(self.sequence.steps, self.step_specs, strict=True):
-            if spec.step is not step:
-                raise ValueError(
-                    "GenericSequenceSpec.step_specs debe estar alineado 1:1 y en el mismo orden "
-                    f"que sequence.steps (desalineado en step_id={step.step_id!r})"
-                )
-
-
-@dataclass(frozen=True, slots=True)
 class ControlFollowupFamily:
     """Resultado completo de `build_control_into_stack_sequences`:
 
@@ -116,37 +99,37 @@ class ControlFollowupFamily:
       estructuralmente NO PUEDE recibir una `branch_selection` (lo
       rechaza `ScenarioOutcome.__post_init__`, §A2) — nada que confirmar,
       nada que sumar.
-    - `alternatives`: una `GenericSequenceSpec` por follow-up, cada una
+    - `alternatives`: una `InteractionSequence` por follow-up, cada una
       con el MISMO paso de control (reutilizado, no duplicado) más su
       propio follow-up, compartiendo un único `AlternativeGroup`.
     """
 
-    opening: GenericSequenceSpec
-    alternatives: tuple[GenericSequenceSpec, ...]
+    opening: InteractionSequence
+    alternatives: tuple[InteractionSequence, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.opening, GenericSequenceSpec):
-            raise TypeError(f"ControlFollowupFamily.opening debe ser GenericSequenceSpec, no {self.opening!r}")
-        if self.opening.sequence.alternative_group is not None:
+        if not isinstance(self.opening, InteractionSequence):
+            raise TypeError(f"ControlFollowupFamily.opening debe ser InteractionSequence, no {self.opening!r}")
+        if self.opening.alternative_group is not None:
             raise ValueError("ControlFollowupFamily.opening no puede pertenecer a ningún AlternativeGroup")
         if not isinstance(self.alternatives, tuple) or not self.alternatives:
             raise ValueError("ControlFollowupFamily.alternatives debe ser una tuple no vacía")
         for alt in self.alternatives:
-            if not isinstance(alt, GenericSequenceSpec):
-                raise TypeError(f"ControlFollowupFamily.alternatives[] debe ser GenericSequenceSpec, no {alt!r}")
-            if alt.sequence.alternative_group is None:
+            if not isinstance(alt, InteractionSequence):
+                raise TypeError(f"ControlFollowupFamily.alternatives[] debe ser InteractionSequence, no {alt!r}")
+            if alt.alternative_group is None:
                 raise ValueError(
-                    f"ControlFollowupFamily.alternatives[{alt.sequence.sequence_id!r}] debe pertenecer a "
+                    f"ControlFollowupFamily.alternatives[{alt.sequence_id!r}] debe pertenecer a "
                     "un AlternativeGroup"
                 )
 
-    def spec_for(self, alternative_id: str) -> GenericSequenceSpec:
-        for spec in self.alternatives:
-            if spec.sequence.alternative_id == alternative_id:
-                return spec
+    def spec_for(self, alternative_id: str) -> InteractionSequence:
+        for sequence in self.alternatives:
+            if sequence.alternative_id == alternative_id:
+                return sequence
         raise ValueError(
             f"{alternative_id!r} no es una alternativa registrada — disponibles: "
-            f"{[spec.sequence.alternative_id for spec in self.alternatives]!r}"
+            f"{[sequence.alternative_id for sequence in self.alternatives]!r}"
         )
 
 
@@ -183,35 +166,22 @@ def build_control_into_stack_sequences(
         step_id=control_step_id,
         action_ref=control_action_ref,
         actor=control_actor,
-        consumes=(control_consumes,),
-    )
-    control_spec = StepEvaluationSpec(
-        step=control_step,
         declared_support=Support.STRUCTURAL,
         preconditions=(
             StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, control_actor, control_action_ref),
             StructuralPrecondition(PreconditionCheckKind.ABILITY_READY, control_actor, control_ability_slot),
         ),
+        consumes=(control_consumes,),
         postconditions=(
             StructuralPostcondition(
                 PostconditionEffectKind.ABILITY_ON_COOLDOWN, control_actor, control_ability_slot
             ),
         ),
     )
-    opening = GenericSequenceSpec(
-        sequence=InteractionSequence(sequence_id=f"{sequence_id_prefix}:opening", steps=(control_step,)),
-        step_specs=(control_spec,),
-    )
+    opening = InteractionSequence(sequence_id=f"{sequence_id_prefix}:opening", steps=(control_step,))
 
-    alternatives: list[GenericSequenceSpec] = []
+    alternatives: list[InteractionSequence] = []
     for followup in followups:
-        followup_step = SequenceStep(
-            step_id=followup.step_id,
-            action_ref=followup.action_ref,
-            actor=control_actor,  # quien sigue el follow-up es quien controló — mismo actor
-            consumes=(followup.consumes,),
-        )
-
         preconditions = [
             StructuralPrecondition(
                 PreconditionCheckKind.ACTION_CONNECTS, control_actor, followup.connect_reference
@@ -235,10 +205,13 @@ def build_control_into_stack_sequences(
                 )
             )
 
-        followup_spec = StepEvaluationSpec(
-            step=followup_step,
+        followup_step = SequenceStep(
+            step_id=followup.step_id,
+            action_ref=followup.action_ref,
+            actor=control_actor,  # quien sigue el follow-up es quien controló — mismo actor
             declared_support=Support.STRUCTURAL,
             preconditions=tuple(preconditions),
+            consumes=(followup.consumes,),
             postconditions=tuple(postconditions),
         )
 
@@ -248,13 +221,13 @@ def build_control_into_stack_sequences(
             alternative_group=group,
             alternative_id=followup.alternative_id,
         )
-        alternatives.append(GenericSequenceSpec(sequence=sequence, step_specs=(control_spec, followup_spec)))
+        alternatives.append(sequence)
 
     return ControlFollowupFamily(opening=opening, alternatives=tuple(alternatives))
 
 
 def extend_family_alternatives_with_step(
-    family: ControlFollowupFamily, *, extra_step: SequenceStep, extra_spec: StepEvaluationSpec
+    family: ControlFollowupFamily, *, extra_step: SequenceStep
 ) -> ControlFollowupFamily:
     """Extiende CADA alternativa de `family` (nunca `opening`) con un paso
     adicional al final — p. ej. la respuesta de un segundo actor dentro de
@@ -262,24 +235,24 @@ def extend_family_alternatives_with_step(
     cambios: el paso extra representa una reacción a un follow-up que ya
     ocurrió, y `opening` es precisamente "todavía no se declaró cuál".
 
-    Genérico: no sabe qué representa `extra_step` — solo reutiliza los
-    mismos tipos (`SequenceStep`/`StepEvaluationSpec`) ya validados, sin
-    duplicar su lógica de construcción."""
+    Genérico: no sabe qué representa `extra_step` — solo reutiliza
+    `SequenceStep` (fuente canónica única, ya validado) sin duplicar su
+    lógica de construcción."""
 
-    if extra_step.step_id in {step.step_id for alt in family.alternatives for step in alt.sequence.steps}:
+    if extra_step.step_id in {step.step_id for alt in family.alternatives for step in alt.steps}:
         raise ValueError(
             f"extra_step.step_id={extra_step.step_id!r} ya existe en alguna alternativa de la "
             "familia — los step_id deben seguir siendo únicos por secuencia"
         )
 
-    extended: list[GenericSequenceSpec] = []
+    extended: list[InteractionSequence] = []
     for alt in family.alternatives:
         sequence = InteractionSequence(
-            sequence_id=f"{alt.sequence.sequence_id}+{extra_step.step_id}",
-            steps=(*alt.sequence.steps, extra_step),
-            alternative_group=alt.sequence.alternative_group,
-            alternative_id=alt.sequence.alternative_id,
+            sequence_id=f"{alt.sequence_id}+{extra_step.step_id}",
+            steps=(*alt.steps, extra_step),
+            alternative_group=alt.alternative_group,
+            alternative_id=alt.alternative_id,
         )
-        extended.append(GenericSequenceSpec(sequence=sequence, step_specs=(*alt.step_specs, extra_spec)))
+        extended.append(sequence)
 
     return ControlFollowupFamily(opening=family.opening, alternatives=tuple(extended))

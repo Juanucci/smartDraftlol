@@ -40,21 +40,23 @@ from lol_reasoner.domain.combat_state import (
 )
 from lol_reasoner.domain.enums import EffectCondition, EffectType, Support
 from lol_reasoner.reasoning.scenario_builder import build_scenario_baseline
-from lol_reasoner.reasoning.sequences.evaluator import (
-    PostconditionEffectKind,
-    PreconditionCheckKind,
-    StepEvaluationSpec,
-    StructuralPostcondition,
-    StructuralPrecondition,
-)
 from lol_reasoner.reasoning.sequences.generic_sequences import (
     ControlFollowupFamily,
     FollowupAlternative,
-    GenericSequenceSpec,
     build_control_into_stack_sequences,
     extend_family_alternatives_with_step,
 )
-from lol_reasoner.reasoning.sequences.steps import WHOLE_EFFECT_COMPONENT, ActorRole, EffectIdentity, SequenceStep
+from lol_reasoner.reasoning.sequences.sequence import InteractionSequence
+from lol_reasoner.reasoning.sequences.steps import (
+    WHOLE_EFFECT_COMPONENT,
+    ActorRole,
+    EffectIdentity,
+    PostconditionEffectKind,
+    PreconditionCheckKind,
+    SequenceStep,
+    StructuralPostcondition,
+    StructuralPrecondition,
+)
 
 DARIUS_ID = "darius"
 MORDEKAISER_ID = "mordekaiser"
@@ -130,7 +132,7 @@ class ApprehendFollowupRegistration:
     stack_reference: str
     family: ControlFollowupFamily
 
-    def spec_for(self, alternative_id: str) -> GenericSequenceSpec:
+    def spec_for(self, alternative_id: str) -> InteractionSequence:
         return self.family.spec_for(alternative_id)
 
 
@@ -347,7 +349,7 @@ class BidirectionalTradeRegistration:
     mordekaiser_stack_threshold: int
     family: ControlFollowupFamily
 
-    def spec_for(self, alternative_id: str) -> GenericSequenceSpec:
+    def spec_for(self, alternative_id: str) -> InteractionSequence:
         return self.family.spec_for(alternative_id)
 
 
@@ -385,16 +387,6 @@ def build_bidirectional_trade_registration(
         step_id="response_obliterate",
         action_ref=response_action_ref,
         actor=mordekaiser_role,
-        consumes=(
-            EffectIdentity(
-                fact_ref=f"{mordekaiser.id}:{response_slot}",
-                causal_role="stack_application",
-                component=EffectCondition.ON_HIT.value,
-            ),
-        ),
-    )
-    response_spec = StepEvaluationSpec(
-        step=response_step,
         declared_support=Support.STRUCTURAL,
         preconditions=(
             StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, mordekaiser_role, response_action_ref),
@@ -410,6 +402,13 @@ def build_bidirectional_trade_registration(
                 invalidator_key=APPREHEND_INTERRUPT_INVALIDATOR_KEY,
             ),
         ),
+        consumes=(
+            EffectIdentity(
+                fact_ref=f"{mordekaiser.id}:{response_slot}",
+                causal_role="stack_application",
+                component=EffectCondition.ON_HIT.value,
+            ),
+        ),
         postconditions=(
             StructuralPostcondition(PostconditionEffectKind.ABILITY_ON_COOLDOWN, mordekaiser_role, response_slot),
             StructuralPostcondition(
@@ -421,7 +420,7 @@ def build_bidirectional_trade_registration(
         ),
     )
 
-    family = extend_family_alternatives_with_step(base.family, extra_step=response_step, extra_spec=response_spec)
+    family = extend_family_alternatives_with_step(base.family, extra_step=response_step)
 
     return BidirectionalTradeRegistration(
         apprehend_followup=base,

@@ -92,8 +92,8 @@ def test_missing_ability_reference_fails_explicitly():
 
 
 def test_apprehend_control_step_does_not_consume_stack_application(registration_candidate):
-    control_spec = registration_candidate.spec_for(Q_ALTERNATIVE_ID).step_specs[0]
-    for identity in control_spec.step.consumes:
+    control_step = registration_candidate.spec_for(Q_ALTERNATIVE_ID).steps[0]
+    for identity in control_step.consumes:
         assert identity.causal_role != "stack_application"
 
 
@@ -252,7 +252,7 @@ def test_q_outer_zone_is_not_inferred_from_apprehend_contact(registration_candid
     followup_result = next(r for r in outcome.step_results if r.step_id == "followup_decimate")
     # Apprehend conectó (confirmado), pero la precondición de zona
     # exterior de Q sigue UNKNOWN — nadie la infirió del contacto.
-    assert PreconditionStatus.UNKNOWN in followup_result.precondition_statuses
+    assert PreconditionStatus.UNKNOWN in [r.status for r in followup_result.precondition_results]
     assert outcome.execution_status is ExecutionStatus.HYPOTHETICAL
 
 
@@ -266,7 +266,7 @@ def test_q_outer_zone_is_not_inferred_from_basic_attack_range(registration_candi
     )
 
     followup_result = next(r for r in outcome.step_results if r.step_id == "followup_decimate")
-    assert PreconditionStatus.UNKNOWN in followup_result.precondition_statuses
+    assert PreconditionStatus.UNKNOWN in [r.status for r in followup_result.precondition_results]
 
 
 def test_action_connects_references_are_independent_per_action(registration_candidate):
@@ -548,3 +548,151 @@ def test_this_file_never_asserts_a_hardcoded_absolute_score():
 
     source = Path(__file__).read_text(encoding="utf-8")
     assert not re.search(r"assert\s+\w*score\w*\s*==\s*-?\d", source, re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — invariantes restauradas (§A1: tabla test anterior ->
+# test actual/reemplazo, ver entrega de esta ronda). Ninguna de estas
+# reintroduce texto libre ni depende de un número de tests exacto — cada
+# una verifica un comportamiento concreto que había quedado sin cobertura
+# directa tras la reorganización histórica de este archivo.
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_champion_id_fails_explicitly():
+    fake_darius = _synthetic_champion("not_darius")
+    with pytest.raises(ValueError):
+        build_apprehend_followup_registration(darius=fake_darius, darius_role=ActorRole.CANDIDATE)
+
+
+def test_selecting_an_unregistered_alternative_fails_explicitly(registration_candidate):
+    with pytest.raises(ValueError):
+        registration_candidate.spec_for("not_a_real_alternative")
+
+
+def test_used_abilities_go_on_cooldown_preserving_rank(darius, registration_candidate):
+    from lol_reasoner.domain.combat_state import AbilityAvailability
+
+    baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=baseline
+    )
+
+    after = outcome.trade_outcome.state_delta.after
+    apprehend_rank_before = baseline.candidate.abilities[registration_candidate.apprehend_slot].rank
+    decimate_rank_before = baseline.candidate.abilities[registration_candidate.decimate_slot].rank
+
+    assert after.candidate.abilities[registration_candidate.apprehend_slot].availability is AbilityAvailability.ON_COOLDOWN
+    assert after.candidate.abilities[registration_candidate.apprehend_slot].rank == apprehend_rank_before
+    assert after.candidate.abilities[registration_candidate.decimate_slot].availability is AbilityAvailability.ON_COOLDOWN
+    assert after.candidate.abilities[registration_candidate.decimate_slot].rank == decimate_rank_before
+
+
+def test_basic_attack_followup_does_not_touch_any_ability_state(registration_candidate):
+    baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.basic_attack_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=AA_ALTERNATIVE_ID, baseline=baseline
+    )
+
+    after = outcome.trade_outcome.state_delta.after
+    # el autoataque no tiene AbilityState propio: las únicas habilidades
+    # que cambian son las que Apprehend puso en cooldown — Decimate (Q)
+    # sigue exactamente como en el baseline, sin tocar.
+    assert after.candidate.abilities[registration_candidate.decimate_slot] == baseline.candidate.abilities[
+        registration_candidate.decimate_slot
+    ]
+
+
+def test_scenario_builder_generates_only_the_requested_references(registration_candidate):
+    baseline = build_apprehend_followup_baseline(registration_candidate)
+
+    expected_refs = {
+        registration_candidate.apprehend_action_ref,
+        registration_candidate.basic_attack_action_ref,
+        registration_candidate.decimate_outer_zone_action_ref,
+    }
+    assert set(baseline.shared.action_contexts.keys()) == expected_refs
+    assert set(baseline.candidate.abilities.keys()) == {
+        registration_candidate.apprehend_slot,
+        registration_candidate.decimate_slot,
+    }
+    assert set(baseline.enemy.stacks.keys()) == {registration_candidate.stack_reference}
+    # nada más: ni la referencia de casteo de Q (distinta de su zona
+    # exterior), ni ningún slot/mecánica no pedida explícitamente.
+    assert registration_candidate.decimate_action_ref not in baseline.shared.action_contexts
+
+
+def test_no_global_cartesian_product_of_scenarios(darius):
+    # construir la misma registración dos veces con argumentos DISTINTOS
+    # produce dos CombatState independientes — nunca una combinación
+    # acumulada ni un estado compartido entre llamadas.
+    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
+    baseline_a = build_apprehend_followup_baseline(
+        registration, range_statuses={registration.apprehend_action_ref: RangeStatus.IN_RANGE}
+    )
+    baseline_b = build_apprehend_followup_baseline(
+        registration, range_statuses={registration.apprehend_action_ref: RangeStatus.OUT_OF_RANGE}
+    )
+
+    assert (
+        baseline_a.shared.action_contexts[registration.apprehend_action_ref].range_status
+        is RangeStatus.IN_RANGE
+    )
+    assert (
+        baseline_b.shared.action_contexts[registration.apprehend_action_ref].range_status
+        is RangeStatus.OUT_OF_RANGE
+    )
+    # cada llamada es una construcción nueva e independiente, nunca un
+    # objeto compartido/mutado entre las dos.
+    assert baseline_a is not baseline_b
+
+
+def test_darius_mirror_matchup_is_not_the_registered_pair(darius):
+    mirror_darius = _synthetic_champion("darius")
+    assert not is_darius_mordekaiser_matchup(darius, mirror_darius)
+    assert not is_darius_mordekaiser_matchup(mirror_darius, darius)
+
+
+def test_no_source_references_noxian_might_or_five_stacks():
+    import re
+    from pathlib import Path
+
+    package_root = Path(__file__).resolve().parents[1] / "src" / "lol_reasoner" / "reasoning" / "sequences"
+    forbidden = re.compile(r"noxian_might|five.?stack|5.?stack", re.IGNORECASE)
+    for path in package_root.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert not forbidden.search(source), f"{path} referencia Noxian Might o cinco cargas fuera de alcance"
+
+
+def test_shadow_modules_do_not_import_rule_or_scoring_internals():
+    import ast
+    from pathlib import Path
+
+    package_root = Path(__file__).resolve().parents[1] / "src" / "lol_reasoner" / "reasoning" / "sequences"
+    forbidden_prefixes = ("lol_reasoner.reasoning.rules", "lol_reasoner.scoring")
+    for path in package_root.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                assert not node.module.startswith(forbidden_prefixes), (
+                    f"{path} importa {node.module!r} — reasoning/sequences/*.py no puede depender de "
+                    "reglas atómicas ni de scoring"
+                )
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith(forbidden_prefixes), (
+                        f"{path} importa {alias.name!r} — reasoning/sequences/*.py no puede depender de "
+                        "reglas atómicas ni de scoring"
+                    )

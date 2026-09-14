@@ -33,9 +33,11 @@ from lol_reasoner.reasoning.sequences.steps import (
     EffectIdentity,
     PreconditionStatus,
     SequenceStep,
+    StructuralPrecondition,
     _effect_identity_to_primitive,
     _require_nonempty_string,
     _sequence_step_to_primitive,
+    _structural_precondition_to_primitive,
     resolve_step_support,
 )
 
@@ -256,6 +258,46 @@ def chain_execution_status(step_results: Iterable["StepResult"]) -> ExecutionSta
 
 
 # ---------------------------------------------------------------------------
+# Precondición evaluada CON su identidad — nunca un status suelto
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PreconditionResult:
+    """UNA precondición ya evaluada, junto con su identidad COMPLETA
+    (cierre de hardening §A2): nunca un `PreconditionStatus` suelto sin
+    decir qué kind/actor/reference/invalidator_key lo produjo.
+    `precondition` es la MISMA `StructuralPrecondition` que
+    `SequenceStep.preconditions` declaró — la fuente canónica única de
+    `steps.py` — nunca una copia reconstruida ni texto libre nuevo. Esto es
+    lo que permite que la serialización explique, para cada status, CUÁL
+    condición concreta resolvió — nunca una lista de valores sin
+    contexto."""
+
+    precondition: StructuralPrecondition
+    status: PreconditionStatus
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.precondition, StructuralPrecondition):
+            raise TypeError(
+                f"PreconditionResult.precondition debe ser StructuralPrecondition, no "
+                f"{self.precondition!r} ({type(self.precondition).__name__})"
+            )
+        if not isinstance(self.status, PreconditionStatus):
+            raise TypeError(
+                f"PreconditionResult.status debe ser PreconditionStatus, no {self.status!r} "
+                f"({type(self.status).__name__})"
+            )
+
+
+def _precondition_result_to_primitive(result: PreconditionResult) -> dict[str, object]:
+    return {
+        "precondition": _structural_precondition_to_primitive(result.precondition),
+        "status": result.status.value,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Resultado de un paso evaluado + soporte de la cadena (eslabón más débil)
 # ---------------------------------------------------------------------------
 
@@ -272,7 +314,7 @@ class StepResult:
     `__post_init__` con la misma función pura `resolve_step_support` que ya
     aplicaba esta regla (§B.5): imposible pasarlo por `__init__` (lanza
     `TypeError`, igual que `InteractionSequence.covers_causes`), e
-    imposible que quede contradictorio con `precondition_statuses` — no hay
+    imposible que quede contradictorio con `precondition_results` — no hay
     dos fuentes de verdad que puedan desalinearse, solo una función que
     siempre las resuelve de la misma manera:
     - alguna precondición `UNSATISFIED` -> `effective_support = None`
@@ -280,32 +322,90 @@ class StepResult:
     - alguna precondición `UNKNOWN` sin bloqueo -> como mucho `CONDITIONED`,
       nunca `STRUCTURAL`;
     - sin `UNKNOWN` ni `UNSATISFIED` -> `effective_support = declared_support`.
+
+    **Herencia de incertidumbre** (cierre de hardening — seguridad de
+    estados proyectados): `inherited_execution_status` es un dato de
+    ENTRADA real (nunca derivado) que declara la certeza del `CombatState`
+    contra el que se evaluó ESTE paso — `CONFIRMED` si venía de una
+    transición confirmada o del baseline inicial, `HYPOTHETICAL` si venía
+    de una proyección de un paso previo. Nunca puede ser `BLOCKED`: un
+    paso bloqueado no produce ningún `CombatState` del que otro paso pueda
+    partir (ver `evaluator.StepTransition`) — heredar `BLOCKED` significaría
+    evaluar un paso que nunca debió evaluarse, y se rechaza explícitamente.
+
+    `own_execution_status` (derivado, `field(init=False)`) es la certeza
+    que este paso tendría mirando SOLO sus propias precondiciones, sin
+    considerar de dónde vino el estado de entrada. `execution_status`
+    (derivado) es el que realmente se expone y el que participa de
+    `chain_execution_status`/`chain_support`: el eslabón más débil entre
+    `own_execution_status` y `inherited_execution_status` — nunca el
+    orden de declaración accidental del enum, la misma
+    `_EXECUTION_STATUS_PRIORITY` ya usada por `chain_execution_status`. Un
+    paso con TODAS sus precondiciones `SATISFIED` sigue sin poder
+    figurar como `CONFIRMED` si heredó `HYPOTHETICAL` — no puede aparecer
+    como ejecución efectivamente confirmada si depende de un estado
+    producido hipotéticamente. `effective_support` aplica la misma
+    degradación: una herencia `HYPOTHETICAL` limita el soporte final a
+    como mucho `CONDITIONED`, igual que una precondición `UNKNOWN` propia
+    — nunca se recupera `STRUCTURAL` por heredar incertidumbre ajena.
     """
 
     step_id: str
-    precondition_statuses: tuple[PreconditionStatus, ...]
+    precondition_results: tuple[PreconditionResult, ...]
     declared_support: Support
+    inherited_execution_status: "ExecutionStatus" = ExecutionStatus.CONFIRMED
+    own_execution_status: "ExecutionStatus" = field(init=False, default=None)  # type: ignore[assignment]
     effective_support: Support | None = field(init=False, default=None)
     execution_status: "ExecutionStatus" = field(init=False, default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.step_id, field_name="StepResult.step_id")
 
-        if not isinstance(self.precondition_statuses, tuple):
+        if not isinstance(self.precondition_results, tuple):
             raise TypeError(
-                f"StepResult.precondition_statuses debe ser tuple, no "
-                f"{type(self.precondition_statuses).__name__}"
+                f"StepResult.precondition_results debe ser tuple, no "
+                f"{type(self.precondition_results).__name__}"
+            )
+        for item in self.precondition_results:
+            if not isinstance(item, PreconditionResult):
+                raise TypeError(
+                    f"StepResult.precondition_results[] debe ser PreconditionResult, no {item!r} "
+                    f"({type(item).__name__})"
+                )
+
+        if not isinstance(self.inherited_execution_status, ExecutionStatus):
+            raise TypeError(
+                f"StepResult.inherited_execution_status debe ser ExecutionStatus, no "
+                f"{self.inherited_execution_status!r} ({type(self.inherited_execution_status).__name__})"
+            )
+        if self.inherited_execution_status is ExecutionStatus.BLOCKED:
+            raise ValueError(
+                "StepResult.inherited_execution_status no puede ser BLOCKED — un paso bloqueado "
+                "nunca produce un CombatState del que otro paso pueda heredar (ver "
+                "evaluator.StepTransition); heredar BLOCKED significaría evaluar un paso que "
+                "nunca debió evaluarse"
             )
 
+        own_statuses = tuple(item.status for item in self.precondition_results)
         # `resolve_step_support` valida tanto `declared_support` como cada
-        # `precondition_statuses[]` (TypeError si el tipo no corresponde) y
-        # es la ÚNICA lógica que decide effective_support — StepResult no
-        # duplica esa decisión, solo la invoca y la fija.
-        effective = resolve_step_support(
-            declared_support=self.declared_support, precondition_statuses=self.precondition_statuses
+        # status (TypeError si el tipo no corresponde) y es la ÚNICA lógica
+        # que decide el soporte propio — StepResult no duplica esa decisión,
+        # solo la invoca y la combina con la herencia.
+        own_effective = resolve_step_support(declared_support=self.declared_support, precondition_statuses=own_statuses)
+        own_execution = execution_status_of(own_statuses)
+        object.__setattr__(self, "own_execution_status", own_execution)
+
+        final_execution = min(
+            (own_execution, self.inherited_execution_status),
+            key=lambda status: _EXECUTION_STATUS_PRIORITY[status],
         )
-        object.__setattr__(self, "effective_support", effective)
-        object.__setattr__(self, "execution_status", execution_status_of(self.precondition_statuses))
+        object.__setattr__(self, "execution_status", final_execution)
+
+        final_effective = own_effective
+        if final_effective is not None and final_execution is ExecutionStatus.HYPOTHETICAL:
+            if _SUPPORT_PRIORITY[final_effective] > _SUPPORT_PRIORITY[Support.CONDITIONED]:
+                final_effective = Support.CONDITIONED
+        object.__setattr__(self, "effective_support", final_effective)
 
 
 def chain_support(step_results: Iterable[StepResult]) -> Support | None:
@@ -790,10 +890,12 @@ class ScenarioOutcome:
 def _step_result_to_primitive(result: StepResult) -> dict[str, object]:
     return {
         "step_id": result.step_id,
-        "precondition_statuses": [status.value for status in result.precondition_statuses],
+        "precondition_results": [_precondition_result_to_primitive(r) for r in result.precondition_results],
         "declared_support": result.declared_support.value,
-        "effective_support": result.effective_support.value if result.effective_support is not None else None,
+        "own_execution_status": result.own_execution_status.value,
+        "inherited_execution_status": result.inherited_execution_status.value,
         "execution_status": result.execution_status.value,
+        "effective_support": result.effective_support.value if result.effective_support is not None else None,
     }
 
 

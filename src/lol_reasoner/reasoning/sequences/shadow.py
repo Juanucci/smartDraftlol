@@ -22,7 +22,6 @@ from lol_reasoner.domain.champion import Champion
 from lol_reasoner.domain.combat_state import CombatState
 from lol_reasoner.domain.enums import Factor, Provenance
 from lol_reasoner.reasoning.sequences.evaluator import evaluate_sequence_prefix
-from lol_reasoner.reasoning.sequences.generic_sequences import GenericSequenceSpec
 from lol_reasoner.reasoning.sequences.registry import (
     DARIUS_ID,
     ApprehendFollowupRegistration,
@@ -37,6 +36,7 @@ from lol_reasoner.reasoning.sequences.sequence import (
     AlternativeGroup,
     CausalComponent,
     Evaluation,
+    InteractionSequence,
     ScenarioOutcome,
     StateDelta,
     TradeOutcome,
@@ -57,16 +57,16 @@ def _resolve_darius_role(candidate: Champion, enemy: Champion) -> ActorRole:
 
 def _build_outcome_from_spec(
     *,
-    spec: GenericSequenceSpec,
+    spec: InteractionSequence,
     baseline: CombatState,
     branch_selection: AlternativeGroup | None,
     causal_components: tuple[CausalComponent, ...],
     evaluation: Evaluation,
 ) -> ScenarioOutcome:
-    step_results, final_state = evaluate_sequence_prefix(spec.step_specs, baseline)
+    step_results, final_state = evaluate_sequence_prefix(spec.steps, baseline)
     trade_outcome = TradeOutcome(state_delta=StateDelta(before=baseline, after=final_state), evaluation=evaluation)
     return ScenarioOutcome(
-        sequence=spec.sequence,
+        sequence=spec,
         step_results=step_results,
         trade_outcome=trade_outcome,
         branch_selection=branch_selection,
@@ -74,14 +74,14 @@ def _build_outcome_from_spec(
     )
 
 
-def _shadow_causal_component(spec: GenericSequenceSpec, *, sequence_id: str) -> CausalComponent:
+def _shadow_causal_component(spec: InteractionSequence, *, sequence_id: str) -> CausalComponent:
     """UN `CausalComponent` shadow-only a partir del `EffectIdentity` que
     consume el ÚLTIMO paso de `spec` (el follow-up que efectivamente
     aplica el stack). `polarity=None`: no se firma una dirección — esta
     ronda no decide favorecidos, solo demuestra que la cadena puede
     completarse y producir un componente representable."""
 
-    consumed = spec.sequence.steps[-1].consumes[0]
+    consumed = spec.steps[-1].consumes[0]
     return CausalComponent(
         factor=Factor.STACKING_PAYOFF,
         delta=_SHADOW_CAUSAL_COMPONENT_PLACEHOLDER_DELTA,
@@ -130,7 +130,7 @@ def build_apprehend_followup_outcome(
     spec = registration.spec_for(selected_alternative_id)
     resolved_baseline = baseline if baseline is not None else build_apprehend_followup_baseline(registration)
 
-    group = spec.sequence.alternative_group
+    group = spec.alternative_group
     assert group is not None  # toda alternativa de esta familia pertenece a un grupo
     branch_selection = AlternativeGroup(
         group_id=group.group_id, alternative_ids=group.alternative_ids, selected_id=selected_alternative_id
@@ -138,7 +138,7 @@ def build_apprehend_followup_outcome(
 
     causal_components: tuple[CausalComponent, ...] = ()
     if emit_shadow_causal_component:
-        causal_components = (_shadow_causal_component(spec, sequence_id=spec.sequence.sequence_id),)
+        causal_components = (_shadow_causal_component(spec, sequence_id=spec.sequence_id),)
 
     return _build_outcome_from_spec(
         spec=spec,
@@ -229,7 +229,7 @@ def build_bidirectional_trade_outcome(
     spec = registration.spec_for(selected_alternative_id)
     resolved_baseline = baseline if baseline is not None else build_bidirectional_trade_baseline(registration)
 
-    group = spec.sequence.alternative_group
+    group = spec.alternative_group
     assert group is not None
     branch_selection = AlternativeGroup(
         group_id=group.group_id, alternative_ids=group.alternative_ids, selected_id=selected_alternative_id

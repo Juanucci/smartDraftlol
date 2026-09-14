@@ -1,19 +1,18 @@
 """Evaluador genérico de pasos de secuencia contra un `CombatState` real.
 
-v1.7 — cierre de Etapa 2 más primera secuencia real, exclusivamente en
-shadow mode. Ningún tipo ni función de este módulo nombra un campeón, una
-habilidad o una mecánica concreta: la instancia real (Darius/Mordekaiser,
+v1.7 — cierre de hardening: `SequenceStep` (`steps.py`) es ahora la ÚNICA
+fuente canónica de precondiciones/postcondiciones/`declared_support` de un
+paso — este módulo ya NO define su propio vocabulario de
+`StructuralPrecondition`/`StructuralPostcondition` (los importa de
+`steps.py`) ni empareja nada aparte vía un `StepEvaluationSpec`: ese tipo
+desapareció, era exactamente la segunda fuente de verdad capaz de
+divergir de `SequenceStep`. `evaluate_step`/`evaluate_sequence_prefix`
+ahora reciben `SequenceStep` directamente.
+
+Ningún tipo ni función de este módulo nombra un campeón, una habilidad o
+una mecánica concreta: la instancia real (Darius/Mordekaiser,
 Apprehend/Decimate/Hemorrhage) vive en `registry.py`, que resuelve
 referencias contra el conocimiento existente y las pasa acá como datos.
-
-**Contrato mínimo**: cada `SequenceStep` (declarativo, Etapa 2, sin
-callables) se empareja con un `StepEvaluationSpec` — qué hechos
-ESTRUCTURALES de un `CombatState` hay que leer para resolver sus
-precondiciones (`StructuralPrecondition`), y qué transición
-POSTCONDICIONAL aplica si el paso no queda bloqueado
-(`StructuralPostcondition`). El emparejamiento vive APARTE de
-`SequenceStep` a propósito — no reabre su API pública de Etapa 2 (no
-agrega campos ni cambia sus invariantes).
 
 **Vocabulario genérico, no ad hoc**: los tipos de precondición/
 postcondición que este módulo sabe resolver leen/escriben exclusivamente
@@ -33,13 +32,25 @@ que otra acción haya conectado.
 `dataclasses.replace` reconstruye actores/estado, lo que vuelve a correr
 `__post_init__` (revalida y re-congela cualquier mapping tocado). El
 snapshot de entrada queda intacto para quien lo llamó.
+
+**Seguridad de estados proyectados** (cierre de hardening — §A3): un paso
+`CONFIRMED` produce un `CombatState` confirmado; uno `HYPOTHETICAL`
+produce, con la misma mecánica de aplicar postcondiciones, una
+PROYECCIÓN — nunca indistinguible de un hecho porque viaja envuelta en
+`StepTransition` junto al `StepResult` que declara explícitamente su
+`execution_status`; uno `BLOCKED` no aplica sus postcondiciones y no
+produce transición (`StepTransition.state is None`, blindado en su
+`__post_init__`). Un paso posterior que evalúa contra una proyección
+HEREDA esa incertidumbre vía `inherited_execution_status`
+(`evaluate_sequence_prefix` la enhebra paso a paso) — nunca puede figurar
+como ejecución efectivamente confirmada dependiendo de un estado
+hipotético (ver `StepResult` en `sequence.py`).
 """
 
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from enum import Enum
 
 from lol_reasoner.domain.combat_state import (
     AbilityAvailability,
@@ -52,138 +63,20 @@ from lol_reasoner.domain.combat_state import (
     StackState,
     StackWindow,
 )
-from lol_reasoner.domain.enums import Support
-from lol_reasoner.reasoning.sequences.sequence import PreconditionStatus, StepResult
-from lol_reasoner.reasoning.sequences.steps import ActorRole, SequenceStep
-
-# ---------------------------------------------------------------------------
-# Vocabulario genérico de precondiciones/postcondiciones estructurales
-# ---------------------------------------------------------------------------
-
-
-class PreconditionCheckKind(str, Enum):
-    """Hechos estructurales que este evaluador sabe leer de un
-    `CombatState` — ninguno nombra una mecánica concreta; los tres ya
-    existen en `domain.combat_state`.
-
-    `ACTION_CONNECTS` (antes `ACTION_IN_RANGE`, renombrado en el microfix
-    de esta ronda) deliberadamente NO es un único chequeo "global": cada
-    `StructuralPrecondition` de este tipo se liga a un `reference`
-    (`action_ref`) DISTINTO por acción/zona — alcance de autoataque,
-    impacto de un desplazamiento, o la zona exterior específica de una
-    habilidad de dos zonas son tres entradas INDEPENDIENTES de
-    `SharedContext.action_contexts`, nunca inferidas una de otra. Que el
-    action_ref de un desplazamiento esté `IN_RANGE` no dice nada sobre el
-    action_ref, distinto, de la zona exterior de otra habilidad.
-
-    `INVALIDATOR_ABSENT` (trade bidireccional): un control/desplazamiento
-    NO bloquea automáticamente una acción posterior — solo lo hace si un
-    invalidador CONCRETO de esa acción está `PRESENT`, reusando el
-    tri-estado `InvalidatorStatus` ya existente en `ActionContext`."""
-
-    ACTION_CONNECTS = "action_connects"  # SharedContext.action_contexts[reference].range_status
-    ABILITY_READY = "ability_ready"  # ActorState.abilities[reference].availability
-    INVALIDATOR_ABSENT = "invalidator_absent"  # SharedContext.action_contexts[reference].invalidators[invalidator_key]
-
-
-@dataclass(frozen=True, slots=True)
-class StructuralPrecondition:
-    kind: PreconditionCheckKind
-    actor: ActorRole
-    reference: str  # action_ref (ACTION_CONNECTS/INVALIDATOR_ABSENT) o slot de `abilities` (ABILITY_READY)
-    invalidator_key: str | None = None  # SOLO para INVALIDATOR_ABSENT: qué invalidador de `reference` consultar
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.kind, PreconditionCheckKind):
-            raise TypeError(f"StructuralPrecondition.kind debe ser PreconditionCheckKind, no {self.kind!r}")
-        if not isinstance(self.actor, ActorRole):
-            raise TypeError(f"StructuralPrecondition.actor debe ser ActorRole, no {self.actor!r}")
-        if not isinstance(self.reference, str) or not self.reference.strip():
-            raise ValueError(f"StructuralPrecondition.reference no puede ser vacío (recibido {self.reference!r})")
-        if self.kind is PreconditionCheckKind.INVALIDATOR_ABSENT:
-            if not isinstance(self.invalidator_key, str) or not self.invalidator_key.strip():
-                raise ValueError(
-                    "StructuralPrecondition.invalidator_key es obligatorio y no vacío cuando "
-                    f"kind == INVALIDATOR_ABSENT (recibido {self.invalidator_key!r})"
-                )
-        elif self.invalidator_key is not None:
-            raise ValueError(
-                f"StructuralPrecondition.invalidator_key solo aplica a INVALIDATOR_ABSENT, no a "
-                f"{self.kind!r} (recibido {self.invalidator_key!r})"
-            )
-
-
-class PostconditionEffectKind(str, Enum):
-    """Transiciones estructurales que este evaluador sabe aplicar sobre un
-    `CombatState` — ninguna inventa un valor mecánico nuevo: solo mueve
-    campos ya existentes a otro de sus propios valores cualitativos."""
-
-    ABILITY_ON_COOLDOWN = "ability_on_cooldown"  # ActorState.abilities[reference] -> ON_COOLDOWN
-    STACK_APPLIED = "stack_applied"  # ActorState.stacks[reference] -> una aplicación más (± reward)
-
-
-@dataclass(frozen=True, slots=True)
-class StructuralPostcondition:
-    kind: PostconditionEffectKind
-    actor: ActorRole  # a quién se le aplica — el OBJETIVO, no necesariamente quien actúa
-    reference: str  # slot dentro de `abilities`, o clave dentro de `stacks`
-    # SOLO para STACK_APPLIED: umbral de la StackingMechanic que `reference`
-    # alimenta. Si se alcanza o supera con esta aplicación, activa
-    # `RewardState.ACTIVE` (trade bidireccional, §4: "activá el reward...
-    # si alcanza el umbral"); si no se alcanza, dice `RewardState.INACTIVE`
-    # (un hecho CONOCIDO, no una omisión); si el conteo previo es
-    # desconocido, no puede saberse si se cruzó — se preserva el
-    # `reward_state` anterior sin inventar nada. `None` = esta aplicación
-    # no modela lógica de umbral (p. ej. Hemorrhage en esta ronda, cuyo
-    # umbral de 5 queda fuera de alcance — "no llegues a cinco cargas").
-    threshold: int | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.kind, PostconditionEffectKind):
-            raise TypeError(f"StructuralPostcondition.kind debe ser PostconditionEffectKind, no {self.kind!r}")
-        if not isinstance(self.actor, ActorRole):
-            raise TypeError(f"StructuralPostcondition.actor debe ser ActorRole, no {self.actor!r}")
-        if not isinstance(self.reference, str) or not self.reference.strip():
-            raise ValueError(f"StructuralPostcondition.reference no puede ser vacío (recibido {self.reference!r})")
-        if self.threshold is not None:
-            if self.kind is not PostconditionEffectKind.STACK_APPLIED:
-                raise ValueError(
-                    f"StructuralPostcondition.threshold solo aplica a STACK_APPLIED, no a "
-                    f"{self.kind!r} (recibido {self.threshold!r})"
-                )
-            if isinstance(self.threshold, bool) or not isinstance(self.threshold, int) or self.threshold <= 0:
-                raise ValueError(
-                    f"StructuralPostcondition.threshold debe ser un int positivo real, no "
-                    f"{self.threshold!r} ({type(self.threshold).__name__})"
-                )
-
-
-@dataclass(frozen=True, slots=True)
-class StepEvaluationSpec:
-    """Empareja UN `SequenceStep` con cómo evaluarlo contra un
-    `CombatState` real. `declared_support` es la certeza que este paso
-    tendría SI todas sus precondiciones se sostuvieran — la misma
-    semántica declared/effective ya cerrada en `StepResult` (§A4)."""
-
-    step: SequenceStep
-    declared_support: Support
-    preconditions: tuple[StructuralPrecondition, ...] = ()
-    postconditions: tuple[StructuralPostcondition, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.step, SequenceStep):
-            raise TypeError(f"StepEvaluationSpec.step debe ser SequenceStep, no {self.step!r}")
-        if not isinstance(self.declared_support, Support):
-            raise TypeError(f"StepEvaluationSpec.declared_support debe ser Support, no {self.declared_support!r}")
-        if not isinstance(self.preconditions, tuple) or not all(
-            isinstance(p, StructuralPrecondition) for p in self.preconditions
-        ):
-            raise TypeError("StepEvaluationSpec.preconditions debe ser tuple[StructuralPrecondition, ...]")
-        if not isinstance(self.postconditions, tuple) or not all(
-            isinstance(p, StructuralPostcondition) for p in self.postconditions
-        ):
-            raise TypeError("StepEvaluationSpec.postconditions debe ser tuple[StructuralPostcondition, ...]")
-
+from lol_reasoner.reasoning.sequences.sequence import (
+    ExecutionStatus,
+    PreconditionResult,
+    PreconditionStatus,
+    StepResult,
+)
+from lol_reasoner.reasoning.sequences.steps import (
+    ActorRole,
+    PreconditionCheckKind,
+    PostconditionEffectKind,
+    SequenceStep,
+    StructuralPostcondition,
+    StructuralPrecondition,
+)
 
 # ---------------------------------------------------------------------------
 # Lectura de precondiciones (nunca infiere SATISFIED/UNSATISFIED de una
@@ -303,53 +196,133 @@ def _apply_postcondition(state: CombatState, postcondition: StructuralPostcondit
 
 
 # ---------------------------------------------------------------------------
+# StepTransition — par (StepResult, CombatState | None) donde `None` es
+# SIEMPRE Y ÚNICAMENTE el caso BLOCKED (cierre de hardening — §A3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class StepTransition:
+    """Resultado de evaluar UN paso: su `StepResult` (con `execution_status`
+    ya resuelto — `CONFIRMED`/`HYPOTHETICAL`/`BLOCKED`, incluida la
+    herencia de incertidumbre) junto con el `CombatState` que produjo, si
+    produjo alguno.
+
+    `state is None` es SIEMPRE y ÚNICAMENTE el caso `BLOCKED` (blindado
+    acá abajo): "no hubo transición porque el paso bloqueó" queda
+    estructuralmente distinto de "hubo una transición y produjo este
+    estado", sea confirmado o proyectado. Un `state` no-`None` con
+    `result.execution_status is HYPOTHETICAL` es una PROYECCIÓN bajo
+    hipótesis, nunca un hecho confirmado — `result.execution_status`
+    (siempre serializado junto a este estado, nunca por separado) es la
+    única fuente que dice cuál es cuál; este tipo no duplica esa
+    distinción con un campo booleano propio."""
+
+    result: StepResult
+    state: CombatState | None
+
+    __hash__ = None  # type: ignore[assignment]  # puede contener un CombatState no hashable
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, StepResult):
+            raise TypeError(f"StepTransition.result debe ser StepResult, no {self.result!r} ({type(self.result).__name__})")
+        if self.state is not None and not isinstance(self.state, CombatState):
+            raise TypeError(
+                f"StepTransition.state debe ser CombatState o None, no {self.state!r} "
+                f"({type(self.state).__name__})"
+            )
+        is_blocked = self.result.execution_status is ExecutionStatus.BLOCKED
+        if is_blocked and self.state is not None:
+            raise ValueError(
+                "StepTransition.state debe ser None cuando result.execution_status es BLOCKED — "
+                "un paso bloqueado no aplica sus postcondiciones, no hay transición que representar"
+            )
+        if not is_blocked and self.state is None:
+            raise ValueError(
+                "StepTransition.state no puede ser None salvo cuando result.execution_status es "
+                "BLOCKED — CONFIRMED y HYPOTHETICAL siempre producen un CombatState (confirmado o "
+                "proyectado, respectivamente)"
+            )
+
+
+# ---------------------------------------------------------------------------
 # API pública: evaluar un paso, o una secuencia completa como prefijo
 # ---------------------------------------------------------------------------
 
 
-def evaluate_step(spec: StepEvaluationSpec, state: CombatState) -> tuple[StepResult, CombatState]:
-    """Evalúa UN paso contra `state`.
+def evaluate_step(
+    step: SequenceStep,
+    state: CombatState,
+    *,
+    inherited_execution_status: ExecutionStatus = ExecutionStatus.CONFIRMED,
+) -> StepTransition:
+    """Evalúa UN `SequenceStep` (fuente canónica única, `steps.py`) contra
+    `state`, heredando `inherited_execution_status` — la certeza del
+    `CombatState` de entrada (`CONFIRMED` por defecto: el baseline o una
+    transición previa confirmada; `HYPOTHETICAL` si `state` es en sí mismo
+    una proyección de un paso anterior). Nunca `BLOCKED` (`StepResult` lo
+    rechaza — ver `sequence.py`).
 
-    Devuelve `(result, next_state)`: `next_state` es el MISMO `state`
-    recibido si el paso queda bloqueado (`result.effective_support is
-    None`) o no declara postcondiciones estructurales; uno NUEVO (nunca
-    mutado in-place) si aplica alguna."""
+    Devuelve un `StepTransition`: `state=None` si el paso queda bloqueado
+    (`result.execution_status is BLOCKED`, sin aplicar sus
+    postcondiciones); si no, el `CombatState` resultante — confirmado o
+    proyectado según `result.execution_status`, nunca mutado in-place."""
 
+    if not isinstance(step, SequenceStep):
+        raise TypeError(f"evaluate_step espera un SequenceStep, no {step!r} ({type(step).__name__})")
     if not isinstance(state, CombatState):
         raise TypeError(f"evaluate_step espera un CombatState, no {state!r} ({type(state).__name__})")
 
-    statuses = tuple(_resolve_precondition(p, state) for p in spec.preconditions)
+    precondition_results = tuple(
+        PreconditionResult(precondition=p, status=_resolve_precondition(p, state)) for p in step.preconditions
+    )
     result = StepResult(
-        step_id=spec.step.step_id, precondition_statuses=statuses, declared_support=spec.declared_support
+        step_id=step.step_id,
+        precondition_results=precondition_results,
+        declared_support=step.declared_support,
+        inherited_execution_status=inherited_execution_status,
     )
 
-    if result.effective_support is None:
-        return result, state  # bloqueado: no hay transición que aplicar
+    if result.execution_status is ExecutionStatus.BLOCKED:
+        return StepTransition(result=result, state=None)  # bloqueado: no hay transición que aplicar
 
     next_state = state
-    for postcondition in spec.postconditions:
+    for postcondition in step.postconditions:
         next_state = _apply_postcondition(next_state, postcondition)
 
-    return result, next_state
+    return StepTransition(result=result, state=next_state)
 
 
 def evaluate_sequence_prefix(
-    specs: tuple[StepEvaluationSpec, ...], initial_state: CombatState
+    steps: tuple[SequenceStep, ...], initial_state: CombatState
 ) -> tuple[tuple[StepResult, ...], CombatState]:
-    """Evalúa una secuencia de specs EN ORDEN, deteniéndose en el primer
-    paso bloqueado — así `step_results` es, por construcción, siempre el
-    prefijo ordenado que `ScenarioOutcome` exige (§A1): nunca se generan
-    resultados posteriores a un bloqueo porque el bucle corta ahí mismo.
+    """Evalúa una secuencia de `SequenceStep` EN ORDEN, deteniéndose en el
+    primer paso bloqueado — así `step_results` es, por construcción,
+    siempre el prefijo ordenado que `ScenarioOutcome` exige (§A1): nunca
+    se generan resultados posteriores a un bloqueo porque el bucle corta
+    ahí mismo.
+
+    **Herencia de incertidumbre enhebrada** (cierre de hardening — §A3):
+    el primer paso hereda `CONFIRMED` (el baseline es, por definición, el
+    punto de partida conocido); cada paso siguiente hereda el
+    `execution_status` YA RESUELTO (con su propia herencia incluida) del
+    paso anterior — así una vez que la cadena entra en `HYPOTHETICAL`,
+    todo paso posterior quedará como mucho `HYPOTHETICAL` (nunca
+    `CONFIRMED`), sin necesidad de que `chain_execution_status` haga nada
+    especial: cada `StepResult` ya trae su estado final correctamente
+    degradado.
 
     Devuelve los `StepResult` obtenidos y el último `CombatState`
-    producido (el de entrada, sin cambios, si el primer paso ya bloquea).
-    """
+    producido (el de entrada, sin cambios, si el primer paso ya bloquea)."""
 
     results: list[StepResult] = []
     state = initial_state
-    for spec in specs:
-        result, state = evaluate_step(spec, state)
-        results.append(result)
-        if result.effective_support is None:
+    inherited_status = ExecutionStatus.CONFIRMED
+    for step in steps:
+        transition = evaluate_step(step, state, inherited_execution_status=inherited_status)
+        results.append(transition.result)
+        if transition.result.execution_status is ExecutionStatus.BLOCKED:
             break
+        state = transition.state  # type: ignore[assignment]  # no-None: no bloqueado (StepTransition lo garantiza)
+        inherited_status = transition.result.execution_status
     return tuple(results), state

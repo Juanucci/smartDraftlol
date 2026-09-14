@@ -89,9 +89,9 @@ def test_missing_mordekaiser_response_reference_fails_explicitly(darius):
 
 def test_trade_sequence_contains_steps_from_both_actors(registration_candidate):
     spec = registration_candidate.spec_for(Q_ALTERNATIVE_ID)
-    actors = [step.actor for step in spec.sequence.steps]
+    actors = [step.actor for step in spec.steps]
     assert actors == [ActorRole.CANDIDATE, ActorRole.CANDIDATE, ActorRole.ENEMY]
-    step_ids = [step.step_id for step in spec.sequence.steps]
+    step_ids = [step.step_id for step in spec.steps]
     assert step_ids == ["control_apprehend", "followup_decimate", "response_obliterate"]
 
 
@@ -128,7 +128,7 @@ def test_mordekaiser_response_is_hypothetical_by_default(registration_candidate)
     outcome = build_bidirectional_trade_outcome(registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID)
     response_result = next(r for r in outcome.step_results if r.step_id == "response_obliterate")
     assert response_result.execution_status is ExecutionStatus.HYPOTHETICAL
-    assert PreconditionStatus.UNKNOWN in response_result.precondition_statuses
+    assert PreconditionStatus.UNKNOWN in [r.status for r in response_result.precondition_results]
 
 
 def test_mordekaiser_response_blocked_when_apprehend_interrupt_present(registration_candidate):
@@ -180,7 +180,7 @@ def test_apprehend_confirmed_does_not_guarantee_q_outer_zone(registration_candid
         registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=baseline
     )
     followup_result = next(r for r in outcome.step_results if r.step_id == "followup_decimate")
-    assert PreconditionStatus.UNKNOWN in followup_result.precondition_statuses
+    assert PreconditionStatus.UNKNOWN in [r.status for r in followup_result.precondition_results]
     assert outcome.execution_status is not ExecutionStatus.CONFIRMED
 
 
@@ -193,7 +193,7 @@ def test_apprehend_confirmed_does_not_guarantee_response_connects(registration_c
         registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=baseline
     )
     response_result = outcome.step_results[-1]
-    assert PreconditionStatus.UNKNOWN in response_result.precondition_statuses
+    assert PreconditionStatus.UNKNOWN in [r.status for r in response_result.precondition_results]
 
 
 # --- acumulaciones por actor; pasiva no activada antes del umbral ----------
