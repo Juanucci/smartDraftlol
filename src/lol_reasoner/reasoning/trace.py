@@ -19,6 +19,7 @@ from lol_reasoner.domain.enums import (
     Support,
     phase_index,
 )
+from lol_reasoner.reasoning.sequences.sequence import ScenarioOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,16 +61,66 @@ class TraceEntry:
     provenance: Provenance = Provenance.DERIVED  # ver RuleEffect.provenance
 
 
+@dataclass(frozen=True, slots=True)
+class ShadowSequenceRecord:
+    """Diagnóstico de UNA secuencia evaluada en shadow mode (v1.7,
+    primera secuencia real). NUNCA puntuable: no es un `TraceEntry`, no
+    tiene `factor`/`polarity`/`delta`, y ningún consumidor de scoring
+    (`global_score`, `personal_score`, `deduped_for_scoring`,
+    `compute_confidence`) ni el narrador lo leen — viven exclusivamente en
+    `ReasoningTrace.shadow_sequence_outcomes`, un canal separado de
+    `entries`.
+
+    `promoted` es una compuerta explícita, no decorativa: en esta ronda
+    SIEMPRE debe ser `False` (una secuencia en shadow mode no puede
+    reclamar cobertura puntuable) — `__post_init__` lo hace cumplir. El
+    día que exista un mecanismo de promoción real, ese código deberá
+    tocar este tipo deliberadamente; hasta entonces, no hay forma de
+    construir un registro "promovido" por accidente.
+    """
+
+    matchup_id: str  # p. ej. "darius_vs_mordekaiser" — identifica el par, no la orientación
+    sequence_id: str
+    outcome: ScenarioOutcome
+    promoted: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.matchup_id, str) or not self.matchup_id.strip():
+            raise ValueError(f"ShadowSequenceRecord.matchup_id no puede ser vacío (recibido {self.matchup_id!r})")
+        if not isinstance(self.sequence_id, str) or not self.sequence_id.strip():
+            raise ValueError(f"ShadowSequenceRecord.sequence_id no puede ser vacío (recibido {self.sequence_id!r})")
+        if not isinstance(self.outcome, ScenarioOutcome):
+            raise TypeError(f"ShadowSequenceRecord.outcome debe ser ScenarioOutcome, no {self.outcome!r}")
+        if self.promoted is not False:
+            raise ValueError(
+                "ShadowSequenceRecord.promoted debe ser False en esta ronda — no existe todavía "
+                "ningún mecanismo de promoción a puntuable"
+            )
+
+
 @dataclass(slots=True)
 class ReasoningTrace:
-    """Log append-only de una evaluación candidato-vs-enemigo."""
+    """Log append-only de una evaluación candidato-vs-enemigo.
+
+    `shadow_sequence_outcomes` (v1.7) es un canal SEPARADO de `entries`,
+    exclusivamente para diagnóstico de secuencias en shadow mode — ningún
+    método de esta clase que alimenta scoring (`for_phase`, `for_factor`,
+    `for_polarity`, `categories`, `deduped_for_scoring`) lo lee ni lo va a
+    leer nunca: son dos listas independientes a propósito, para que
+    adjuntar un diagnóstico shadow no pueda confundirse con agregar una
+    entrada puntuable.
+    """
 
     candidate_id: str
     enemy_id: str
     entries: list[TraceEntry] = field(default_factory=list)
+    shadow_sequence_outcomes: list[ShadowSequenceRecord] = field(default_factory=list)
 
     def add(self, entry: TraceEntry) -> None:
         self.entries.append(entry)
+
+    def add_shadow_sequence_outcome(self, record: ShadowSequenceRecord) -> None:
+        self.shadow_sequence_outcomes.append(record)
 
     def for_phase(self, phase: Phase) -> list[TraceEntry]:
         return [e for e in self.entries if e.phase == phase]
