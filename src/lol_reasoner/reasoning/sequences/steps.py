@@ -75,6 +75,13 @@ class ActorRole(str, Enum):
 # Identidad mecánica estructural
 # ---------------------------------------------------------------------------
 
+# Componente reservado para un efecto sin partes distinguibles — nunca un
+# string mágico repetido en código/tests. Un efecto sin partes NO usa
+# `None` (ver docs/design/v1.7-sequence-state-design.md §B.3, endurecido en
+# Etapa 2): usa esta constante, explícita e inequívoca. No introducir
+# sinónimos ("full"/"entire"/"all"): un solo nombre para un solo concepto.
+WHOLE_EFFECT_COMPONENT = "whole"
+
 
 @dataclass(frozen=True, slots=True)
 class EffectIdentity:
@@ -86,18 +93,28 @@ class EffectIdentity:
     doble conteo o pérdida de matiz semántico.
 
     Los tres campos son texto explícito, no vacío — nada de esto se infiere
-    ni se normaliza. Sin mappings internos: es hashable y usable como
-    elemento de un `frozenset`/clave de deduplicación futura.
+    ni se normaliza. Un efecto sin partes distinguibles declara
+    `component=WHOLE_EFFECT_COMPONENT`, nunca `None` ni un sinónimo ad hoc.
+    Sin mappings internos: es hashable y usable como elemento de un
+    `frozenset`/clave de deduplicación futura.
     """
 
     fact_ref: str  # referencia estable al hecho/efecto (ability_id, effect_id, o equivalente)
     causal_role: str  # p. ej. "damage", "heal", "stack_application", "displacement"
-    component: str  # parte/fase concreta del efecto (p. ej. "blade", "handle", "whole")
+    component: str  # parte/fase concreta del efecto, o WHOLE_EFFECT_COMPONENT si no aplica
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.fact_ref, field_name="EffectIdentity.fact_ref")
         _require_nonempty_string(self.causal_role, field_name="EffectIdentity.causal_role")
         _require_nonempty_string(self.component, field_name="EffectIdentity.component")
+
+
+def _effect_identity_to_primitive(identity: EffectIdentity) -> dict[str, object]:
+    return {
+        "fact_ref": identity.fact_ref,
+        "causal_role": identity.causal_role,
+        "component": identity.component,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -215,3 +232,19 @@ class SequenceStep:
                 )
         if len(set(self.consumes)) != len(self.consumes):
             raise ValueError(f"SequenceStep.consumes tiene EffectIdentity duplicadas: {self.consumes!r}")
+
+
+def _sequence_step_to_primitive(step: SequenceStep) -> dict[str, object]:
+    """Frontera de serialización para UN paso — sub-parte privada de
+    `sequence.sequence_to_primitive`/`sequence.scenario_outcome_to_primitive`
+    (ver ese módulo para la API pública y el resto de los tipos de
+    secuencia)."""
+
+    return {
+        "step_id": step.step_id,
+        "action_ref": step.action_ref,
+        "actor": step.actor.value,
+        "preconditions": list(step.preconditions),
+        "consumes": [_effect_identity_to_primitive(identity) for identity in step.consumes],
+        "postconditions": list(step.postconditions),
+    }

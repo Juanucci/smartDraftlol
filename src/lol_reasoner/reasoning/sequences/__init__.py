@@ -1,4 +1,4 @@
-"""Tipos de secuencia y resultado (v1.7, Etapa 2).
+"""Tipos de secuencia y resultado (v1.7, Etapa 2 — endurecida).
 
 Solo tipos genéricos, inmutables y sus invariantes — sin secuencias
 concretas, sin motor de transición, sin generador de escenarios, sin
@@ -16,14 +16,20 @@ from lol_reasoner.reasoning.sequences.sequence import (
     Evaluation,
     InteractionSequence,
     ScenarioOutcome,
+    SequenceProgress,
     StateDelta,
     StepResult,
     TerminalEvent,
     TerminalEventKind,
     TradeOutcome,
     chain_support,
+    require_sequence_progress,
+    scenario_outcome_to_primitive,
+    sequence_progress,
+    sequence_to_primitive,
 )
 from lol_reasoner.reasoning.sequences.steps import (
+    WHOLE_EFFECT_COMPONENT,
     ActorRole,
     EffectIdentity,
     PreconditionStatus,
@@ -32,6 +38,7 @@ from lol_reasoner.reasoning.sequences.steps import (
 )
 
 __all__ = [
+    "WHOLE_EFFECT_COMPONENT",
     "ActorRole",
     "AlternativeGroup",
     "CausalComponent",
@@ -40,6 +47,7 @@ __all__ = [
     "InteractionSequence",
     "PreconditionStatus",
     "ScenarioOutcome",
+    "SequenceProgress",
     "SequenceStep",
     "StateDelta",
     "StepResult",
@@ -47,5 +55,9 @@ __all__ = [
     "TerminalEventKind",
     "TradeOutcome",
     "chain_support",
+    "require_sequence_progress",
     "resolve_step_support",
+    "scenario_outcome_to_primitive",
+    "sequence_progress",
+    "sequence_to_primitive",
 ]

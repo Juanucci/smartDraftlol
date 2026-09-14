@@ -25,7 +25,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from lol_reasoner.domain.combat_state import CombatState
+from lol_reasoner.domain.combat_state import CombatState, combat_state_to_primitive
 from lol_reasoner.domain.enums import Factor, Polarity, Provenance, Support
 from lol_reasoner.reasoning.sequences.steps import (
     _SUPPORT_PRIORITY,
@@ -33,7 +33,10 @@ from lol_reasoner.reasoning.sequences.steps import (
     EffectIdentity,
     PreconditionStatus,
     SequenceStep,
+    _effect_identity_to_primitive,
     _require_nonempty_string,
+    _sequence_step_to_primitive,
+    resolve_step_support,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,11 +109,23 @@ class InteractionSequence:
     no dependa de "cuál tiene más precondiciones" ni del orden de
     registro, es un contrato de un mecanismo de selección futuro — este
     tipo solo representa UNA secuencia ya construida.
+
+    **`alternative_id`** (cierre de Etapa 2, §A2): si esta secuencia es UNA
+    alternativa dentro de un `AlternativeGroup` (p. ej. "autoataque" vs "Q"
+    como follow-up de un mismo punto de decisión), declara EXACTAMENTE cuál
+    — nunca solo el grupo entero sin decir cuál de sus miembros es esta
+    secuencia. `alternative_group` y `alternative_id` se declaran juntos o
+    ninguno de los dos, y `alternative_id` debe pertenecer a
+    `alternative_group.alternative_ids`. Esto es lo que permite que
+    `ScenarioOutcome` compruebe, más adelante, que la selección de rama que
+    recibe coincide exactamente con la alternativa que esta secuencia
+    representa — no solo con el grupo.
     """
 
     sequence_id: str
     steps: tuple[SequenceStep, ...]
     alternative_group: AlternativeGroup | None = None
+    alternative_id: str | None = None
     covers_causes: frozenset[EffectIdentity] = field(init=False, default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -135,6 +150,19 @@ class InteractionSequence:
                 f"InteractionSequence.alternative_group debe ser AlternativeGroup o None, no "
                 f"{self.alternative_group!r} ({type(self.alternative_group).__name__})"
             )
+        if (self.alternative_group is None) != (self.alternative_id is None):
+            raise ValueError(
+                "InteractionSequence.alternative_group y alternative_id deben declararse "
+                f"juntos o ninguno de los dos (alternative_group={self.alternative_group!r}, "
+                f"alternative_id={self.alternative_id!r})"
+            )
+        if self.alternative_id is not None:
+            _require_nonempty_string(self.alternative_id, field_name="InteractionSequence.alternative_id")
+            if self.alternative_id not in self.alternative_group.alternative_ids:  # type: ignore[union-attr]
+                raise ValueError(
+                    f"InteractionSequence.alternative_id={self.alternative_id!r} no pertenece a "
+                    f"alternative_group.alternative_ids={self.alternative_group.alternative_ids!r}"  # type: ignore[union-attr]
+                )
 
         derived = frozenset(identity for step in self.steps for identity in step.consumes)
         object.__setattr__(self, "covers_causes", derived)
@@ -147,22 +175,30 @@ class InteractionSequence:
 
 @dataclass(frozen=True, slots=True)
 class StepResult:
-    """Resultado de haber evaluado UN paso: sus precondiciones ya
-    resueltas a `PreconditionStatus`, y el `Support` resultante.
+    """Resultado de haber evaluado UN paso.
 
-    Invariantes reforzadas en el propio tipo (no solo por convención de
-    quien lo construye, ver `resolve_step_support` para la función pura
-    que produce valores coherentes con estas reglas):
-    - alguna precondición `UNSATISFIED` bloquea el paso -> `support` debe
-      ser `None` (no hay soporte de una rama bloqueada);
-    - sin precondiciones `UNSATISFIED`, el paso no está bloqueado ->
-      `support` debe ser un `Support` real, nunca `None`;
-    - alguna precondición `UNKNOWN` nunca permite `Support.STRUCTURAL`.
+    **Una única fuente de verdad para el soporte** (cierre de Etapa 2,
+    §A4): `declared_support` es el ÚNICO dato de entrada — la certeza que
+    tendría este paso SI todas sus precondiciones se sostuvieran (lo que
+    una regla/hecho mecánico declararía en el mejor caso). `effective_support`
+    NUNCA es un dato de entrada — es `field(init=False)`, y se DERIVA en
+    `__post_init__` con la misma función pura `resolve_step_support` que ya
+    aplicaba esta regla (§B.5): imposible pasarlo por `__init__` (lanza
+    `TypeError`, igual que `InteractionSequence.covers_causes`), e
+    imposible que quede contradictorio con `precondition_statuses` — no hay
+    dos fuentes de verdad que puedan desalinearse, solo una función que
+    siempre las resuelve de la misma manera:
+    - alguna precondición `UNSATISFIED` -> `effective_support = None`
+      (paso bloqueado, sin nivel de soporte);
+    - alguna precondición `UNKNOWN` sin bloqueo -> como mucho `CONDITIONED`,
+      nunca `STRUCTURAL`;
+    - sin `UNKNOWN` ni `UNSATISFIED` -> `effective_support = declared_support`.
     """
 
     step_id: str
     precondition_statuses: tuple[PreconditionStatus, ...]
-    support: Support | None
+    declared_support: Support
+    effective_support: Support | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.step_id, field_name="StepResult.step_id")
@@ -172,45 +208,24 @@ class StepResult:
                 f"StepResult.precondition_statuses debe ser tuple, no "
                 f"{type(self.precondition_statuses).__name__}"
             )
-        for status in self.precondition_statuses:
-            if not isinstance(status, PreconditionStatus):
-                raise TypeError(
-                    f"StepResult.precondition_statuses[] debe ser PreconditionStatus, no "
-                    f"{status!r} ({type(status).__name__})"
-                )
 
-        blocked = any(status is PreconditionStatus.UNSATISFIED for status in self.precondition_statuses)
-
-        if self.support is not None and not isinstance(self.support, Support):
-            raise TypeError(
-                f"StepResult.support debe ser Support o None, no {self.support!r} "
-                f"({type(self.support).__name__})"
-            )
-
-        if blocked and self.support is not None:
-            raise ValueError(
-                "StepResult con una precondición UNSATISFIED está bloqueado — no puede "
-                f"declarar support (recibido {self.support!r})"
-            )
-        if not blocked and self.support is None:
-            raise ValueError(
-                "StepResult sin ninguna precondición UNSATISFIED no está bloqueado — debe "
-                "declarar un Support real, no None"
-            )
-
-        has_unknown = any(status is PreconditionStatus.UNKNOWN for status in self.precondition_statuses)
-        if has_unknown and self.support is Support.STRUCTURAL:
-            raise ValueError(
-                "StepResult con una precondición UNKNOWN no puede declarar Support.STRUCTURAL"
-            )
+        # `resolve_step_support` valida tanto `declared_support` como cada
+        # `precondition_statuses[]` (TypeError si el tipo no corresponde) y
+        # es la ÚNICA lógica que decide effective_support — StepResult no
+        # duplica esa decisión, solo la invoca y la fija.
+        effective = resolve_step_support(
+            declared_support=self.declared_support, precondition_statuses=self.precondition_statuses
+        )
+        object.__setattr__(self, "effective_support", effective)
 
 
 def chain_support(step_results: Iterable[StepResult]) -> Support | None:
     """Soporte de una CADENA de pasos ya evaluados: el de su eslabón más
-    débil, nunca un promedio. Si algún paso está bloqueado (`support is
-    None`), toda la cadena queda bloqueada. Usa la misma prioridad
-    explícita que `resolve_step_support` — nunca el orden de declaración
-    accidental de `Support`.
+    débil (por `effective_support`, la única fuente de verdad — nunca
+    `declared_support`), nunca un promedio. Si algún paso está bloqueado
+    (`effective_support is None`), toda la cadena queda bloqueada. Usa la
+    misma prioridad explícita que `resolve_step_support` — nunca el orden
+    de declaración accidental de `Support`.
     """
 
     results = tuple(step_results)
@@ -220,9 +235,78 @@ def chain_support(step_results: Iterable[StepResult]) -> Support | None:
         if not isinstance(result, StepResult):
             raise TypeError(f"chain_support: cada elemento debe ser StepResult, no {result!r}")
 
-    if any(result.support is None for result in results):
+    if any(result.effective_support is None for result in results):
         return None
-    return min((result.support for result in results), key=lambda support: _SUPPORT_PRIORITY[support])
+    return min(
+        (result.effective_support for result in results), key=lambda support: _SUPPORT_PRIORITY[support]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Progreso de una secuencia evaluada: prefijo ordenado, nunca arbitrario
+# ---------------------------------------------------------------------------
+
+
+class SequenceProgress(str, Enum):
+    """Clasificación explícita de cuánto de una `InteractionSequence` fue
+    efectivamente evaluado (cierre de Etapa 2, §A1) — ninguna de las cuatro
+    situaciones se superpone con otra:
+
+    - `NOT_STARTED`: `step_results` vacío. Estructuralmente indistinguible
+      de "bloqueada antes del primer paso" o de un resultado `UNRESOLVED`
+      declarado en `TradeOutcome` — ninguno de los dos produce un
+      `StepResult`, así que no hay dato acá para diferenciarlos; esa
+      distinción, si hace falta, la lleva `TradeOutcome.evaluation`.
+    - `BLOCKED`: el último `StepResult` está bloqueado
+      (`effective_support is None`) — incluso si su cantidad coincide con
+      el total de pasos, un bloqueo nunca es una finalización exitosa.
+    - `COMPLETED`: la cantidad de resultados iguala la cantidad de pasos de
+      la secuencia, y el último no está bloqueado.
+    - `PARTIAL`: cualquier prefijo no vacío que no sea ni `BLOCKED` ni
+      `COMPLETED`.
+    """
+
+    NOT_STARTED = "not_started"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+
+
+def sequence_progress(
+    *, sequence: InteractionSequence, step_results: tuple[StepResult, ...]
+) -> SequenceProgress:
+    """Clasifica el progreso de `step_results` para `sequence` — asume que
+    `step_results` ya es un prefijo válido y ordenado de `sequence.steps`
+    (esa validación estructural vive en `ScenarioOutcome.__post_init__`,
+    que es quien llama a esta función)."""
+
+    if not step_results:
+        return SequenceProgress.NOT_STARTED
+    if step_results[-1].effective_support is None:
+        return SequenceProgress.BLOCKED
+    if len(step_results) == len(sequence.steps):
+        return SequenceProgress.COMPLETED
+    return SequenceProgress.PARTIAL
+
+
+def require_sequence_progress(
+    *, sequence: InteractionSequence, step_results: tuple[StepResult, ...], expected: SequenceProgress
+) -> None:
+    """Guarda pura para un motor/builder futuro que necesite AFIRMAR en qué
+    estado de avance espera encontrar una secuencia evaluada (p. ej. "esto
+    debería estar completo") y fallar explícitamente si no lo está — en vez
+    de asumir en silencio el mejor caso. No es un campo de `ScenarioOutcome`
+    (que deriva `progress` sin intervención del caller, ver
+    `sequence_progress`): es una verificación externa opcional, para quien
+    la necesite."""
+
+    actual = sequence_progress(sequence=sequence, step_results=step_results)
+    if actual is not expected:
+        raise ValueError(
+            f"Se esperaba progreso {expected.value!r} para la secuencia "
+            f"{sequence.sequence_id!r}, pero es {actual.value!r} "
+            f"({len(step_results)}/{len(sequence.steps)} pasos evaluados)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,13 +336,21 @@ class TerminalEventKind(str, Enum):
 @dataclass(frozen=True, slots=True)
 class TerminalEvent:
     """Evento terminal opcional de un trade — nunca un requisito para que
-    exista una `Evaluation`. `KILL` exige declarar qué actor murió; `NONE`
-    (conocido: no hubo muerte) y `UNKNOWN` (no se evaluó) no admiten
-    actor. No hay respawn, bounty ni ninguna otra simulación de muerte acá
-    — solo esta distinción de tres estados."""
+    exista una `Evaluation`. `KILL` exige declarar quién murió, en
+    `killed_actors`; `NONE` (conocido: no hubo muerte) y `UNKNOWN` (no se
+    evaluó) exigen `killed_actors` vacío.
+
+    **Ambos actores muertos es un caso válido** (cierre de Etapa 2, §A3):
+    `killed_actors` es una colección inmutable, no un único actor opcional
+    — permite representar `()`, `(CANDIDATE,)`, `(ENEMY,)` o
+    `(CANDIDATE, ENEMY)` sin ambigüedad, sin repetir un actor, y sin
+    admitir ningún `ActorRole` que no sea `CANDIDATE`/`ENEMY`. No hay
+    respawn, bounty, asistencia, torre ni causa temporal de la muerte acá
+    — solo esta distinción de tres estados con 0/1/2 actores.
+    """
 
     kind: TerminalEventKind = TerminalEventKind.UNKNOWN
-    actor: ActorRole | None = None
+    killed_actors: tuple[ActorRole, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TerminalEventKind):
@@ -266,18 +358,26 @@ class TerminalEvent:
                 f"TerminalEvent.kind debe ser TerminalEventKind, no {self.kind!r} "
                 f"({type(self.kind).__name__})"
             )
-        if self.actor is not None and not isinstance(self.actor, ActorRole):
+        if not isinstance(self.killed_actors, tuple):
             raise TypeError(
-                f"TerminalEvent.actor debe ser ActorRole o None, no {self.actor!r} "
-                f"({type(self.actor).__name__})"
+                f"TerminalEvent.killed_actors debe ser tuple, no {type(self.killed_actors).__name__}"
             )
+        for actor in self.killed_actors:
+            if not isinstance(actor, ActorRole):
+                raise TypeError(
+                    f"TerminalEvent.killed_actors[] debe ser ActorRole, no {actor!r} "
+                    f"({type(actor).__name__})"
+                )
+        if len(set(self.killed_actors)) != len(self.killed_actors):
+            raise ValueError(f"TerminalEvent.killed_actors no puede repetir un actor: {self.killed_actors!r}")
+
         if self.kind is TerminalEventKind.KILL:
-            if self.actor is None:
-                raise ValueError("TerminalEvent.kind == KILL exige declarar `actor`")
-        elif self.actor is not None:
+            if not self.killed_actors:
+                raise ValueError("TerminalEvent.kind == KILL exige al menos un actor en killed_actors")
+        elif self.killed_actors:
             raise ValueError(
-                f"TerminalEvent.kind == {self.kind.value!r} no admite `actor` (recibido "
-                f"{self.actor!r}) — solo KILL declara quién murió"
+                f"TerminalEvent.kind == {self.kind.value!r} no admite killed_actors (recibido "
+                f"{self.killed_actors!r}) — solo KILL declara quién murió"
             )
 
 
@@ -399,17 +499,39 @@ _UNSIGNED_EVALUATIONS = (Evaluation.NEUTRAL, Evaluation.CONDITIONAL, Evaluation.
 @dataclass(frozen=True, slots=True)
 class ScenarioOutcome:
     """Resultado de haber evaluado una `InteractionSequence` contra un
-    escenario: sus resultados por paso, el soporte agregado de la cadena
-    (derivado, `field(init=False)` — nunca declarado a mano), el
+    escenario: sus resultados por paso (un PREFIJO ordenado, nunca un
+    subconjunto arbitrario — ver `progress`), el soporte agregado de la
+    cadena (derivado, `field(init=False)` — nunca declarado a mano), el
     `TradeOutcome` si corresponde, la selección de rama si la secuencia
     pertenece a un `AlternativeGroup`, y los `CausalComponent` que
     produjo, si los produjo.
 
+    **`step_results` debe ser un prefijo ordenado** (cierre de Etapa 2,
+    §A1): si `sequence.steps` es `[p1, p2, p3]`, los únicos
+    `step_results` válidos son `[]`, `[p1]`, `[p1, p2]` o `[p1, p2, p3]`
+    — nunca `[p2]`, `[p1, p3]` ni `[p2, p1]`. Un paso bloqueado
+    (`effective_support is None`) debe ser el ÚLTIMO de la lista: no puede
+    haber un resultado posterior a un bloqueo. `progress` (derivado, ver
+    `SequenceProgress`/`sequence_progress`) clasifica el resultado en
+    `NOT_STARTED`/`PARTIAL`/`BLOCKED`/`COMPLETED`.
+
+    **Coherencia secuencia ↔ selección de rama** (cierre de Etapa 2, §A2):
+    si `sequence` pertenece a un `AlternativeGroup` (`sequence.alternative_group`
+    no `None`), una `branch_selection` ajena (grupo distinto) es inválida,
+    y una secuencia SIN grupo no puede recibir ninguna `branch_selection`
+    (`ValueError` en ambos casos — no son solo restricciones de
+    `causal_components`). Cuando el grupo coincide, `causal_components` solo
+    se admite si `branch_selection.selected_id` coincide EXACTAMENTE con
+    `sequence.alternative_id` — la alternativa de esta secuencia; una
+    alternativa distinta seleccionada, una selección ausente, o una
+    selección irresuelta (`selected_id=None`) nunca producen componentes
+    puntuables para esta secuencia.
+
     Invariantes reforzadas en construcción (diseño §B.10):
     - una rama bloqueada (`support is None`) no puede tener
       `causal_components`;
-    - una selección de rama irresuelta (`branch_selection.selected_id is
-      None`) tampoco puede tenerlos;
+    - una alternativa no confirmada como la seleccionada (ver arriba)
+      tampoco puede tenerlos;
     - solo `Evaluation.CANDIDATE_FAVORED`/`ENEMY_FAVORED` pueden tener
       `CausalComponent` con `polarity` firmada — `NEUTRAL`/`CONDITIONAL`/
       `UNRESOLVED` nunca fuerzan una polaridad.
@@ -423,6 +545,7 @@ class ScenarioOutcome:
     branch_selection: AlternativeGroup | None = None
     causal_components: tuple[CausalComponent, ...] = field(default_factory=tuple)
     support: Support | None = field(init=False, default=None)
+    progress: SequenceProgress = field(init=False, default=None)  # type: ignore[assignment]
 
     __hash__ = None  # type: ignore[assignment]  # puede contener un TradeOutcome no hashable
 
@@ -442,19 +565,41 @@ class ScenarioOutcome:
                     f"ScenarioOutcome.step_results[] debe ser StepResult, no {result!r} "
                     f"({type(result).__name__})"
                 )
-        declared_step_ids = {step.step_id for step in self.sequence.steps}
+
+        # --- §A1: step_results debe ser EXACTAMENTE un prefijo ordenado de
+        # sequence.steps — nunca un subconjunto arbitrario ni un orden
+        # distinto al declarado por la propia secuencia.
+        declared_step_ids = [step.step_id for step in self.sequence.steps]
+        declared_step_id_set = set(declared_step_ids)
+        result_step_ids = [result.step_id for result in self.step_results]
+
         seen_result_ids: set[str] = set()
-        for result in self.step_results:
-            if result.step_id not in declared_step_ids:
+        for step_id in result_step_ids:
+            if step_id not in declared_step_id_set:
                 raise ValueError(
-                    f"ScenarioOutcome.step_results referencia step_id={result.step_id!r}, "
-                    f"que no pertenece a sequence.steps de {self.sequence.sequence_id!r}"
+                    f"ScenarioOutcome.step_results referencia step_id={step_id!r}, que no "
+                    f"pertenece a sequence.steps de {self.sequence.sequence_id!r}"
                 )
-            if result.step_id in seen_result_ids:
+            if step_id in seen_result_ids:
+                raise ValueError(f"ScenarioOutcome.step_results tiene step_id repetido: {step_id!r}")
+            seen_result_ids.add(step_id)
+
+        expected_prefix = declared_step_ids[: len(result_step_ids)]
+        if result_step_ids != expected_prefix:
+            raise ValueError(
+                "ScenarioOutcome.step_results debe formar exactamente el prefijo ordenado "
+                f"{expected_prefix!r} de sequence.steps (derivado del orden declarado en la "
+                f"secuencia, no del orden del caller) — recibido {result_step_ids!r}"
+            )
+
+        for index, result in enumerate(self.step_results):
+            is_last = index == len(self.step_results) - 1
+            if result.effective_support is None and not is_last:
                 raise ValueError(
-                    f"ScenarioOutcome.step_results tiene step_id repetido: {result.step_id!r}"
+                    f"ScenarioOutcome.step_results tiene un StepResult bloqueado "
+                    f"({result.step_id!r}) que no es el último — no puede haber resultados "
+                    "posteriores a un paso bloqueado"
                 )
-            seen_result_ids.add(result.step_id)
 
         if self.trade_outcome is not None and not isinstance(self.trade_outcome, TradeOutcome):
             raise TypeError(
@@ -480,20 +625,45 @@ class ScenarioOutcome:
 
         resolved_support = chain_support(self.step_results) if self.step_results else None
         object.__setattr__(self, "support", resolved_support)
+        object.__setattr__(
+            self, "progress", sequence_progress(sequence=self.sequence, step_results=self.step_results)
+        )
+
+        # --- §A2: coherencia secuencia <-> selección de rama. Estructural
+        # (siempre se rechaza), independiente de si hay causal_components.
+        sequence_group = self.sequence.alternative_group
+        sequence_alt_id = self.sequence.alternative_id
+        selection_confirms_this_alternative = True
+        if sequence_group is None:
+            if self.branch_selection is not None:
+                raise ValueError(
+                    f"ScenarioOutcome.branch_selection fue provista pero la secuencia "
+                    f"{self.sequence.sequence_id!r} no pertenece a ningún AlternativeGroup — "
+                    "no se admite una selección de rama ajena"
+                )
+        else:
+            if self.branch_selection is None:
+                selection_confirms_this_alternative = False
+            else:
+                if self.branch_selection.group_id != sequence_group.group_id:
+                    raise ValueError(
+                        f"ScenarioOutcome.branch_selection.group_id="
+                        f"{self.branch_selection.group_id!r} no coincide con "
+                        f"sequence.alternative_group.group_id={sequence_group.group_id!r}"
+                    )
+                selection_confirms_this_alternative = self.branch_selection.selected_id == sequence_alt_id
 
         blocked = resolved_support is None
         if blocked and self.causal_components:
             raise ValueError(
                 "ScenarioOutcome bloqueado (support=None) no puede tener causal_components"
             )
-        if (
-            self.branch_selection is not None
-            and self.branch_selection.selected_id is None
-            and self.causal_components
-        ):
+        if not selection_confirms_this_alternative and self.causal_components:
             raise ValueError(
-                "ScenarioOutcome con branch_selection irresuelta (selected_id=None) no puede "
-                "tener causal_components"
+                "ScenarioOutcome no puede tener causal_components: la selección de rama no "
+                f"confirma la alternativa de esta secuencia (alternative_id={sequence_alt_id!r}, "
+                f"branch_selection={self.branch_selection!r}) — una alternativa no seleccionada, "
+                "ausente o irresuelta nunca produce componentes puntuables"
             )
         if self.trade_outcome is not None and self.trade_outcome.evaluation in _UNSIGNED_EVALUATIONS:
             if any(component.polarity is not None for component in self.causal_components):
@@ -502,3 +672,140 @@ class ScenarioOutcome:
                     "tener CausalComponent con polaridad firmada — solo CANDIDATE_FAVORED/"
                     "ENEMY_FAVORED pueden tener componentes firmados"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Frontera de serialización explícita (cierre de Etapa 2, §A6)
+# ---------------------------------------------------------------------------
+#
+# Misma razón que `domain.combat_state.combat_state_to_primitive`:
+# `dataclasses.asdict()` no sabe copiar los `MappingProxyType` internos de
+# un `CombatState` (que `StateDelta` referencia), así que tampoco puede
+# usarse sobre ningún tipo de este módulo que lo contenga transitivamente.
+# Esta es la única frontera aprobada para convertir un `ScenarioOutcome` (o
+# una `InteractionSequence` suelta) a datos primitivos JSON-compatibles —
+# pura, no muta nada, construye colecciones NUEVAS (nunca expone la tupla o
+# el frozenset original), y con orden determinista incluso para
+# `covers_causes` (un `frozenset`, cuyo orden de iteración no está
+# garantizado entre procesos — se ordena explícitamente antes de listar).
+# API pública deliberadamente pequeña: dos funciones (`sequence_to_primitive`,
+# `scenario_outcome_to_primitive`); el resto son helpers privados por tipo.
+
+
+def _step_result_to_primitive(result: StepResult) -> dict[str, object]:
+    return {
+        "step_id": result.step_id,
+        "precondition_statuses": [status.value for status in result.precondition_statuses],
+        "declared_support": result.declared_support.value,
+        "effective_support": result.effective_support.value if result.effective_support is not None else None,
+    }
+
+
+def _alternative_group_to_primitive(group: AlternativeGroup) -> dict[str, object]:
+    return {
+        "group_id": group.group_id,
+        "alternative_ids": list(group.alternative_ids),
+        "selected_id": group.selected_id,
+    }
+
+
+def _terminal_event_to_primitive(event: TerminalEvent) -> dict[str, object]:
+    return {
+        "kind": event.kind.value,
+        "killed_actors": [actor.value for actor in event.killed_actors],
+    }
+
+
+def _state_delta_to_primitive(delta: StateDelta) -> dict[str, object]:
+    # Reutiliza combat_state_to_primitive — nunca reimplementa la
+    # conversión de CombatState acá (requisito explícito de §A6).
+    return {
+        "before": combat_state_to_primitive(delta.before),
+        "after": combat_state_to_primitive(delta.after),
+    }
+
+
+def _trade_outcome_to_primitive(trade: TradeOutcome) -> dict[str, object]:
+    return {
+        "state_delta": _state_delta_to_primitive(trade.state_delta),
+        "evaluation": trade.evaluation.value,
+        "terminal_event": _terminal_event_to_primitive(trade.terminal_event),
+    }
+
+
+def _causal_component_to_primitive(component: CausalComponent) -> dict[str, object]:
+    return {
+        "factor": component.factor.value,
+        "delta": component.delta,
+        "provenance": component.provenance.value,
+        "fact_ref": component.fact_ref,
+        "sequence_id": component.sequence_id,
+        "polarity": component.polarity.value if component.polarity is not None else None,
+    }
+
+
+def _sorted_covers_causes_to_primitive(covers_causes: frozenset[EffectIdentity]) -> list[dict[str, object]]:
+    primitives = [_effect_identity_to_primitive(identity) for identity in covers_causes]
+    # Orden determinista explícito: un frozenset no promete orden estable
+    # de iteración entre procesos (hashing de strings puede variar).
+    primitives.sort(key=lambda item: (item["fact_ref"], item["causal_role"], item["component"]))
+    return primitives
+
+
+def sequence_to_primitive(sequence: InteractionSequence) -> dict[str, object]:
+    """Convierte UNA `InteractionSequence` (sin resultados de evaluación)
+    a datos primitivos JSON-compatibles. No muta `sequence` ni expone
+    ninguna referencia mutable hacia sus tuplas/frozenset internos."""
+
+    if not isinstance(sequence, InteractionSequence):
+        raise TypeError(
+            f"sequence_to_primitive espera una InteractionSequence, no {sequence!r} "
+            f"({type(sequence).__name__})"
+        )
+    return {
+        "sequence_id": sequence.sequence_id,
+        "steps": [_sequence_step_to_primitive(step) for step in sequence.steps],
+        "alternative_group": (
+            _alternative_group_to_primitive(sequence.alternative_group)
+            if sequence.alternative_group is not None
+            else None
+        ),
+        "alternative_id": sequence.alternative_id,
+        "covers_causes": _sorted_covers_causes_to_primitive(sequence.covers_causes),
+    }
+
+
+def scenario_outcome_to_primitive(outcome: ScenarioOutcome) -> dict[str, object]:
+    """Convierte un `ScenarioOutcome` completo a datos primitivos
+    JSON-compatibles (`dict`/`list`/`str`/`int`/`float`/`bool`/`None`).
+
+    Esta es la frontera de serialización aprobada para el diagnóstico
+    shadow de una secuencia (una etapa futura, no esta). **No usar
+    `dataclasses.asdict()`** sobre `ScenarioOutcome` ni sobre ningún tipo
+    que contenga, transitivamente, un `CombatState` — no sabe copiar sus
+    `MappingProxyType` internos. No implementa deserialización ni
+    persistencia en disco.
+    """
+
+    if not isinstance(outcome, ScenarioOutcome):
+        raise TypeError(
+            f"scenario_outcome_to_primitive espera un ScenarioOutcome, no {outcome!r} "
+            f"({type(outcome).__name__})"
+        )
+    return {
+        "sequence": sequence_to_primitive(outcome.sequence),
+        "step_results": [_step_result_to_primitive(result) for result in outcome.step_results],
+        "progress": outcome.progress.value,
+        "support": outcome.support.value if outcome.support is not None else None,
+        "trade_outcome": (
+            _trade_outcome_to_primitive(outcome.trade_outcome) if outcome.trade_outcome is not None else None
+        ),
+        "branch_selection": (
+            _alternative_group_to_primitive(outcome.branch_selection)
+            if outcome.branch_selection is not None
+            else None
+        ),
+        "causal_components": [
+            _causal_component_to_primitive(component) for component in outcome.causal_components
+        ],
+    }
