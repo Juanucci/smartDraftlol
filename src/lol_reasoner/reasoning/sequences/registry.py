@@ -121,7 +121,8 @@ class ApprehendFollowupRegistration:
     en UNA orientación concreta: qué rol ocupa Darius, las referencias de
     acción/slot ya resueltas (incluida la de conexión de la zona exterior
     de Q, DISTINTA de la de su rango de casteo), y la `ControlFollowupFamily`
-    (opening + una `GenericSequenceSpec` por alternativa)."""
+    (opening + una `InteractionSequence` por alternativa — `GenericSequenceSpec`
+    ya no existe, ver `generic_sequences.py`)."""
 
     darius_role: ActorRole
     mordekaiser_role: ActorRole

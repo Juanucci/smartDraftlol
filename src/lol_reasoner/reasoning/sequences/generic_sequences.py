@@ -109,6 +109,18 @@ class ControlFollowupFamily:
       `ScenarioOutcome.pending_alternatives` pueda auditar, sobre
       `opening`, qué alternativas seguían disponibles sin tener que
       simular ninguna ni elegir una por defecto.
+
+    **Invariantes cruzadas catálogo↔secuencias** (cierre de hardening
+    §A4): el catálogo declarado (`alternative_ids` del grupo compartido) y
+    las secuencias reales de `alternatives` no pueden divergir —
+    exactamente una secuencia por `alternative_id` del catálogo, nunca
+    duplicadas, nunca una catalogada sin secuencia ni una secuencia con un
+    `alternative_id` ajeno al catálogo. Todos los `sequence_id` (incluido
+    `opening`) son únicos. `opening.steps` debe ser un PREFIJO
+    ESTRUCTURAL ordenado de cada alternativa (comparación campo a campo de
+    cada `SequenceStep` — no solo mismos `step_id`): el tramo compartido
+    tiene que ser literalmente el mismo `declared_support`/precondiciones/
+    postcondiciones/`consumes`, nunca una reconstrucción parecida.
     """
 
     opening: InteractionSequence
@@ -122,7 +134,9 @@ class ControlFollowupFamily:
             raise ValueError("ControlFollowupFamily.opening no puede pertenecer a ningún AlternativeGroup")
         if not isinstance(self.alternatives, tuple) or not self.alternatives:
             raise ValueError("ControlFollowupFamily.alternatives debe ser una tuple no vacía")
+
         first_group: AlternativeGroup | None = None
+        alternative_ids_seen: list[str] = []
         for alt in self.alternatives:
             if not isinstance(alt, InteractionSequence):
                 raise TypeError(f"ControlFollowupFamily.alternatives[] debe ser InteractionSequence, no {alt!r}")
@@ -142,10 +156,64 @@ class ControlFollowupFamily:
                     f"alternative_ids — {alt.sequence_id!r} declara {alt.alternative_group!r}, "
                     f"distinto de {first_group!r}"
                 )
+            alternative_ids_seen.append(alt.alternative_id)  # type: ignore[arg-type]
+
+        # --- §A4: bijección exacta entre el catálogo declarado por el
+        # grupo y las secuencias reales — nunca duplicadas, nunca faltantes,
+        # nunca sobrantes.
+        if len(set(alternative_ids_seen)) != len(alternative_ids_seen):
+            raise ValueError(
+                "ControlFollowupFamily.alternatives tiene secuencias DUPLICADAS para el mismo "
+                f"alternative_id: {alternative_ids_seen!r} — cada alternativa del catálogo debe "
+                "tener EXACTAMENTE una secuencia"
+            )
+        catalog = set(first_group.alternative_ids)  # type: ignore[union-attr]
+        represented = set(alternative_ids_seen)
+        missing = catalog - represented
+        if missing:
+            raise ValueError(
+                f"ControlFollowupFamily: el grupo declara alternative_ids="
+                f"{first_group.alternative_ids!r} pero no hay ninguna secuencia para "  # type: ignore[union-attr]
+                f"{sorted(missing)!r} — toda alternativa catalogada necesita su secuencia"
+            )
+        # Nota: dado que `InteractionSequence` (ronda anterior) ya exige que
+        # `alternative_id` pertenezca a su PROPIO `alternative_group.alternative_ids`,
+        # y arriba ya se exige que TODAS las alternativas compartan el mismo
+        # group_id/alternative_ids, esta rama es hoy inalcanzable de forma
+        # aislada — se conserva por profundidad de defensa, para el día en
+        # que alguna de esas dos guardas cambie.
+        extra = represented - catalog
+        if extra:  # pragma: no cover
+            raise ValueError(
+                f"ControlFollowupFamily: hay secuencias con alternative_id={sorted(extra)!r}, ajeno "
+                f"al catálogo declarado por el grupo ({first_group.alternative_ids!r})"  # type: ignore[union-attr]
+            )
+
+        # --- §A4: sequence_id únicos, incluido opening.
+        all_sequence_ids = [self.opening.sequence_id, *(alt.sequence_id for alt in self.alternatives)]
+        if len(set(all_sequence_ids)) != len(all_sequence_ids):
+            raise ValueError(
+                f"ControlFollowupFamily tiene sequence_id repetidos (incluyendo opening): "
+                f"{all_sequence_ids!r}"
+            )
+
+        # --- §A4: opening.steps debe ser un prefijo ESTRUCTURAL ordenado
+        # de cada alternativa — comparación campo a campo de SequenceStep
+        # (dataclass, igualdad estructural por defecto), no solo step_id.
+        opening_steps = self.opening.steps
+        for alt in self.alternatives:
+            if alt.steps[: len(opening_steps)] != opening_steps:
+                raise ValueError(
+                    f"ControlFollowupFamily.alternatives[{alt.sequence_id!r}].steps no comienza "
+                    "con el mismo prefijo ESTRUCTURAL que opening.steps — el tramo compartido debe "
+                    "ser idéntico campo a campo (declared_support/preconditions/postconditions/"
+                    "consumes), no solo tener los mismos step_id"
+                )
+
         object.__setattr__(
             self,
             "pending_group",
-            AlternativeGroup(group_id=first_group.group_id, alternative_ids=first_group.alternative_ids),
+            AlternativeGroup(group_id=first_group.group_id, alternative_ids=first_group.alternative_ids),  # type: ignore[union-attr]
         )
 
     def spec_for(self, alternative_id: str) -> InteractionSequence:

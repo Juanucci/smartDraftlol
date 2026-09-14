@@ -64,14 +64,34 @@ def _identity(
     return EffectIdentity(fact_ref=fact_ref, causal_role=causal_role, component=component)
 
 
+def _synthetic_precondition(reference: str = "candidate:q") -> StructuralPrecondition:
+    return StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, ActorRole.CANDIDATE, reference)
+
+
+def _preconditions_for(count: int) -> tuple[StructuralPrecondition, ...]:
+    """`count` `StructuralPrecondition` estables — la MISMA fuente que
+    usan tanto `_step()` (para declararlas) como `_result()`/
+    `_blocked_result()` (para evaluarlas), de modo que un `_step(n)` y un
+    `_result(n)` con el mismo `n` sean, por construcción, estructuralmente
+    coherentes (cierre de hardening §A1: `ScenarioOutcome` ahora exige
+    exactamente esto)."""
+
+    return tuple(_synthetic_precondition(f"candidate:ref_{i}") for i in range(count))
+
+
 def _step(
-    step_id: str = "s1", *, consumes: tuple[EffectIdentity, ...] = (), declared_support: Support = Support.STRUCTURAL
+    step_id: str = "s1",
+    *,
+    consumes: tuple[EffectIdentity, ...] = (),
+    declared_support: Support = Support.STRUCTURAL,
+    precondition_count: int = 0,
 ) -> SequenceStep:
     return SequenceStep(
         step_id=step_id,
         action_ref="candidate:q",
         actor=ActorRole.CANDIDATE,
         declared_support=declared_support,
+        preconditions=_preconditions_for(precondition_count),
         consumes=consumes,
     )
 
@@ -80,21 +100,17 @@ def _combat_state(level: int | None = None) -> CombatState:
     return CombatState(candidate=ActorState(level=level), enemy=ActorState())
 
 
-def _synthetic_precondition(reference: str = "candidate:q") -> StructuralPrecondition:
-    return StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, ActorRole.CANDIDATE, reference)
-
-
 def _precondition_results(statuses: tuple[PreconditionStatus, ...]) -> tuple[PreconditionResult, ...]:
     return tuple(
-        PreconditionResult(precondition=_synthetic_precondition(f"candidate:ref_{i}"), status=status)
-        for i, status in enumerate(statuses)
+        PreconditionResult(precondition=precondition, status=status)
+        for precondition, status in zip(_preconditions_for(len(statuses)), statuses, strict=True)
     )
 
 
 def _result(
     step_id: str = "s1",
     *,
-    statuses: tuple[PreconditionStatus, ...] = (PreconditionStatus.SATISFIED,),
+    statuses: tuple[PreconditionStatus, ...] = (),
     declared: Support = Support.STRUCTURAL,
     inherited: ExecutionStatus = ExecutionStatus.CONFIRMED,
 ) -> StepResult:
@@ -556,7 +572,7 @@ def test_favorable_evaluation_can_exist_without_any_death():
 
 
 def test_blocked_outcome_has_no_causal_components():
-    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1", precondition_count=1),))
     blocked_result = _blocked_result("s1")
 
     outcome = ScenarioOutcome(sequence=seq, step_results=(blocked_result,))
@@ -566,7 +582,7 @@ def test_blocked_outcome_has_no_causal_components():
 
 
 def test_blocked_outcome_rejects_explicit_causal_components():
-    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1", precondition_count=1),))
     blocked_result = _blocked_result("s1")
     component = _causal_component("seq")
 
@@ -596,7 +612,7 @@ def test_unresolved_branch_selection_rejects_causal_components():
 
 
 def test_ambiguous_outcome_never_carries_structural_support():
-    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1", precondition_count=1, declared_support=Support.AMBIGUOUS),))
     unknown_result = _result("s1", statuses=(PreconditionStatus.UNKNOWN,), declared=Support.AMBIGUOUS)
 
     outcome = ScenarioOutcome(sequence=seq, step_results=(unknown_result,))
@@ -796,7 +812,10 @@ def test_a1_reversed_order_is_rejected():
 
 
 def test_a1_result_after_blocked_step_is_rejected():
-    seq = _three_step_sequence()
+    seq = InteractionSequence(
+        sequence_id="seq3",
+        steps=(_step("paso_1"), _step("paso_2", precondition_count=1), _step("paso_3")),
+    )
     with pytest.raises(ValueError):
         ScenarioOutcome(
             sequence=seq, step_results=(_result("paso_1"), _blocked_result("paso_2"), _result("paso_3"))
@@ -840,7 +859,9 @@ def test_a1_not_started_progress_for_empty_step_results():
 def test_a1_blocked_progress_even_when_length_matches_total_steps():
     # bloqueada en el último paso: no es "completada" pese a tener la
     # misma cantidad de resultados que pasos tiene la secuencia.
-    seq = InteractionSequence(sequence_id="seq2", steps=(_step("paso_1"), _step("paso_2")))
+    seq = InteractionSequence(
+        sequence_id="seq2", steps=(_step("paso_1"), _step("paso_2", precondition_count=1))
+    )
     results = (_result("paso_1"), _blocked_result("paso_2"))
 
     outcome = ScenarioOutcome(sequence=seq, step_results=results)
@@ -1174,7 +1195,14 @@ def test_serialized_precondition_result_identifies_its_condition():
         precondition_results=(PreconditionResult(precondition=precondition, status=PreconditionStatus.UNSATISFIED),),
         declared_support=Support.STRUCTURAL,
     )
-    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(precondition,),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
     outcome = ScenarioOutcome(sequence=seq, step_results=(result,))
 
     primitive = scenario_outcome_to_primitive(outcome)
@@ -1225,7 +1253,7 @@ def test_step_result_rejects_blocked_as_an_inherited_execution_status():
 
 def test_serialized_step_result_exposes_all_three_execution_status_layers():
     result = _result("s1", statuses=(PreconditionStatus.SATISFIED,), inherited=ExecutionStatus.HYPOTHETICAL)
-    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1"),))
+    seq = InteractionSequence(sequence_id="seq", steps=(_step("s1", precondition_count=1),))
     outcome = ScenarioOutcome(sequence=seq, step_results=(result,))
 
     primitive = scenario_outcome_to_primitive(outcome)["step_results"][0]
@@ -1240,3 +1268,254 @@ def test_chain_execution_status_still_works_with_inherited_results():
     inherited_weak = _result("s2", statuses=(PreconditionStatus.SATISFIED,), inherited=ExecutionStatus.HYPOTHETICAL)
 
     assert chain_execution_status((strong, inherited_weak)) is ExecutionStatus.HYPOTHETICAL
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — §A1: coherencia estructural SequenceStep <-> StepResult
+# ---------------------------------------------------------------------------
+
+
+def test_a1_positive_matching_declared_support_and_preconditions_is_accepted():
+    precondition = _synthetic_precondition("candidate:ref_x")
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.CONDITIONED,
+        preconditions=(precondition,),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    result = StepResult(
+        step_id="s1",
+        precondition_results=(PreconditionResult(precondition=precondition, status=PreconditionStatus.SATISFIED),),
+        declared_support=Support.CONDITIONED,
+    )
+
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,))
+    assert outcome.step_results[0].declared_support is Support.CONDITIONED
+
+
+def test_a1_mismatched_declared_support_is_rejected():
+    step = _step("s1", declared_support=Support.STRUCTURAL)
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    # el StepResult declara CONDITIONED, distinto del STRUCTURAL del SequenceStep
+    result = _result("s1", declared=Support.CONDITIONED)
+
+    with pytest.raises(ValueError, match="declared_support"):
+        ScenarioOutcome(sequence=seq, step_results=(result,))
+
+
+def test_a1_omitted_precondition_is_rejected():
+    precondition = _synthetic_precondition("candidate:ref_x")
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(precondition,),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    # el StepResult no evaluó NINGUNA precondición — la declarada por el paso se omitió
+    result = _result("s1")
+
+    with pytest.raises(ValueError, match="precondici"):
+        ScenarioOutcome(sequence=seq, step_results=(result,))
+
+
+def test_a1_added_precondition_not_declared_by_the_step_is_rejected():
+    step = _step("s1")  # sin precondiciones declaradas
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    # el StepResult evaluó UNA precondición que el SequenceStep nunca declaró
+    result = _result("s1", statuses=(PreconditionStatus.SATISFIED,))
+
+    with pytest.raises(ValueError, match="precondici"):
+        ScenarioOutcome(sequence=seq, step_results=(result,))
+
+
+def test_a1_replaced_precondition_with_different_reference_is_rejected():
+    declared_precondition = _synthetic_precondition("candidate:real_ref")
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(declared_precondition,),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    # el StepResult evaluó una StructuralPrecondition con OTRA reference —
+    # misma cantidad, pero no la misma condición.
+    swapped_precondition = _synthetic_precondition("candidate:otra_ref")
+    result = StepResult(
+        step_id="s1",
+        precondition_results=(PreconditionResult(precondition=swapped_precondition, status=PreconditionStatus.SATISFIED),),
+        declared_support=Support.STRUCTURAL,
+    )
+
+    with pytest.raises(ValueError, match="precondici"):
+        ScenarioOutcome(sequence=seq, step_results=(result,))
+
+
+def test_a1_reordered_preconditions_is_rejected():
+    precondition_a = _synthetic_precondition("candidate:ref_a")
+    precondition_b = _synthetic_precondition("candidate:ref_b")
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(precondition_a, precondition_b),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    # mismas dos condiciones, pero evaluadas en el orden INVERSO al declarado
+    result = StepResult(
+        step_id="s1",
+        precondition_results=(
+            PreconditionResult(precondition=precondition_b, status=PreconditionStatus.SATISFIED),
+            PreconditionResult(precondition=precondition_a, status=PreconditionStatus.SATISFIED),
+        ),
+        declared_support=Support.STRUCTURAL,
+    )
+
+    with pytest.raises(ValueError, match="precondici"):
+        ScenarioOutcome(sequence=seq, step_results=(result,))
+
+
+def test_a1_structural_equality_not_object_identity_is_what_matters():
+    # dos instancias DISTINTAS de StructuralPrecondition con los mismos
+    # valores deben considerarse la MISMA condición — la comparación es
+    # estructural, nunca por identidad de objeto en memoria.
+    step_precondition = StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, ActorRole.CANDIDATE, "candidate:q")
+    result_precondition = StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, ActorRole.CANDIDATE, "candidate:q")
+    assert step_precondition is not result_precondition  # instancias distintas...
+    assert step_precondition == result_precondition  # ...pero estructuralmente iguales
+
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(step_precondition,),
+    )
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    result = StepResult(
+        step_id="s1",
+        precondition_results=(PreconditionResult(precondition=result_precondition, status=PreconditionStatus.SATISFIED),),
+        declared_support=Support.STRUCTURAL,
+    )
+
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,))  # no debe lanzar
+    assert outcome.step_results[0].precondition_results[0].precondition == step_precondition
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — §A2: causalidad CONFIRMADA como invariante del modelo
+# ---------------------------------------------------------------------------
+
+
+def _confirmed_seq_and_result(sequence_id: str = "seq", step_id: str = "s1"):
+    seq = InteractionSequence(sequence_id=sequence_id, steps=(_step(step_id),))
+    result = _result(step_id)  # sin precondiciones -> CONFIRMED por defecto
+    return seq, result
+
+
+def test_a2_confirmed_execution_can_carry_an_uncalibrated_causal_component():
+    seq, result = _confirmed_seq_and_result()
+    component = CausalComponent(
+        factor=Factor.STACKING_PAYOFF,
+        calibration_status=CalibrationStatus.UNCALIBRATED,
+        delta=None,
+        provenance=Provenance.DERIVED,
+        fact_ref="synthetic:q",
+        sequence_id="seq",
+    )
+
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,), causal_components=(component,))
+    assert outcome.execution_status is ExecutionStatus.CONFIRMED
+    assert outcome.causal_components == (component,)
+
+
+def test_a2_hypothetical_execution_rejects_causal_components_at_construction():
+    step = _step("s1", precondition_count=1)
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    hypothetical_result = _result("s1", statuses=(PreconditionStatus.UNKNOWN,))
+    component = _causal_component("seq")
+
+    with pytest.raises(ValueError, match="CONFIRMED"):
+        ScenarioOutcome(sequence=seq, step_results=(hypothetical_result,), causal_components=(component,))
+
+
+def test_a2_blocked_execution_rejects_causal_components_at_construction():
+    step = _step("s1", precondition_count=1)
+    seq = InteractionSequence(sequence_id="seq", steps=(step,))
+    component = _causal_component("seq")
+
+    with pytest.raises(ValueError, match="CONFIRMED"):
+        ScenarioOutcome(sequence=seq, step_results=(_blocked_result("s1"),), causal_components=(component,))
+
+
+def test_a2_no_evaluated_results_rejects_causal_components():
+    seq, _ = _confirmed_seq_and_result()
+    component = _causal_component("seq")
+
+    with pytest.raises(ValueError, match="CONFIRMED"):
+        ScenarioOutcome(sequence=seq, step_results=(), causal_components=(component,))
+
+
+def test_a2_causal_component_with_a_foreign_sequence_id_is_rejected():
+    seq, result = _confirmed_seq_and_result(sequence_id="seq_real")
+    foreign_component = _causal_component("seq_otra")  # sequence_id distinto del outcome
+
+    with pytest.raises(ValueError, match="sequence_id"):
+        ScenarioOutcome(sequence=seq, step_results=(result,), causal_components=(foreign_component,))
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — §A3: branch_selection/pending_alternatives excluyentes
+# ---------------------------------------------------------------------------
+
+
+def test_a3_branch_selection_and_pending_alternatives_cannot_coexist():
+    seq, result = _confirmed_seq_and_result()
+    branch_selection = AlternativeGroup(group_id="g", alternative_ids=("aa", "q"), selected_id="q")
+    pending = AlternativeGroup(group_id="g", alternative_ids=("aa", "q"))
+
+    with pytest.raises(ValueError, match="pending_alternatives"):
+        ScenarioOutcome(
+            sequence=seq, step_results=(result,), branch_selection=branch_selection, pending_alternatives=pending
+        )
+
+
+def test_a3_unresolved_opening_with_pending_alternatives_remains_valid():
+    # sigue siendo válido: opening SIN grupo propio, con pending_alternatives
+    # declarando la decisión pendiente y NINGUNA seleccionada.
+    seq, result = _confirmed_seq_and_result()
+    pending = AlternativeGroup(group_id="g_followup", alternative_ids=("aa", "q"))
+
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,), pending_alternatives=pending)
+    assert outcome.branch_selection is None
+    assert outcome.pending_alternatives.selected_id is None
+
+
+def test_a3_branch_selection_with_same_group_id_but_different_catalog_is_rejected():
+    group = AlternativeGroup(group_id="g_followup", alternative_ids=("aa", "q"))
+    seq = InteractionSequence(
+        sequence_id="seq_q", steps=(_step("s1"),), alternative_group=group, alternative_id="q"
+    )
+    result = _result("s1")
+    # mismo group_id, pero un catálogo de alternativas DISTINTO (agrega "w")
+    divergent_selection = AlternativeGroup(group_id="g_followup", alternative_ids=("aa", "q", "w"), selected_id="q")
+
+    with pytest.raises(ValueError, match="alternative_ids"):
+        ScenarioOutcome(sequence=seq, step_results=(result,), branch_selection=divergent_selection)
+
+
+def test_a3_branch_selection_with_matching_group_and_catalog_is_accepted():
+    group = AlternativeGroup(group_id="g_followup", alternative_ids=("aa", "q"))
+    seq = InteractionSequence(
+        sequence_id="seq_q", steps=(_step("s1"),), alternative_group=group, alternative_id="q"
+    )
+    result = _result("s1")
+    matching_selection = AlternativeGroup(group_id="g_followup", alternative_ids=("aa", "q"), selected_id="q")
+
+    outcome = ScenarioOutcome(sequence=seq, step_results=(result,), branch_selection=matching_selection)
+    assert outcome.branch_selection.selected_id == "q"

@@ -839,6 +839,34 @@ class ScenarioOutcome:
                     "posteriores a un paso bloqueado"
                 )
 
+            # --- Cierre de hardening §A1: StepResult debe describir
+            # EXACTAMENTE el SequenceStep que le corresponde (mismo índice,
+            # ya garantizado prefijo-ordenado arriba) — nunca un
+            # declared_support distinto ni una secuencia de precondiciones
+            # evaluadas que omita, agregue, reemplace o reordene una
+            # condición realmente declarada. Comparación ESTRUCTURAL (los
+            # dataclasses de steps.py comparan campo a campo, no por
+            # identidad de objeto en memoria) — dos StructuralPrecondition
+            # con los mismos valores son iguales aunque sean instancias
+            # distintas.
+            declared_step = self.sequence.steps[index]
+            if result.declared_support != declared_step.declared_support:
+                raise ValueError(
+                    f"ScenarioOutcome.step_results[{index}] ({result.step_id!r}) declara "
+                    f"declared_support={result.declared_support!r}, pero "
+                    f"sequence.steps[{index}].declared_support={declared_step.declared_support!r} "
+                    "— un StepResult no puede divergir del SequenceStep que evaluó"
+                )
+            evaluated_preconditions = tuple(item.precondition for item in result.precondition_results)
+            if evaluated_preconditions != declared_step.preconditions:
+                raise ValueError(
+                    f"ScenarioOutcome.step_results[{index}] ({result.step_id!r}) evaluó "
+                    f"precondiciones {evaluated_preconditions!r}, distintas (omitidas, agregadas, "
+                    f"reemplazadas o reordenadas) de las declaradas por sequence.steps[{index}]: "
+                    f"{declared_step.preconditions!r} — un StepResult debe evaluar EXACTAMENTE las "
+                    "precondiciones que su SequenceStep declara, en el mismo orden"
+                )
+
         if self.trade_outcome is not None and not isinstance(self.trade_outcome, TradeOutcome):
             raise TypeError(
                 f"ScenarioOutcome.trade_outcome debe ser TradeOutcome o None, no "
@@ -861,6 +889,18 @@ class ScenarioOutcome:
                     f"pendiente — su selected_id debe ser None (recibido "
                     f"{self.pending_alternatives.selected_id!r}); una alternativa ya confirmada "
                     "pertenece a branch_selection, no a pending_alternatives"
+                )
+            # --- Cierre de hardening §A3: no pueden coexistir. Una
+            # selección YA CONFIRMADA (branch_selection) y una declaración
+            # de alternativas TODAVÍA pendientes (pending_alternatives)
+            # describen estados mutuamente excluyentes del mismo punto de
+            # decisión — nunca los dos a la vez sobre el mismo outcome.
+            if self.branch_selection is not None:
+                raise ValueError(
+                    "ScenarioOutcome.branch_selection y pending_alternatives no pueden coexistir "
+                    f"(branch_selection={self.branch_selection!r}, "
+                    f"pending_alternatives={self.pending_alternatives!r}) — una selección ya "
+                    "confirmada y un punto de decisión todavía pendiente son estados excluyentes"
                 )
         if not isinstance(self.causal_components, tuple):
             raise TypeError(
@@ -907,13 +947,22 @@ class ScenarioOutcome:
                         f"{self.branch_selection.group_id!r} no coincide con "
                         f"sequence.alternative_group.group_id={sequence_group.group_id!r}"
                     )
+                # --- Cierre de hardening §A3: mismo group_id no alcanza —
+                # el CATÁLOGO completo de alternativas también debe
+                # coincidir. Una selección con el mismo group_id pero un
+                # catálogo distinto (alternativas agregadas/quitadas/
+                # renombradas) describiría un grupo distinto que solo
+                # coincide en el nombre.
+                if self.branch_selection.alternative_ids != sequence_group.alternative_ids:
+                    raise ValueError(
+                        f"ScenarioOutcome.branch_selection.alternative_ids="
+                        f"{self.branch_selection.alternative_ids!r} no coincide con "
+                        "sequence.alternative_group.alternative_ids="
+                        f"{sequence_group.alternative_ids!r} (mismo group_id="
+                        f"{sequence_group.group_id!r}, catálogo de alternativas distinto)"
+                    )
                 selection_confirms_this_alternative = self.branch_selection.selected_id == sequence_alt_id
 
-        blocked = resolved_support is None
-        if blocked and self.causal_components:
-            raise ValueError(
-                "ScenarioOutcome bloqueado (support=None) no puede tener causal_components"
-            )
         if not selection_confirms_this_alternative and self.causal_components:
             raise ValueError(
                 "ScenarioOutcome no puede tener causal_components: la selección de rama no "
@@ -921,6 +970,29 @@ class ScenarioOutcome:
                 f"branch_selection={self.branch_selection!r}) — una alternativa no seleccionada, "
                 "ausente o irresuelta nunca produce componentes puntuables"
             )
+        # --- Cierre de hardening §A2: la causalidad CONFIRMADA es una
+        # invariante del MODELO, no solo una precaución de shadow.py. Un
+        # ScenarioOutcome construido a mano no puede llevar
+        # causal_components salvo que execution_status sea EXACTAMENTE
+        # CONFIRMED (nunca HYPOTHETICAL/BLOCKED, y nunca None — que es lo
+        # que vale cuando no hay ningún resultado evaluado), y cada
+        # componente debe referenciar EXACTAMENTE esta secuencia.
+        if self.causal_components:
+            if self.execution_status is not ExecutionStatus.CONFIRMED:
+                raise ValueError(
+                    "ScenarioOutcome.causal_components requiere execution_status CONFIRMED — "
+                    f"recibido {self.execution_status!r} (None significa que no hay ningún "
+                    "resultado evaluado); una ejecución HYPOTHETICAL o BLOCKED nunca materializa "
+                    "un componente causal — es una invariante del modelo, no solo del builder shadow"
+                )
+            for component in self.causal_components:
+                if component.sequence_id != self.sequence.sequence_id:
+                    raise ValueError(
+                        f"ScenarioOutcome.causal_components[].sequence_id={component.sequence_id!r} "
+                        f"no coincide con sequence.sequence_id={self.sequence.sequence_id!r} — un "
+                        "componente causal no puede atribuirse a una secuencia distinta de la que "
+                        "produjo este outcome"
+                    )
         if self.trade_outcome is not None and self.trade_outcome.evaluation in _UNSIGNED_EVALUATIONS:
             if any(component.polarity is not None for component in self.causal_components):
                 raise ValueError(
