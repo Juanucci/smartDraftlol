@@ -15,16 +15,18 @@ POSTCONDICIONAL aplica si el paso no queda bloqueado
 `SequenceStep` a propósito — no reabre su API pública de Etapa 2 (no
 agrega campos ni cambia sus invariantes).
 
-**Vocabulario genérico, no ad hoc**: los dos tipos de precondición/
+**Vocabulario genérico, no ad hoc**: los tipos de precondición/
 postcondición que este módulo sabe resolver leen/escriben exclusivamente
 campos que YA existen en `domain.combat_state` (`RangeStatus`,
-`AbilityAvailability`, `StackState`) — ningún campo nuevo, ninguna
-simulación de tiempo, ninguna probabilidad. Una clave ausente en el
-`CombatState` es `PreconditionStatus.UNKNOWN` (no observada), nunca se
-infiere `SATISFIED`/`UNSATISFIED` a partir de su ausencia. Cada
-`StructuralPrecondition` se liga a UNA acción concreta (`reference`) —
-nunca un booleano global: estar en rango de un autoataque no dice nada
-del `reference`, distinto, de la zona exterior de otra habilidad.
+`AbilityAvailability`, `InvalidatorStatus`, `StackState`) — ningún campo
+nuevo, ninguna simulación de tiempo, ninguna probabilidad. Una clave
+ausente en el `CombatState` es `PreconditionStatus.UNKNOWN` (no
+observada), nunca se infiere `SATISFIED`/`UNSATISFIED` a partir de su
+ausencia. Cada `StructuralPrecondition` se liga a UNA acción/invalidador
+concreto (`reference`) — nunca un booleano global: estar en rango de un
+autoataque no dice nada del `reference`, distinto, de la zona exterior de
+otra habilidad, y un invalidador ausente para una acción no se infiere de
+que otra acción haya conectado.
 
 **Snapshot nuevo, nunca mutado in-place**: `evaluate_step`/
 `evaluate_sequence_prefix` jamás modifican el `CombatState` recibido —
@@ -44,7 +46,9 @@ from lol_reasoner.domain.combat_state import (
     AbilityState,
     ActorState,
     CombatState,
+    InvalidatorStatus,
     RangeStatus,
+    RewardState,
     StackState,
     StackWindow,
 )
@@ -59,7 +63,7 @@ from lol_reasoner.reasoning.sequences.steps import ActorRole, SequenceStep
 
 class PreconditionCheckKind(str, Enum):
     """Hechos estructurales que este evaluador sabe leer de un
-    `CombatState` — ninguno nombra una mecánica concreta; ambos ya
+    `CombatState` — ninguno nombra una mecánica concreta; los tres ya
     existen en `domain.combat_state`.
 
     `ACTION_CONNECTS` (antes `ACTION_IN_RANGE`, renombrado en el microfix
@@ -67,20 +71,27 @@ class PreconditionCheckKind(str, Enum):
     `StructuralPrecondition` de este tipo se liga a un `reference`
     (`action_ref`) DISTINTO por acción/zona — alcance de autoataque,
     impacto de un desplazamiento, o la zona exterior específica de una
-    habilidad de dos zonas son entradas INDEPENDIENTES de
+    habilidad de dos zonas son tres entradas INDEPENDIENTES de
     `SharedContext.action_contexts`, nunca inferidas una de otra. Que el
     action_ref de un desplazamiento esté `IN_RANGE` no dice nada sobre el
-    action_ref, distinto, de la zona exterior de otra habilidad."""
+    action_ref, distinto, de la zona exterior de otra habilidad.
+
+    `INVALIDATOR_ABSENT` (trade bidireccional): un control/desplazamiento
+    NO bloquea automáticamente una acción posterior — solo lo hace si un
+    invalidador CONCRETO de esa acción está `PRESENT`, reusando el
+    tri-estado `InvalidatorStatus` ya existente en `ActionContext`."""
 
     ACTION_CONNECTS = "action_connects"  # SharedContext.action_contexts[reference].range_status
     ABILITY_READY = "ability_ready"  # ActorState.abilities[reference].availability
+    INVALIDATOR_ABSENT = "invalidator_absent"  # SharedContext.action_contexts[reference].invalidators[invalidator_key]
 
 
 @dataclass(frozen=True, slots=True)
 class StructuralPrecondition:
     kind: PreconditionCheckKind
     actor: ActorRole
-    reference: str  # action_ref (ACTION_CONNECTS) o slot dentro de `abilities` (ABILITY_READY)
+    reference: str  # action_ref (ACTION_CONNECTS/INVALIDATOR_ABSENT) o slot de `abilities` (ABILITY_READY)
+    invalidator_key: str | None = None  # SOLO para INVALIDATOR_ABSENT: qué invalidador de `reference` consultar
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, PreconditionCheckKind):
@@ -89,6 +100,17 @@ class StructuralPrecondition:
             raise TypeError(f"StructuralPrecondition.actor debe ser ActorRole, no {self.actor!r}")
         if not isinstance(self.reference, str) or not self.reference.strip():
             raise ValueError(f"StructuralPrecondition.reference no puede ser vacío (recibido {self.reference!r})")
+        if self.kind is PreconditionCheckKind.INVALIDATOR_ABSENT:
+            if not isinstance(self.invalidator_key, str) or not self.invalidator_key.strip():
+                raise ValueError(
+                    "StructuralPrecondition.invalidator_key es obligatorio y no vacío cuando "
+                    f"kind == INVALIDATOR_ABSENT (recibido {self.invalidator_key!r})"
+                )
+        elif self.invalidator_key is not None:
+            raise ValueError(
+                f"StructuralPrecondition.invalidator_key solo aplica a INVALIDATOR_ABSENT, no a "
+                f"{self.kind!r} (recibido {self.invalidator_key!r})"
+            )
 
 
 class PostconditionEffectKind(str, Enum):
@@ -97,7 +119,7 @@ class PostconditionEffectKind(str, Enum):
     campos ya existentes a otro de sus propios valores cualitativos."""
 
     ABILITY_ON_COOLDOWN = "ability_on_cooldown"  # ActorState.abilities[reference] -> ON_COOLDOWN
-    STACK_APPLIED = "stack_applied"  # ActorState.stacks[reference] -> una aplicación más
+    STACK_APPLIED = "stack_applied"  # ActorState.stacks[reference] -> una aplicación más (± reward)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +127,16 @@ class StructuralPostcondition:
     kind: PostconditionEffectKind
     actor: ActorRole  # a quién se le aplica — el OBJETIVO, no necesariamente quien actúa
     reference: str  # slot dentro de `abilities`, o clave dentro de `stacks`
+    # SOLO para STACK_APPLIED: umbral de la StackingMechanic que `reference`
+    # alimenta. Si se alcanza o supera con esta aplicación, activa
+    # `RewardState.ACTIVE` (trade bidireccional, §4: "activá el reward...
+    # si alcanza el umbral"); si no se alcanza, dice `RewardState.INACTIVE`
+    # (un hecho CONOCIDO, no una omisión); si el conteo previo es
+    # desconocido, no puede saberse si se cruzó — se preserva el
+    # `reward_state` anterior sin inventar nada. `None` = esta aplicación
+    # no modela lógica de umbral (p. ej. Hemorrhage en esta ronda, cuyo
+    # umbral de 5 queda fuera de alcance — "no llegues a cinco cargas").
+    threshold: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, PostconditionEffectKind):
@@ -113,6 +145,17 @@ class StructuralPostcondition:
             raise TypeError(f"StructuralPostcondition.actor debe ser ActorRole, no {self.actor!r}")
         if not isinstance(self.reference, str) or not self.reference.strip():
             raise ValueError(f"StructuralPostcondition.reference no puede ser vacío (recibido {self.reference!r})")
+        if self.threshold is not None:
+            if self.kind is not PostconditionEffectKind.STACK_APPLIED:
+                raise ValueError(
+                    f"StructuralPostcondition.threshold solo aplica a STACK_APPLIED, no a "
+                    f"{self.kind!r} (recibido {self.threshold!r})"
+                )
+            if isinstance(self.threshold, bool) or not isinstance(self.threshold, int) or self.threshold <= 0:
+                raise ValueError(
+                    f"StructuralPostcondition.threshold debe ser un int positivo real, no "
+                    f"{self.threshold!r} ({type(self.threshold).__name__})"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +224,17 @@ def _resolve_precondition(precondition: StructuralPrecondition, state: CombatSta
             return PreconditionStatus.UNSATISFIED
         return PreconditionStatus.UNKNOWN
 
+    if precondition.kind is PreconditionCheckKind.INVALIDATOR_ABSENT:
+        context = state.shared.action_contexts.get(precondition.reference)
+        if context is None:
+            return PreconditionStatus.UNKNOWN
+        status = context.invalidators.get(precondition.invalidator_key)  # type: ignore[arg-type]
+        if status is None or status is InvalidatorStatus.UNKNOWN:
+            return PreconditionStatus.UNKNOWN
+        if status is InvalidatorStatus.ABSENT:
+            return PreconditionStatus.SATISFIED
+        return PreconditionStatus.UNSATISFIED  # InvalidatorStatus.PRESENT
+
     raise ValueError(f"PreconditionCheckKind no soportado: {precondition.kind!r}")  # pragma: no cover
 
 
@@ -208,7 +262,7 @@ def _apply_ability_on_cooldown(actor_state: ActorState, reference: str) -> Actor
     return dataclasses.replace(actor_state, abilities=updated)
 
 
-def _apply_stack(actor_state: ActorState, reference: str) -> ActorState:
+def _apply_stack(actor_state: ActorState, reference: str, threshold: int | None) -> ActorState:
     existing = actor_state.stacks.get(reference)
     if existing is None:
         raise ValueError(
@@ -218,12 +272,20 @@ def _apply_stack(actor_state: ActorState, reference: str) -> ActorState:
         )
     if existing.count is None:
         # Stack inicial desconocido: aplicar un golpe no inventa un conteo
-        # exacto (§B5/B6) — solo confirma que el ciclo está activo.
-        updated_stack = StackState(count=None, window=StackWindow.ACTIVE, reward_state=existing.reward_state)
+        # exacto (§B5/B6) — solo confirma que el ciclo está activo. Sin
+        # conteo, tampoco puede saberse si se cruzó un umbral: el
+        # reward_state anterior se preserva sin cambios.
+        new_count = None
+        new_reward = existing.reward_state
     else:
-        updated_stack = StackState(
-            count=existing.count + 1, window=StackWindow.ACTIVE, reward_state=existing.reward_state
-        )
+        new_count = existing.count + 1
+        if threshold is None:
+            new_reward = existing.reward_state  # esta aplicación no modela lógica de umbral
+        elif new_count >= threshold:
+            new_reward = RewardState.ACTIVE  # umbral alcanzado: hecho conocido, se activa
+        else:
+            new_reward = RewardState.INACTIVE  # bajo el umbral: hecho conocido, NO se activa
+    updated_stack = StackState(count=new_count, window=StackWindow.ACTIVE, reward_state=new_reward)
     updated = dict(actor_state.stacks)
     updated[reference] = updated_stack
     return dataclasses.replace(actor_state, stacks=updated)
@@ -234,7 +296,7 @@ def _apply_postcondition(state: CombatState, postcondition: StructuralPostcondit
     if postcondition.kind is PostconditionEffectKind.ABILITY_ON_COOLDOWN:
         updated_actor_state = _apply_ability_on_cooldown(actor_state, postcondition.reference)
     elif postcondition.kind is PostconditionEffectKind.STACK_APPLIED:
-        updated_actor_state = _apply_stack(actor_state, postcondition.reference)
+        updated_actor_state = _apply_stack(actor_state, postcondition.reference, postcondition.threshold)
     else:
         raise ValueError(f"PostconditionEffectKind no soportado: {postcondition.kind!r}")  # pragma: no cover
     return _with_actor_state(state, postcondition.actor, updated_actor_state)

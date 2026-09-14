@@ -1,11 +1,16 @@
-"""Registro mínimo de la primera secuencia real (v1.7, shadow mode).
+"""Registro mínimo de las secuencias reales Darius-Mordekaiser (v1.7,
+shadow mode).
 
-Instancia concreta de `generic_sequences.build_control_into_stack_sequences`
-para Darius vs Mordekaiser: Apprehend (control) habilita contacto ->
-autoataque o Decimate en zona exterior (follow-up, alternativas
-mutuamente excluyentes) aplica una carga de Hemorrhage. SOLO este matchup
-— cualquier otro par de campeones no ejecuta nada acá (ver
-`is_darius_mordekaiser_matchup`).
+Dos familias, ambas construidas SOLO para este matchup (ver
+`is_darius_mordekaiser_matchup`):
+
+1. **Apprehend->follow-up** (microfix): Apprehend (control) habilita
+   contacto -> autoataque o Decimate en zona exterior (follow-up,
+   alternativas mutuamente excluyentes) aplica una carga de Hemorrhage.
+2. **Trade bidireccional mínimo**: la familia anterior, extendida con UNA
+   respuesta real de Mordekaiser (Obliterate) dentro de la MISMA
+   hipótesis — ver `build_bidirectional_trade_registration` para la
+   justificación de por qué Obliterate y no otra habilidad.
 
 Este es el ÚNICO módulo de todo `reasoning/sequences/` que puede nombrar
 un campeón — y solo para RESOLVER referencias reales contra el
@@ -13,9 +18,8 @@ conocimiento ya existente (`Champion`/`Ability`/`StackingMechanic`), nunca
 para inventar un valor mecánico nuevo. Cada resolución falla
 explícitamente (`ValueError`) si la referencia esperada no existe, en vez
 de continuar con un supuesto silencioso — y cada hecho que este módulo
-asume (que Apprehend no aplica Hemorrhage, que Decimate sí, que Hemorrhage
-admite autoataque y Q como fuentes) se re-verifica contra el conocimiento
-cargado, no se da por sentado.
+asume se re-verifica contra el conocimiento cargado, no se da por
+sentado.
 """
 
 from __future__ import annotations
@@ -29,19 +33,28 @@ from lol_reasoner.domain.combat_state import (
     AbilityState,
     ActionContext,
     CombatState,
+    InvalidatorStatus,
     RangeStatus,
     StackState,
     StackWindow,
 )
-from lol_reasoner.domain.enums import EffectCondition, EffectType
+from lol_reasoner.domain.enums import EffectCondition, EffectType, Support
 from lol_reasoner.reasoning.scenario_builder import build_scenario_baseline
+from lol_reasoner.reasoning.sequences.evaluator import (
+    PostconditionEffectKind,
+    PreconditionCheckKind,
+    StepEvaluationSpec,
+    StructuralPostcondition,
+    StructuralPrecondition,
+)
 from lol_reasoner.reasoning.sequences.generic_sequences import (
     ControlFollowupFamily,
     FollowupAlternative,
     GenericSequenceSpec,
     build_control_into_stack_sequences,
+    extend_family_alternatives_with_step,
 )
-from lol_reasoner.reasoning.sequences.steps import WHOLE_EFFECT_COMPONENT, ActorRole, EffectIdentity
+from lol_reasoner.reasoning.sequences.steps import WHOLE_EFFECT_COMPONENT, ActorRole, EffectIdentity, SequenceStep
 
 DARIUS_ID = "darius"
 MORDEKAISER_ID = "mordekaiser"
@@ -56,7 +69,11 @@ _GROUP_ID = "darius_apprehend_followup"
 AA_ALTERNATIVE_ID = "aa"
 Q_ALTERNATIVE_ID = "q"
 
-_PERFORMER_LEVEL = 3  # E y Q disponibles desde EARLY_LANE
+_MORDEKAISER_RESPONSE_SLOT = "Q"  # Obliterate
+_DARKNESS_RISE_MECHANIC_ID = "darkness_rise"
+APPREHEND_INTERRUPT_INVALIDATOR_KEY = "apprehend_interrupt"
+
+_PERFORMER_LEVEL = 3  # E y Q disponibles desde EARLY_LANE, para ambos campeones
 
 
 def is_darius_mordekaiser_matchup(candidate: Champion, enemy: Champion) -> bool:
@@ -282,5 +299,212 @@ def build_apprehend_followup_baseline(
         enemy_level=_PERFORMER_LEVEL,
         enemy_abilities=performer_abilities,
         candidate_stacks=receiver_stacks,
+        action_contexts=action_contexts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Familia 2: trade bidireccional mínimo (Apprehend-followup + respuesta)
+# ---------------------------------------------------------------------------
+
+
+def _require_mordekaiser_response(mordekaiser: Champion) -> tuple[Ability, StackingMechanic]:
+    """Resuelve y verifica Obliterate (Q) + Darkness Rise contra el
+    conocimiento cargado — ver `build_bidirectional_trade_registration`
+    para la justificación de por qué esta es la respuesta elegida."""
+
+    obliterate = _require_ability(mordekaiser, _MORDEKAISER_RESPONSE_SLOT)
+    darkness_rise = _require_stacking_mechanic(mordekaiser, _DARKNESS_RISE_MECHANIC_ID)
+
+    if EffectType.STACK_APPLICATION not in obliterate.effect_types():
+        raise ValueError(f"{obliterate.name!r} ya no aplica STACK_APPLICATION — la referencia de conocimiento cambió")
+    on_hit_stack_effects = [
+        effect
+        for effect in obliterate.effects_of(EffectType.STACK_APPLICATION)
+        if EffectCondition.ON_HIT in effect.conditions
+    ]
+    if not on_hit_stack_effects:
+        raise ValueError(f"{obliterate.name!r} no tiene un efecto STACK_APPLICATION condicionado a ON_HIT")
+    if obliterate.slot not in darkness_rise.applied_by:
+        raise ValueError(
+            f"{darkness_rise.id!r} ya no admite el slot {obliterate.slot!r} como fuente — la "
+            "referencia de conocimiento cambió"
+        )
+
+    return obliterate, darkness_rise
+
+
+@dataclass(frozen=True, slots=True)
+class BidirectionalTradeRegistration:
+    """La familia Apprehend-followup extendida con la respuesta de
+    Mordekaiser — mismas alternativas (aa/q), cada una con un tercer paso
+    (`response_obliterate`) al final."""
+
+    apprehend_followup: ApprehendFollowupRegistration
+    mordekaiser_response_action_ref: str
+    mordekaiser_response_slot: str
+    mordekaiser_stack_reference: str
+    mordekaiser_stack_threshold: int
+    family: ControlFollowupFamily
+
+    def spec_for(self, alternative_id: str) -> GenericSequenceSpec:
+        return self.family.spec_for(alternative_id)
+
+
+def build_bidirectional_trade_registration(
+    *, darius: Champion, mordekaiser: Champion, darius_role: ActorRole
+) -> BidirectionalTradeRegistration:
+    """Extiende la familia Apprehend-followup con LA respuesta elegida de
+    Mordekaiser: **Obliterate (Q)**.
+
+    Justificación (no W, no autoataque): de las cuatro habilidades
+    tempranas de Mordekaiser, Obliterate es la única con un efecto
+    `DAMAGE` Y `STACK_APPLICATION` (`ON_HIT`) que además alimenta su
+    PROPIA `StackingMechanic` (`darkness_rise`, `applied_by` incluye su
+    slot) — una contrarrespuesta mecánicamente real y no trivial, no un
+    autoataque genérico. `W` (Indestructible) queda descartada
+    estructuralmente: sus únicos efectos son `SHIELD_FROM_STORED` y
+    `CONVERT_SHIELD_TO_HEAL` — no impacta al rival (mismo hecho ya
+    establecido por `test_darkness_rise_is_not_fed_by_w`), así que no
+    puede representar una respuesta ACTIVA dentro del trade. Mordekaiser
+    es `RESOURCELESS`, así que no hace falta modelar maná para poder
+    castear la respuesta.
+    """
+
+    base = build_apprehend_followup_registration(darius=darius, darius_role=darius_role)
+    if mordekaiser.id != MORDEKAISER_ID:
+        raise ValueError(f"build_bidirectional_trade_registration espera a Mordekaiser, recibió {mordekaiser.id!r}")
+
+    obliterate, darkness_rise = _require_mordekaiser_response(mordekaiser)
+
+    mordekaiser_role = base.mordekaiser_role
+    response_action_ref = action_ref_for(mordekaiser_role, obliterate.slot)
+    response_slot = obliterate.slot.lower()
+
+    response_step = SequenceStep(
+        step_id="response_obliterate",
+        action_ref=response_action_ref,
+        actor=mordekaiser_role,
+        consumes=(
+            EffectIdentity(
+                fact_ref=f"{mordekaiser.id}:{response_slot}",
+                causal_role="stack_application",
+                component=EffectCondition.ON_HIT.value,
+            ),
+        ),
+    )
+    response_spec = StepEvaluationSpec(
+        step=response_step,
+        declared_support=Support.STRUCTURAL,
+        preconditions=(
+            StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, mordekaiser_role, response_action_ref),
+            StructuralPrecondition(PreconditionCheckKind.ABILITY_READY, mordekaiser_role, response_slot),
+            # Apprehend incluye BRIEF_CC/INTERRUPT reales (ver Champion) —
+            # un desplazamiento NO garantiza automáticamente que bloquea
+            # la respuesta: solo la bloquea si este invalidador CONCRETO
+            # está PRESENT (§3 del trade). Ausente/UNKNOWN por defecto.
+            StructuralPrecondition(
+                PreconditionCheckKind.INVALIDATOR_ABSENT,
+                mordekaiser_role,
+                response_action_ref,
+                invalidator_key=APPREHEND_INTERRUPT_INVALIDATOR_KEY,
+            ),
+        ),
+        postconditions=(
+            StructuralPostcondition(PostconditionEffectKind.ABILITY_ON_COOLDOWN, mordekaiser_role, response_slot),
+            StructuralPostcondition(
+                PostconditionEffectKind.STACK_APPLIED,
+                mordekaiser_role,  # Darkness Rise se acumula en el propio Mordekaiser, no en Darius
+                darkness_rise.id,
+                threshold=darkness_rise.threshold,
+            ),
+        ),
+    )
+
+    family = extend_family_alternatives_with_step(base.family, extra_step=response_step, extra_spec=response_spec)
+
+    return BidirectionalTradeRegistration(
+        apprehend_followup=base,
+        mordekaiser_response_action_ref=response_action_ref,
+        mordekaiser_response_slot=response_slot,
+        mordekaiser_stack_reference=darkness_rise.id,
+        mordekaiser_stack_threshold=darkness_rise.threshold,
+        family=family,
+    )
+
+
+def build_bidirectional_trade_baseline(
+    registration: BidirectionalTradeRegistration,
+    *,
+    range_statuses: Mapping[str, RangeStatus] | None = None,
+    response_invalidators: Mapping[str, InvalidatorStatus] | None = None,
+    mordekaiser_initial_darkness_rise_count: int | None = 0,
+) -> CombatState:
+    """Escenario mínimo del trade: todo lo del baseline de
+    Apprehend-followup, más disponibilidad de Obliterate, su propio
+    `ActionContext` (con los invalidadores declarados EXPLÍCITAMENTE — por
+    defecto `ABSENT`, "contexto normal", igual que el catálogo de
+    invalidadores point-and-click ya documentado en §B.7), y el stack
+    inicial de Darkness Rise EN Mordekaiser (acumulación propia, no
+    recibida).
+
+    `mordekaiser_initial_darkness_rise_count=None` deja el conteo inicial
+    genuinamente desconocido (para probar que una aplicación sobre un
+    conteo `unknown` no inventa si cruzó el umbral)."""
+
+    base = registration.apprehend_followup
+    range_statuses = range_statuses or {}
+    # Convención ya documentada en §B.7: un invalidador point-and-click se
+    # declara ABSENT por defecto ("contexto normal") — una declaración
+    # explícita, no un default silencioso. Solo queda PRESENT/UNKNOWN si
+    # el caller lo pide para probar esa rama específica.
+    if response_invalidators is None:
+        response_invalidators = {APPREHEND_INTERRUPT_INVALIDATOR_KEY: InvalidatorStatus.ABSENT}
+
+    relevant_refs = (base.apprehend_action_ref, base.basic_attack_action_ref, base.decimate_outer_zone_action_ref)
+    action_contexts = {
+        ref: ActionContext(action_ref=ref, range_status=range_statuses.get(ref, RangeStatus.UNKNOWN))
+        for ref in relevant_refs
+    }
+    action_contexts[registration.mordekaiser_response_action_ref] = ActionContext(
+        action_ref=registration.mordekaiser_response_action_ref,
+        range_status=range_statuses.get(registration.mordekaiser_response_action_ref, RangeStatus.UNKNOWN),
+        invalidators=dict(response_invalidators),
+    )
+
+    darius_abilities = {
+        base.apprehend_slot: AbilityState(rank=1, availability=AbilityAvailability.READY),
+        base.decimate_slot: AbilityState(rank=1, availability=AbilityAvailability.READY),
+    }
+    mordekaiser_abilities = {
+        registration.mordekaiser_response_slot: AbilityState(rank=1, availability=AbilityAvailability.READY),
+    }
+    darkness_rise_window = (
+        StackWindow.UNKNOWN
+        if mordekaiser_initial_darkness_rise_count in (None, 0)
+        else StackWindow.ACTIVE
+    )
+    mordekaiser_stacks = {
+        base.stack_reference: StackState(count=0, window=StackWindow.UNKNOWN),  # Hemorrhage RECIBIDO
+        registration.mordekaiser_stack_reference: StackState(
+            count=mordekaiser_initial_darkness_rise_count, window=darkness_rise_window
+        ),
+    }
+
+    if base.darius_role is ActorRole.CANDIDATE:
+        return build_scenario_baseline(
+            candidate_level=_PERFORMER_LEVEL,
+            candidate_abilities=darius_abilities,
+            enemy_level=_PERFORMER_LEVEL,
+            enemy_abilities=mordekaiser_abilities,
+            enemy_stacks=mordekaiser_stacks,
+            action_contexts=action_contexts,
+        )
+    return build_scenario_baseline(
+        enemy_level=_PERFORMER_LEVEL,
+        enemy_abilities=darius_abilities,
+        candidate_level=_PERFORMER_LEVEL,
+        candidate_abilities=mordekaiser_abilities,
+        candidate_stacks=mordekaiser_stacks,
         action_contexts=action_contexts,
     )

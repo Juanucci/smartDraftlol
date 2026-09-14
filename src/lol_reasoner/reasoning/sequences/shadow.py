@@ -26,8 +26,11 @@ from lol_reasoner.reasoning.sequences.generic_sequences import GenericSequenceSp
 from lol_reasoner.reasoning.sequences.registry import (
     DARIUS_ID,
     ApprehendFollowupRegistration,
+    BidirectionalTradeRegistration,
     build_apprehend_followup_baseline,
     build_apprehend_followup_registration,
+    build_bidirectional_trade_baseline,
+    build_bidirectional_trade_registration,
     is_darius_mordekaiser_matchup,
 )
 from lol_reasoner.reasoning.sequences.sequence import (
@@ -180,6 +183,94 @@ def evaluate_apprehend_followup_shadow(
         selected_alternative_id=selected_alternative_id,
         baseline=baseline,
         emit_shadow_causal_component=emit_shadow_causal_component,
+    )
+
+    if trace is not None:
+        record = ShadowSequenceRecord(
+            matchup_id=f"{DARIUS_ID}_vs_mordekaiser",
+            sequence_id=outcome.sequence.sequence_id,
+            outcome=outcome,
+        )
+        trace.add_shadow_sequence_outcome(record)
+
+    return outcome
+
+
+# ---------------------------------------------------------------------------
+# Trade bidireccional mínimo
+# ---------------------------------------------------------------------------
+
+
+def build_bidirectional_trade_outcome(
+    registration: BidirectionalTradeRegistration,
+    *,
+    selected_alternative_id: str | None,
+    baseline: CombatState | None = None,
+) -> ScenarioOutcome:
+    """Igual que `build_apprehend_followup_outcome`, para la familia
+    extendida con la respuesta de Mordekaiser. `causal_components` queda
+    siempre vacío acá: el trade bidireccional es puramente diagnóstico en
+    esta ronda (§B7), sin variante "confirmada" que reclame un componente.
+    """
+
+    if selected_alternative_id is None:
+        spec = registration.family.opening
+        resolved_baseline = (
+            baseline if baseline is not None else build_bidirectional_trade_baseline(registration)
+        )
+        return _build_outcome_from_spec(
+            spec=spec,
+            baseline=resolved_baseline,
+            branch_selection=None,
+            causal_components=(),
+            evaluation=Evaluation.UNRESOLVED,
+        )
+
+    spec = registration.spec_for(selected_alternative_id)
+    resolved_baseline = baseline if baseline is not None else build_bidirectional_trade_baseline(registration)
+
+    group = spec.sequence.alternative_group
+    assert group is not None
+    branch_selection = AlternativeGroup(
+        group_id=group.group_id, alternative_ids=group.alternative_ids, selected_id=selected_alternative_id
+    )
+
+    return _build_outcome_from_spec(
+        spec=spec,
+        baseline=resolved_baseline,
+        branch_selection=branch_selection,
+        causal_components=(),
+        # Trade no necesariamente letal, sin ganador forzado (§5 del
+        # trade): CONDITIONAL es la lectura honesta mientras el contacto
+        # y la respuesta sigan sin confirmarse por defecto.
+        evaluation=Evaluation.CONDITIONAL,
+    )
+
+
+def evaluate_bidirectional_trade_shadow(
+    *,
+    candidate: Champion,
+    enemy: Champion,
+    selected_alternative_id: str | None,
+    baseline: CombatState | None = None,
+    trace: ReasoningTrace | None = None,
+) -> ScenarioOutcome | None:
+    """Evalúa en shadow mode el trade bidireccional mínimo
+    (Apprehend->follow-up->respuesta de Mordekaiser) para el matchup
+    Darius-Mordekaiser, en la orientación que corresponda. Devuelve `None`
+    para cualquier otro matchup. Mismo canal shadow que
+    `evaluate_apprehend_followup_shadow` — nunca `trace.entries`."""
+
+    if not is_darius_mordekaiser_matchup(candidate, enemy):
+        return None
+
+    darius = candidate if candidate.id == DARIUS_ID else enemy
+    mordekaiser = enemy if candidate.id == DARIUS_ID else candidate
+    darius_role = _resolve_darius_role(candidate, enemy)
+
+    registration = build_bidirectional_trade_registration(darius=darius, mordekaiser=mordekaiser, darius_role=darius_role)
+    outcome = build_bidirectional_trade_outcome(
+        registration, selected_alternative_id=selected_alternative_id, baseline=baseline
     )
 
     if trace is not None:

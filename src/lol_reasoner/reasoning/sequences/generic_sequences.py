@@ -57,6 +57,7 @@ class FollowupAlternative:
     stack_target: ActorRole
     stack_reference: str
     connect_reference: str | None = None  # None -> se completa con action_ref en __post_init__
+    stack_threshold: int | None = None  # ver StructuralPostcondition.threshold
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -218,7 +219,10 @@ def build_control_into_stack_sequences(
         ]
         postconditions = [
             StructuralPostcondition(
-                PostconditionEffectKind.STACK_APPLIED, followup.stack_target, followup.stack_reference
+                PostconditionEffectKind.STACK_APPLIED,
+                followup.stack_target,
+                followup.stack_reference,
+                threshold=followup.stack_threshold,
             )
         ]
         if followup.ability_slot is not None:
@@ -247,3 +251,35 @@ def build_control_into_stack_sequences(
         alternatives.append(GenericSequenceSpec(sequence=sequence, step_specs=(control_spec, followup_spec)))
 
     return ControlFollowupFamily(opening=opening, alternatives=tuple(alternatives))
+
+
+def extend_family_alternatives_with_step(
+    family: ControlFollowupFamily, *, extra_step: SequenceStep, extra_spec: StepEvaluationSpec
+) -> ControlFollowupFamily:
+    """Extiende CADA alternativa de `family` (nunca `opening`) con un paso
+    adicional al final — p. ej. la respuesta de un segundo actor dentro de
+    la misma hipótesis (trade bidireccional). `opening` se conserva sin
+    cambios: el paso extra representa una reacción a un follow-up que ya
+    ocurrió, y `opening` es precisamente "todavía no se declaró cuál".
+
+    Genérico: no sabe qué representa `extra_step` — solo reutiliza los
+    mismos tipos (`SequenceStep`/`StepEvaluationSpec`) ya validados, sin
+    duplicar su lógica de construcción."""
+
+    if extra_step.step_id in {step.step_id for alt in family.alternatives for step in alt.sequence.steps}:
+        raise ValueError(
+            f"extra_step.step_id={extra_step.step_id!r} ya existe en alguna alternativa de la "
+            "familia — los step_id deben seguir siendo únicos por secuencia"
+        )
+
+    extended: list[GenericSequenceSpec] = []
+    for alt in family.alternatives:
+        sequence = InteractionSequence(
+            sequence_id=f"{alt.sequence.sequence_id}+{extra_step.step_id}",
+            steps=(*alt.sequence.steps, extra_step),
+            alternative_group=alt.sequence.alternative_group,
+            alternative_id=alt.sequence.alternative_id,
+        )
+        extended.append(GenericSequenceSpec(sequence=sequence, step_specs=(*alt.step_specs, extra_spec)))
+
+    return ControlFollowupFamily(opening=family.opening, alternatives=tuple(extended))
