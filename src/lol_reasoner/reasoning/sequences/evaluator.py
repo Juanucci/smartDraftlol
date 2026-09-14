@@ -21,7 +21,10 @@ campos que YA existen en `domain.combat_state` (`RangeStatus`,
 `AbilityAvailability`, `StackState`) — ningún campo nuevo, ninguna
 simulación de tiempo, ninguna probabilidad. Una clave ausente en el
 `CombatState` es `PreconditionStatus.UNKNOWN` (no observada), nunca se
-infiere `SATISFIED`/`UNSATISFIED` a partir de su ausencia.
+infiere `SATISFIED`/`UNSATISFIED` a partir de su ausencia. Cada
+`StructuralPrecondition` se liga a UNA acción concreta (`reference`) —
+nunca un booleano global: estar en rango de un autoataque no dice nada
+del `reference`, distinto, de la zona exterior de otra habilidad.
 
 **Snapshot nuevo, nunca mutado in-place**: `evaluate_step`/
 `evaluate_sequence_prefix` jamás modifican el `CombatState` recibido —
@@ -57,9 +60,19 @@ from lol_reasoner.reasoning.sequences.steps import ActorRole, SequenceStep
 class PreconditionCheckKind(str, Enum):
     """Hechos estructurales que este evaluador sabe leer de un
     `CombatState` — ninguno nombra una mecánica concreta; ambos ya
-    existen en `domain.combat_state`."""
+    existen en `domain.combat_state`.
 
-    ACTION_IN_RANGE = "action_in_range"  # SharedContext.action_contexts[reference].range_status
+    `ACTION_CONNECTS` (antes `ACTION_IN_RANGE`, renombrado en el microfix
+    de esta ronda) deliberadamente NO es un único chequeo "global": cada
+    `StructuralPrecondition` de este tipo se liga a un `reference`
+    (`action_ref`) DISTINTO por acción/zona — alcance de autoataque,
+    impacto de un desplazamiento, o la zona exterior específica de una
+    habilidad de dos zonas son entradas INDEPENDIENTES de
+    `SharedContext.action_contexts`, nunca inferidas una de otra. Que el
+    action_ref de un desplazamiento esté `IN_RANGE` no dice nada sobre el
+    action_ref, distinto, de la zona exterior de otra habilidad."""
+
+    ACTION_CONNECTS = "action_connects"  # SharedContext.action_contexts[reference].range_status
     ABILITY_READY = "ability_ready"  # ActorState.abilities[reference].availability
 
 
@@ -67,7 +80,7 @@ class PreconditionCheckKind(str, Enum):
 class StructuralPrecondition:
     kind: PreconditionCheckKind
     actor: ActorRole
-    reference: str  # action_ref (ACTION_IN_RANGE) o slot dentro de `abilities` (ABILITY_READY)
+    reference: str  # action_ref (ACTION_CONNECTS) o slot dentro de `abilities` (ABILITY_READY)
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, PreconditionCheckKind):
@@ -147,7 +160,7 @@ def _with_actor_state(state: CombatState, actor: ActorRole, new_actor_state: Act
 
 
 def _resolve_precondition(precondition: StructuralPrecondition, state: CombatState) -> PreconditionStatus:
-    if precondition.kind is PreconditionCheckKind.ACTION_IN_RANGE:
+    if precondition.kind is PreconditionCheckKind.ACTION_CONNECTS:
         context = state.shared.action_contexts.get(precondition.reference)
         if context is None:
             return PreconditionStatus.UNKNOWN

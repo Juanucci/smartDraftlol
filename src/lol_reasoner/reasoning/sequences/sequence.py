@@ -169,6 +169,93 @@ class InteractionSequence:
 
 
 # ---------------------------------------------------------------------------
+# Estado de EJECUCIÓN — distinto del soporte (§ microfix "distinguish
+# projected and executed sequence state")
+# ---------------------------------------------------------------------------
+#
+# `Support` (STRUCTURAL/CONDITIONED/AMBIGUOUS) responde "¿cuánta certeza
+# respalda esta inclinación?" — un eje de CALIBRACIÓN heredado de
+# domain.enums, pensado para scoring. `ExecutionStatus` responde una
+# pregunta DISTINTA y más simple, que scoring nunca necesitó hasta que
+# hubo una secuencia real evaluando precondiciones de ejecución: "¿lo que
+# describe este StepResult/ScenarioOutcome ya ocurrió, es una proyección
+# bajo hipótesis, o quedó bloqueado?" Sin este eje, `progress=COMPLETED`
+# (la cadena terminó de evaluarse) se confundía con "el StateDelta.after
+# es un hecho confirmado" — dos preguntas distintas: una secuencia puede
+# completar su evaluación entera y, a la vez, no tener ninguna garantía de
+# que lo que proyectó haya ocurrido de verdad.
+#
+# Contrato mínimo elegido: `execution_status` no duplica `CombatState` ni
+# introduce un segundo motor — es un rotulado DERIVADO de la MISMA
+# evidencia (`precondition_statuses`) que ya produce `effective_support`,
+# adjunto a `StepResult`/`ScenarioOutcome` (y por lo tanto visible junto a
+# `TradeOutcome.state_delta` en la serialización). El `StateDelta.after`
+# de un outcome con `execution_status=HYPOTHETICAL` sigue siendo el mismo
+# tipo `CombatState` de siempre — lo que cambia es que el consumidor ahora
+# puede leer, en el mismo outcome, que ese "after" es una PROYECCIÓN bajo
+# hipótesis y no una mutación confirmada.
+
+
+class ExecutionStatus(str, Enum):
+    """Certeza de EJECUCIÓN de un paso/cadena — derivada exclusivamente de
+    `precondition_statuses` (la misma entrada que ya resuelve
+    `effective_support`), nunca un dato de entrada independiente: no hay
+    manera de que quede desalineada con las precondiciones que dice
+    describir.
+
+    - `CONFIRMED`: ninguna precondición `UNKNOWN` ni `UNSATISFIED` — lo
+      que el paso/cadena describe es un hecho, no una hipótesis.
+    - `HYPOTHETICAL`: sin `UNSATISFIED`, pero con alguna `UNKNOWN` — el
+      paso se evaluó y no está bloqueado, pero su resultado (y el
+      `StateDelta` que produce) es una PROYECCIÓN bajo una hipótesis de
+      ejecución, no una mutación confirmada.
+    - `BLOCKED`: alguna precondición `UNSATISFIED` — no se produjo
+      transición (mismo caso que `effective_support is None`).
+    """
+
+    CONFIRMED = "confirmed"
+    HYPOTHETICAL = "hypothetical"
+    BLOCKED = "blocked"
+
+
+# Prioridad EXPLÍCITA para el eslabón más débil de este eje — nunca el
+# orden de declaración accidental del enum (mismo principio que
+# `_SUPPORT_PRIORITY`).
+_EXECUTION_STATUS_PRIORITY: dict[ExecutionStatus, int] = {
+    ExecutionStatus.BLOCKED: 0,
+    ExecutionStatus.HYPOTHETICAL: 1,
+    ExecutionStatus.CONFIRMED: 2,
+}
+
+
+def execution_status_of(precondition_statuses: tuple[PreconditionStatus, ...]) -> ExecutionStatus:
+    """Deriva el `ExecutionStatus` de UN paso a partir de sus
+    `precondition_statuses` — función pura, misma entrada que
+    `resolve_step_support`, ningún dato adicional."""
+
+    if any(status is PreconditionStatus.UNSATISFIED for status in precondition_statuses):
+        return ExecutionStatus.BLOCKED
+    if any(status is PreconditionStatus.UNKNOWN for status in precondition_statuses):
+        return ExecutionStatus.HYPOTHETICAL
+    return ExecutionStatus.CONFIRMED
+
+
+def chain_execution_status(step_results: Iterable["StepResult"]) -> ExecutionStatus:
+    """`ExecutionStatus` de una CADENA de pasos: el de su eslabón más
+    débil (`BLOCKED` domina sobre `HYPOTHETICAL`, que domina sobre
+    `CONFIRMED`) — nunca un promedio, misma filosofía que `chain_support`.
+    """
+
+    results = tuple(step_results)
+    if not results:
+        raise ValueError("chain_execution_status requiere al menos un StepResult")
+    for result in results:
+        if not isinstance(result, StepResult):
+            raise TypeError(f"chain_execution_status: cada elemento debe ser StepResult, no {result!r}")
+    return min((result.execution_status for result in results), key=lambda status: _EXECUTION_STATUS_PRIORITY[status])
+
+
+# ---------------------------------------------------------------------------
 # Resultado de un paso evaluado + soporte de la cadena (eslabón más débil)
 # ---------------------------------------------------------------------------
 
@@ -199,6 +286,7 @@ class StepResult:
     precondition_statuses: tuple[PreconditionStatus, ...]
     declared_support: Support
     effective_support: Support | None = field(init=False, default=None)
+    execution_status: "ExecutionStatus" = field(init=False, default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.step_id, field_name="StepResult.step_id")
@@ -217,6 +305,7 @@ class StepResult:
             declared_support=self.declared_support, precondition_statuses=self.precondition_statuses
         )
         object.__setattr__(self, "effective_support", effective)
+        object.__setattr__(self, "execution_status", execution_status_of(self.precondition_statuses))
 
 
 def chain_support(step_results: Iterable[StepResult]) -> Support | None:
@@ -546,6 +635,7 @@ class ScenarioOutcome:
     causal_components: tuple[CausalComponent, ...] = field(default_factory=tuple)
     support: Support | None = field(init=False, default=None)
     progress: SequenceProgress = field(init=False, default=None)  # type: ignore[assignment]
+    execution_status: ExecutionStatus | None = field(init=False, default=None)
 
     __hash__ = None  # type: ignore[assignment]  # puede contener un TradeOutcome no hashable
 
@@ -628,6 +718,11 @@ class ScenarioOutcome:
         object.__setattr__(
             self, "progress", sequence_progress(sequence=self.sequence, step_results=self.step_results)
         )
+        object.__setattr__(
+            self,
+            "execution_status",
+            chain_execution_status(self.step_results) if self.step_results else None,
+        )
 
         # --- §A2: coherencia secuencia <-> selección de rama. Estructural
         # (siempre se rechaza), independiente de si hay causal_components.
@@ -698,6 +793,7 @@ def _step_result_to_primitive(result: StepResult) -> dict[str, object]:
         "precondition_statuses": [status.value for status in result.precondition_statuses],
         "declared_support": result.declared_support.value,
         "effective_support": result.effective_support.value if result.effective_support is not None else None,
+        "execution_status": result.execution_status.value,
     }
 
 
@@ -797,6 +893,7 @@ def scenario_outcome_to_primitive(outcome: ScenarioOutcome) -> dict[str, object]
         "step_results": [_step_result_to_primitive(result) for result in outcome.step_results],
         "progress": outcome.progress.value,
         "support": outcome.support.value if outcome.support is not None else None,
+        "execution_status": outcome.execution_status.value if outcome.execution_status is not None else None,
         "trade_outcome": (
             _trade_outcome_to_primitive(outcome.trade_outcome) if outcome.trade_outcome is not None else None
         ),

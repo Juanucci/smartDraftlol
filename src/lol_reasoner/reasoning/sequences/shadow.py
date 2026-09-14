@@ -8,21 +8,31 @@ NUNCA a `trace.entries`. Quien quiera comparar "shadow OFF" vs "shadow ON"
 simplemente decide si llama o no a `evaluate_apprehend_followup_shadow`
 después de construir la traza con el motor real, sin cambiar una sola
 línea de cómo se construye esa traza.
+
+**Selección de rama SIEMPRE explícita** (microfix de esta ronda, §4):
+`selected_alternative_id` no tiene default — pasar `None` es la forma
+explícita de pedir "todavía no se declaró qué follow-up ocurre" (evalúa
+solo `family.opening`, sin rama, sin `causal_components`); ninguna función
+de este módulo elige "q" ni ninguna otra alternativa por su cuenta.
 """
 
 from __future__ import annotations
 
 from lol_reasoner.domain.champion import Champion
-from lol_reasoner.reasoning.scenario_builder import build_apprehend_followup_baseline
+from lol_reasoner.domain.combat_state import CombatState
+from lol_reasoner.domain.enums import Factor, Provenance
 from lol_reasoner.reasoning.sequences.evaluator import evaluate_sequence_prefix
+from lol_reasoner.reasoning.sequences.generic_sequences import GenericSequenceSpec
 from lol_reasoner.reasoning.sequences.registry import (
     DARIUS_ID,
     ApprehendFollowupRegistration,
+    build_apprehend_followup_baseline,
     build_apprehend_followup_registration,
     is_darius_mordekaiser_matchup,
 )
 from lol_reasoner.reasoning.sequences.sequence import (
     AlternativeGroup,
+    CausalComponent,
     Evaluation,
     ScenarioOutcome,
     StateDelta,
@@ -31,58 +41,112 @@ from lol_reasoner.reasoning.sequences.sequence import (
 from lol_reasoner.reasoning.sequences.steps import ActorRole
 from lol_reasoner.reasoning.trace import ReasoningTrace, ShadowSequenceRecord
 
-_PERFORMER_LEVEL = 3  # nivel mínimo declarado: E y Q ya disponibles (available_from=EARLY_LANE)
+# Placeholder deliberado, NO calibrado — ver "decisiones no especificadas"
+# en la entrega de esta ronda. Nunca llega a scoring (shadow mode, §B7):
+# existe solo para demostrar que el evaluador puede completar la cadena y
+# producir un CausalComponent real cuando la ejecución está confirmada.
+_SHADOW_CAUSAL_COMPONENT_PLACEHOLDER_DELTA = 1.0
 
 
 def _resolve_darius_role(candidate: Champion, enemy: Champion) -> ActorRole:
     return ActorRole.CANDIDATE if candidate.id == DARIUS_ID else ActorRole.ENEMY
 
 
-def build_apprehend_followup_outcome(
-    registration: ApprehendFollowupRegistration, *, selected_alternative_id: str
+def _build_outcome_from_spec(
+    *,
+    spec: GenericSequenceSpec,
+    baseline: CombatState,
+    branch_selection: AlternativeGroup | None,
+    causal_components: tuple[CausalComponent, ...],
+    evaluation: Evaluation,
 ) -> ScenarioOutcome:
-    """Evalúa la alternativa `selected_alternative_id` de `registration`
-    contra su propio escenario baseline (construido acá, solo con lo que
-    esta secuencia necesita) y devuelve el `ScenarioOutcome` resultante.
-
-    Nunca evalúa "la primera alternativa por defecto": el caller decide
-    explícitamente cuál. `causal_components` queda siempre vacío — shadow
-    mode no reclama ninguna causa puntuable (§B7)."""
-
-    selected = registration.spec_for(selected_alternative_id)
-
-    baseline = build_apprehend_followup_baseline(
-        performer_role=registration.darius_role,
-        performer_level=_PERFORMER_LEVEL,
-        control_action_ref=registration.apprehend_action_ref,
-        control_ability_slot=registration.apprehend_slot,
-        followup_action_refs=(registration.basic_attack_action_ref, registration.decimate_action_ref),
-        followup_ability_slots=(None, registration.decimate_slot),
-        stack_reference=registration.stack_reference,
+    step_results, final_state = evaluate_sequence_prefix(spec.step_specs, baseline)
+    trade_outcome = TradeOutcome(state_delta=StateDelta(before=baseline, after=final_state), evaluation=evaluation)
+    return ScenarioOutcome(
+        sequence=spec.sequence,
+        step_results=step_results,
+        trade_outcome=trade_outcome,
+        branch_selection=branch_selection,
+        causal_components=causal_components,
     )
 
-    step_results, final_state = evaluate_sequence_prefix(selected.step_specs, baseline)
 
-    group = selected.sequence.alternative_group
+def _shadow_causal_component(spec: GenericSequenceSpec, *, sequence_id: str) -> CausalComponent:
+    """UN `CausalComponent` shadow-only a partir del `EffectIdentity` que
+    consume el ÚLTIMO paso de `spec` (el follow-up que efectivamente
+    aplica el stack). `polarity=None`: no se firma una dirección — esta
+    ronda no decide favorecidos, solo demuestra que la cadena puede
+    completarse y producir un componente representable."""
+
+    consumed = spec.sequence.steps[-1].consumes[0]
+    return CausalComponent(
+        factor=Factor.STACKING_PAYOFF,
+        delta=_SHADOW_CAUSAL_COMPONENT_PLACEHOLDER_DELTA,
+        provenance=Provenance.DERIVED,
+        fact_ref=consumed.fact_ref,
+        sequence_id=sequence_id,
+    )
+
+
+def build_apprehend_followup_outcome(
+    registration: ApprehendFollowupRegistration,
+    *,
+    selected_alternative_id: str | None,
+    baseline: CombatState | None = None,
+    emit_shadow_causal_component: bool = False,
+) -> ScenarioOutcome:
+    """Evalúa la familia Apprehend-followup para UNA decisión explícita:
+
+    - `selected_alternative_id` es un id real (`"aa"`/`"q"`) -> evalúa
+      ESA alternativa completa (control + follow-up), con
+      `branch_selection` confirmándola.
+    - `selected_alternative_id is None` -> NO se elige ninguna: evalúa
+      solo `registration.family.opening` (el paso de control, sin rama).
+      `branch_selection` queda `None` (la propia secuencia no pertenece a
+      ningún `AlternativeGroup`) y no hay `causal_components`.
+
+    `baseline` por defecto se construye con todo en `UNKNOWN` (§B6); un
+    caller puede pasar uno propio (p. ej. con las conexiones confirmadas)
+    para demostrar una cadena completamente satisfecha.
+
+    `emit_shadow_causal_component=True` adjunta UN `CausalComponent`
+    shadow-only derivado del follow-up seleccionado — nunca automático,
+    nunca cuando no hay alternativa seleccionada."""
+
+    if selected_alternative_id is None:
+        spec = registration.family.opening
+        resolved_baseline = baseline if baseline is not None else build_apprehend_followup_baseline(registration)
+        return _build_outcome_from_spec(
+            spec=spec,
+            baseline=resolved_baseline,
+            branch_selection=None,
+            causal_components=(),
+            evaluation=Evaluation.UNRESOLVED,
+        )
+
+    spec = registration.spec_for(selected_alternative_id)
+    resolved_baseline = baseline if baseline is not None else build_apprehend_followup_baseline(registration)
+
+    group = spec.sequence.alternative_group
     assert group is not None  # toda alternativa de esta familia pertenece a un grupo
     branch_selection = AlternativeGroup(
         group_id=group.group_id, alternative_ids=group.alternative_ids, selected_id=selected_alternative_id
     )
 
-    trade_outcome = TradeOutcome(
-        state_delta=StateDelta(before=baseline, after=final_state),
-        # El acierto del follow-up no está garantizado en este baseline
-        # (range_status queda UNKNOWN a propósito, §B6) — nunca se fuerza
-        # un ganador sin esa evidencia: CONDITIONAL es la lectura honesta.
-        evaluation=Evaluation.CONDITIONAL,
-    )
+    causal_components: tuple[CausalComponent, ...] = ()
+    if emit_shadow_causal_component:
+        causal_components = (_shadow_causal_component(spec, sequence_id=spec.sequence.sequence_id),)
 
-    return ScenarioOutcome(
-        sequence=selected.sequence,
-        step_results=step_results,
-        trade_outcome=trade_outcome,
+    return _build_outcome_from_spec(
+        spec=spec,
+        baseline=resolved_baseline,
         branch_selection=branch_selection,
-        causal_components=(),  # shadow mode: nunca componentes puntuables
+        causal_components=causal_components,
+        # El acierto del follow-up no está garantizado por defecto (§B6);
+        # incluso cuando `baseline` confirma la ejecución, esta ronda no
+        # infiere un favorecido de UNA sola aplicación de stack — nunca se
+        # fuerza una conclusión por el solo hecho de completar la cadena.
+        evaluation=Evaluation.CONDITIONAL,
     )
 
 
@@ -90,10 +154,12 @@ def evaluate_apprehend_followup_shadow(
     *,
     candidate: Champion,
     enemy: Champion,
-    selected_alternative_id: str = "q",
+    selected_alternative_id: str | None,
+    baseline: CombatState | None = None,
+    emit_shadow_causal_component: bool = False,
     trace: ReasoningTrace | None = None,
 ) -> ScenarioOutcome | None:
-    """Evalúa en shadow mode la secuencia Apprehend->follow-up para el
+    """Evalúa en shadow mode la familia Apprehend->follow-up para el
     matchup Darius-Mordekaiser, en la orientación que corresponda según
     quién sea `candidate`/`enemy`. Devuelve `None` (no construye nada)
     para cualquier otro matchup.
@@ -109,7 +175,12 @@ def evaluate_apprehend_followup_shadow(
     darius_role = _resolve_darius_role(candidate, enemy)
 
     registration = build_apprehend_followup_registration(darius=darius, darius_role=darius_role)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=selected_alternative_id)
+    outcome = build_apprehend_followup_outcome(
+        registration,
+        selected_alternative_id=selected_alternative_id,
+        baseline=baseline,
+        emit_shadow_causal_component=emit_shadow_causal_component,
+    )
 
     if trace is not None:
         record = ShadowSequenceRecord(

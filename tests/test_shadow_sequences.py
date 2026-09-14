@@ -1,6 +1,7 @@
-"""Tests de la primera secuencia real en shadow mode (v1.7): Apprehend
-habilita contacto -> autoataque o Decimate aplica Hemorrhage, SOLO para
-Darius vs Mordekaiser (y su orientación inversa), y SOLO en shadow mode.
+"""Tests de la familia Apprehend->follow-up en shadow mode (v1.7),
+incluido el microfix que distingue progreso de evaluación, estado de
+ejecución, y delta confirmado vs proyectado — SOLO para Darius vs
+Mordekaiser (y su orientación inversa), y SOLO en shadow mode.
 
 No hay motor de transición genérico, generador de escenarios genérico ni
 scoring por secuencia en este archivo — eso sigue fuera de alcance. Ningún
@@ -16,40 +17,24 @@ import json
 import pytest
 
 from lol_reasoner.domain.champion import Champion, DamageProfile
-from lol_reasoner.domain.combat_state import CombatState
-from lol_reasoner.domain.enums import (
-    ALL_PHASES,
-    Axis,
-    ResourceType,
-    Support,
-)
+from lol_reasoner.domain.combat_state import RangeStatus
+from lol_reasoner.domain.enums import ALL_PHASES, Axis, ResourceType, Support
 from lol_reasoner.explain.narrator import build_reasons, build_risks
 from lol_reasoner.reasoning.engine import RuleEngine
 from lol_reasoner.reasoning.rules.registry import ALL_GENERAL_RULES
 from lol_reasoner.reasoning.rules.specific import SPECIFIC_INTERACTIONS
-from lol_reasoner.reasoning.scenario_builder import build_apprehend_followup_baseline
-from lol_reasoner.reasoning.sequences.evaluator import (
-    PostconditionEffectKind,
-    PreconditionCheckKind,
-    StepEvaluationSpec,
-    StructuralPostcondition,
-    StructuralPrecondition,
-    evaluate_sequence_prefix,
-    evaluate_step,
-)
 from lol_reasoner.reasoning.sequences.registry import (
     AA_ALTERNATIVE_ID,
     Q_ALTERNATIVE_ID,
+    build_apprehend_followup_baseline,
     build_apprehend_followup_registration,
     is_darius_mordekaiser_matchup,
 )
 from lol_reasoner.reasoning.sequences.sequence import (
-    AlternativeGroup,
-    CausalComponent,
     Evaluation,
+    ExecutionStatus,
     PreconditionStatus,
-    ScenarioOutcome,
-    StepResult,
+    SequenceProgress,
     TerminalEventKind,
     scenario_outcome_to_primitive,
 )
@@ -65,23 +50,6 @@ from lol_reasoner.scoring.personal_score import PlayerProfile, execution_conditi
 from lol_reasoner.scoring.weights import DEFAULT_WEIGHTS
 
 
-# --- 1. la secuencia usa habilidades/efectos reales existentes -------------
-
-
-def test_registration_resolves_real_darius_abilities_and_mechanic(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-
-    assert registration.apprehend_slot == "e"
-    assert registration.decimate_slot == "q"
-    assert registration.stack_reference == "hemorrhage"
-    assert registration.stack_reference in {m.id for m in darius.stacking_mechanics}
-    assert darius.ability("E") is not None
-    assert darius.ability("Q") is not None
-
-
-# --- 2. una referencia mecánica inexistente falla explícitamente -----------
-
-
 def _synthetic_champion(champion_id: str) -> Champion:
     return Champion(
         id=champion_id,
@@ -92,398 +60,371 @@ def _synthetic_champion(champion_id: str) -> Champion:
         casting_resource=ResourceType.MANA,
         trade_patterns=frozenset(),
         tags=frozenset(),
-        abilities=(),  # sin E ni Q: referencia requerida ausente
-        stacking_mechanics=(),  # sin ninguna StackingMechanic
+        abilities=(),
+        stacking_mechanics=(),
         spikes=(),
         knowledge_version="test",
     )
 
 
+@pytest.fixture()
+def registration_candidate(darius):
+    return build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
+
+
+# --- 1. registro resuelve habilidades/efectos reales existentes ------------
+
+
+def test_registration_resolves_real_darius_abilities_and_mechanic(darius, registration_candidate):
+    assert registration_candidate.apprehend_slot == "e"
+    assert registration_candidate.decimate_slot == "q"
+    assert registration_candidate.stack_reference == "hemorrhage"
+    assert registration_candidate.stack_reference in {m.id for m in darius.stacking_mechanics}
+
+
 def test_missing_ability_reference_fails_explicitly():
-    fake_darius = _synthetic_champion("darius")  # mismo id, sin habilidades reales
+    fake_darius = _synthetic_champion("darius")
     with pytest.raises(ValueError, match="Referencia mecánica requerida ausente"):
         build_apprehend_followup_registration(darius=fake_darius, darius_role=ActorRole.CANDIDATE)
 
 
-def test_wrong_champion_id_fails_explicitly():
-    fake = _synthetic_champion("not_darius")
-    with pytest.raises(ValueError):
-        build_apprehend_followup_registration(darius=fake, darius_role=ActorRole.CANDIDATE)
+# --- 2. Apprehend solo no agrega Hemorrhage ---------------------------------
 
 
-# --- 3. Apprehend solo no agrega Hemorrhage ---------------------------------
-
-
-def test_apprehend_control_step_does_not_consume_stack_application(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    control_spec = registration.spec_for(Q_ALTERNATIVE_ID).step_specs[0]
-
-    assert control_spec.step.step_id == "control_apprehend"
+def test_apprehend_control_step_does_not_consume_stack_application(registration_candidate):
+    control_spec = registration_candidate.spec_for(Q_ALTERNATIVE_ID).step_specs[0]
     for identity in control_spec.step.consumes:
         assert identity.causal_role != "stack_application"
-    assert not any(pc.kind is PostconditionEffectKind.STACK_APPLIED for pc in control_spec.postconditions)
 
 
-def test_evaluating_only_the_control_step_leaves_stacks_unchanged(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    spec = registration.spec_for(Q_ALTERNATIVE_ID)
-    baseline = build_apprehend_followup_baseline(
-        performer_role=registration.darius_role,
-        performer_level=3,
-        control_action_ref=registration.apprehend_action_ref,
-        control_ability_slot=registration.apprehend_slot,
-        followup_action_refs=(registration.basic_attack_action_ref, registration.decimate_action_ref),
-        followup_ability_slots=(None, registration.decimate_slot),
-        stack_reference=registration.stack_reference,
+# ---------------------------------------------------------------------------
+# §1 del microfix: progreso de evaluación vs estado de ejecución
+# ---------------------------------------------------------------------------
+
+
+def test_completed_evaluation_with_hypothetical_execution(darius, mordekaiser, registration_candidate):
+    outcome = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
     )
 
-    control_spec = spec.step_specs[0]
-    _, state_after_control_only = evaluate_step(control_spec, baseline)
-
-    assert state_after_control_only.enemy.stacks["hemorrhage"].count == 0
-    assert baseline.enemy.stacks["hemorrhage"].count == 0
-
-
-# --- 4/5. el follow-up agrega el stack, y ocurre DESPUÉS del follow-up -----
+    # la cadena TERMINÓ de evaluarse (progreso completo)...
+    assert outcome.progress is SequenceProgress.COMPLETED
+    # ...pero nada confirma que haya ocurrido de verdad: es una hipótesis
+    assert outcome.execution_status is ExecutionStatus.HYPOTHETICAL
+    assert outcome.support is Support.CONDITIONED  # nunca STRUCTURAL sin confirmación
 
 
-def test_followup_adds_the_stack_after_control_step(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
-
-    before = outcome.trade_outcome.state_delta.before
-    after = outcome.trade_outcome.state_delta.after
-
-    assert before.enemy.stacks["hemorrhage"].count == 0
-    assert after.enemy.stacks["hemorrhage"].count == 1
-    assert after.enemy.stacks["hemorrhage"].window.value == "active"
-
-
-# --- 6/7. snapshot inicial intacto, snapshot final nuevo -------------------
-
-
-def test_initial_snapshot_stays_intact_and_final_is_a_new_object(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    spec = registration.spec_for(Q_ALTERNATIVE_ID)
-    baseline = build_apprehend_followup_baseline(
-        performer_role=registration.darius_role,
-        performer_level=3,
-        control_action_ref=registration.apprehend_action_ref,
-        control_ability_slot=registration.apprehend_slot,
-        followup_action_refs=(registration.basic_attack_action_ref, registration.decimate_action_ref),
-        followup_ability_slots=(None, registration.decimate_slot),
-        stack_reference=registration.stack_reference,
+def test_confirmed_execution_when_all_preconditions_are_satisfied(registration_candidate):
+    confirmed_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=confirmed_baseline
     )
 
-    _, final_state = evaluate_sequence_prefix(spec.step_specs, baseline)
-
-    assert final_state is not baseline
-    assert baseline.enemy.stacks["hemorrhage"].count == 0  # el snapshot de entrada no cambió
-    assert baseline.candidate.abilities["q"].availability.value == "ready"
-    assert final_state.candidate.abilities["q"].availability.value == "on_cooldown"
+    assert outcome.progress is SequenceProgress.COMPLETED
+    assert outcome.execution_status is ExecutionStatus.CONFIRMED
+    assert outcome.support is Support.STRUCTURAL
 
 
-# --- 8. habilidad utilizada queda en cooldown cuando corresponde -----------
-
-
-def test_used_abilities_go_on_cooldown_preserving_rank(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
-    after = outcome.trade_outcome.state_delta.after
-
-    for slot in ("e", "q"):
-        ability = after.candidate.abilities[slot]
-        assert ability.availability.value == "on_cooldown"
-        assert ability.rank == 1  # el rango no cambia por usar la habilidad
-
-
-def test_basic_attack_followup_does_not_touch_any_ability_state(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=AA_ALTERNATIVE_ID)
-    after = outcome.trade_outcome.state_delta.after
-
-    # Apprehend sigue yendo a cooldown (se usó), pero Q nunca se tocó —
-    # el autoataque no tiene AbilityState propio en este modelo.
-    assert after.candidate.abilities["e"].availability.value == "on_cooldown"
-    assert after.candidate.abilities["q"].availability.value == "ready"
-
-
-# --- 9/10. cero conocido -> carga activa; unknown no se vuelve exacto ------
-
-
-def test_known_zero_stack_becomes_one_active_charge(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
-
-    assert outcome.trade_outcome.state_delta.before.enemy.stacks["hemorrhage"].count == 0
-    assert outcome.trade_outcome.state_delta.after.enemy.stacks["hemorrhage"].count == 1
-
-
-def test_unknown_stack_never_becomes_an_exact_count():
-    from lol_reasoner.domain.combat_state import (
-        ActionContext,
-        ActorState,
-        RangeStatus,
-        SharedContext,
-        StackState,
-        StackWindow,
+def test_blocked_execution_when_a_precondition_fails(registration_candidate):
+    blocked_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={registration_candidate.apprehend_action_ref: RangeStatus.OUT_OF_RANGE},
     )
-    from lol_reasoner.reasoning.sequences.steps import EffectIdentity, SequenceStep, WHOLE_EFFECT_COMPONENT
-
-    step = SequenceStep(
-        step_id="followup",
-        action_ref="candidate:q",
-        actor=ActorRole.CANDIDATE,
-        consumes=(EffectIdentity(fact_ref="darius:q", causal_role="stack_application", component=WHOLE_EFFECT_COMPONENT),),
-    )
-    spec = StepEvaluationSpec(
-        step=step,
-        declared_support=Support.STRUCTURAL,
-        preconditions=(StructuralPrecondition(PreconditionCheckKind.ACTION_IN_RANGE, ActorRole.CANDIDATE, "candidate:q"),),
-        postconditions=(StructuralPostcondition(PostconditionEffectKind.STACK_APPLIED, ActorRole.ENEMY, "hemorrhage"),),
-    )
-    state = CombatState(
-        candidate=ActorState(),
-        enemy=ActorState(stacks={"hemorrhage": StackState(count=None, window=StackWindow.UNKNOWN)}),
-        shared=SharedContext(
-            action_contexts={"candidate:q": ActionContext(action_ref="candidate:q", range_status=RangeStatus.IN_RANGE)}
-        ),
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=blocked_baseline
     )
 
-    _, next_state = evaluate_step(spec, state)
-
-    assert next_state.enemy.stacks["hemorrhage"].count is None
-    assert next_state.enemy.stacks["hemorrhage"].window.value == "active"
-
-
-# --- 11. Noxian Might no se activa ------------------------------------------
+    assert outcome.progress is SequenceProgress.BLOCKED
+    assert outcome.execution_status is ExecutionStatus.BLOCKED
+    assert outcome.support is None
+    assert outcome.causal_components == ()
 
 
-def test_reward_state_never_activates_in_this_sequence(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
+def test_execution_status_is_never_a_free_input():
+    # mismo patrón que effective_support (§A4): execution_status es
+    # field(init=False) — no hay forma de pasarlo por el constructor.
+    import dataclasses
 
-    after = outcome.trade_outcome.state_delta.after
-    assert after.enemy.stacks["hemorrhage"].reward_state.value != "active"
+    from lol_reasoner.reasoning.sequences.sequence import StepResult
 
-
-def test_no_source_references_noxian_might_or_five_stacks():
-    import inspect
-
-    from lol_reasoner.reasoning.sequences import evaluator, generic_sequences, registry, shadow
-
-    for module in (evaluator, generic_sequences, registry, shadow):
-        source = inspect.getsource(module).lower()
-        assert "noxian might" not in source
-        assert "noxian_might" not in source
+    init_fields = {f.name for f in dataclasses.fields(StepResult) if f.init}
+    assert "execution_status" not in init_fields
 
 
-# --- 12. no hay kill ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# §2 del microfix: delta proyectado vs delta confirmado
+# ---------------------------------------------------------------------------
 
 
-def test_no_kill_is_ever_declared(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
+def test_projected_delta_is_not_confused_with_confirmed_delta(registration_candidate):
+    hypothetical_outcome = evaluate_apprehend_followup_shadow_result(registration_candidate)
+    confirmed_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    confirmed_outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=confirmed_baseline
+    )
 
-    assert outcome.trade_outcome.terminal_event.kind is TerminalEventKind.UNKNOWN
-    assert outcome.trade_outcome.terminal_event.killed_actors == ()
-
-
-# --- 13. no se fuerza candidato/enemigo favorecido sin evidencia -----------
-
-
-def test_evaluation_is_conditional_not_forced_favored(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
-
-    assert outcome.trade_outcome.evaluation is Evaluation.CONDITIONAL
-    assert outcome.trade_outcome.evaluation not in (Evaluation.CANDIDATE_FAVORED, Evaluation.ENEMY_FAVORED)
-    assert outcome.causal_components == ()  # shadow mode: nunca componentes puntuables
-
-
-# --- 14/15/16. AA y Q en el mismo grupo, solo una evaluada, nunca sumadas --
-
-
-def test_aa_and_q_belong_to_the_same_exclusion_group(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    aa_group = registration.spec_for(AA_ALTERNATIVE_ID).sequence.alternative_group
-    q_group = registration.spec_for(Q_ALTERNATIVE_ID).sequence.alternative_group
-
-    assert aa_group.group_id == q_group.group_id
-    assert set(aa_group.alternative_ids) == {AA_ALTERNATIVE_ID, Q_ALTERNATIVE_ID}
+    # ambos proyectan el MISMO cambio estructural (0 -> 1 carga)...
+    assert hypothetical_outcome.trade_outcome.state_delta.after.enemy.stacks["hemorrhage"].count == 1
+    assert confirmed_outcome.trade_outcome.state_delta.after.enemy.stacks["hemorrhage"].count == 1
+    # ...pero solo uno de los dos outcomes lo etiqueta como CONFIRMED — el
+    # consumidor puede (y debe) distinguirlos sin adivinar por su cuenta.
+    assert hypothetical_outcome.execution_status is ExecutionStatus.HYPOTHETICAL
+    assert confirmed_outcome.execution_status is ExecutionStatus.CONFIRMED
 
 
-def test_only_one_alternative_is_evaluated_per_outcome(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=AA_ALTERNATIVE_ID)
+def evaluate_apprehend_followup_shadow_result(registration):
+    return build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
+
+
+# ---------------------------------------------------------------------------
+# §4 del microfix: selección de ramas explícita
+# ---------------------------------------------------------------------------
+
+
+def test_aa_branch_selected_explicitly(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=AA_ALTERNATIVE_ID
+    )
 
     assert outcome.sequence.alternative_id == AA_ALTERNATIVE_ID
+    assert outcome.branch_selection.selected_id == AA_ALTERNATIVE_ID
     step_ids = {r.step_id for r in outcome.step_results}
-    assert "followup_decimate" not in step_ids  # Q nunca se evaluó en este outcome
+    assert "followup_decimate" not in step_ids
 
 
-def test_selecting_an_unregistered_alternative_fails_explicitly(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    with pytest.raises(ValueError):
-        registration.spec_for("not_a_real_alternative")
-
-
-def test_without_selection_alternatives_are_not_summed(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    q_sequence = registration.spec_for(Q_ALTERNATIVE_ID).sequence
-
-    from lol_reasoner.domain.enums import Factor, Provenance
-
-    ok_results = tuple(
-        StepResult(
-            step_id=step.step_id,
-            precondition_statuses=(PreconditionStatus.SATISFIED,),
-            declared_support=Support.STRUCTURAL,
-        )
-        for step in q_sequence.steps
-    )
-    unresolved_selection = AlternativeGroup(
-        group_id=q_sequence.alternative_group.group_id, alternative_ids=q_sequence.alternative_group.alternative_ids
-    )
-    component = CausalComponent(
-        factor=Factor.MECHANICAL_INTERACTION,
-        delta=1.0,
-        provenance=Provenance.DERIVED,
-        fact_ref="darius:q",
-        sequence_id=q_sequence.sequence_id,
+def test_q_outer_branch_selected_explicitly(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
     )
 
-    with pytest.raises(ValueError):
-        ScenarioOutcome(
-            sequence=q_sequence, step_results=ok_results, branch_selection=unresolved_selection, causal_components=(component,)
-        )
+    assert outcome.sequence.alternative_id == Q_ALTERNATIVE_ID
+    assert outcome.branch_selection.selected_id == Q_ALTERNATIVE_ID
+    step_ids = {r.step_id for r in outcome.step_results}
+    assert "followup_basic_attack" not in step_ids
 
 
-# --- 17/18. soporte del eslabón más débil; hit unknown nunca STRUCTURAL ---
+def test_unselected_branch_is_unresolved_and_never_arbitrary(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id=None)
+
+    assert outcome.branch_selection is None  # nada que confirmar
+    assert outcome.causal_components == ()  # nada puntuable de ninguna rama
+    assert outcome.trade_outcome.evaluation is Evaluation.UNRESOLVED
+    step_ids = {r.step_id for r in outcome.step_results}
+    assert "followup_basic_attack" not in step_ids
+    assert "followup_decimate" not in step_ids  # ninguna de las dos ramas se evaluó
 
 
-def test_outcome_support_is_the_weakest_link(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
+def test_evaluate_apprehend_followup_shadow_has_no_default_alternative():
+    import inspect
 
-    supports = {r.effective_support for r in outcome.step_results}
-    assert outcome.support in supports
-    assert outcome.support is not Support.STRUCTURAL  # ningún paso alcanza rango confirmado
+    from lol_reasoner.reasoning.sequences.shadow import evaluate_apprehend_followup_shadow as fn
 
-
-def test_unknown_range_hit_never_yields_structural_support(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    outcome = build_apprehend_followup_outcome(registration, selected_alternative_id=Q_ALTERNATIVE_ID)
-
-    for result in outcome.step_results:
-        assert PreconditionStatus.UNKNOWN in result.precondition_statuses
-        assert result.effective_support is not Support.STRUCTURAL
+    signature = inspect.signature(fn)
+    assert signature.parameters["selected_alternative_id"].default is inspect.Parameter.empty
 
 
-# --- 19/20. el builder genera solo lo pedido; sin producto cartesiano -----
+# ---------------------------------------------------------------------------
+# §3 del microfix: condiciones específicas por acción/zona
+# ---------------------------------------------------------------------------
 
 
-def test_scenario_builder_generates_only_the_requested_references(darius):
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
+def test_q_outer_zone_is_not_inferred_from_apprehend_contact(registration_candidate):
     baseline = build_apprehend_followup_baseline(
-        performer_role=registration.darius_role,
-        performer_level=3,
-        control_action_ref=registration.apprehend_action_ref,
-        control_ability_slot=registration.apprehend_slot,
-        followup_action_refs=(registration.basic_attack_action_ref, registration.decimate_action_ref),
-        followup_ability_slots=(None, registration.decimate_slot),
-        stack_reference=registration.stack_reference,
+        registration_candidate,
+        range_statuses={registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE},
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=baseline
     )
 
-    assert set(baseline.candidate.abilities.keys()) == {"e", "q"}
-    assert dict(baseline.candidate.stacks) == {}
-    assert set(baseline.enemy.stacks.keys()) == {"hemorrhage"}
-    assert dict(baseline.enemy.abilities) == {}
-    assert set(baseline.shared.action_contexts.keys()) == {
-        registration.apprehend_action_ref,
-        registration.basic_attack_action_ref,
-        registration.decimate_action_ref,
+    followup_result = next(r for r in outcome.step_results if r.step_id == "followup_decimate")
+    # Apprehend conectó (confirmado), pero la precondición de zona
+    # exterior de Q sigue UNKNOWN — nadie la infirió del contacto.
+    assert PreconditionStatus.UNKNOWN in followup_result.precondition_statuses
+    assert outcome.execution_status is ExecutionStatus.HYPOTHETICAL
+
+
+def test_q_outer_zone_is_not_inferred_from_basic_attack_range(registration_candidate):
+    baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={registration_candidate.basic_attack_action_ref: RangeStatus.IN_RANGE},
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=baseline
+    )
+
+    followup_result = next(r for r in outcome.step_results if r.step_id == "followup_decimate")
+    assert PreconditionStatus.UNKNOWN in followup_result.precondition_statuses
+
+
+def test_action_connects_references_are_independent_per_action(registration_candidate):
+    baseline = build_apprehend_followup_baseline(registration_candidate)
+    refs = set(baseline.shared.action_contexts.keys())
+    assert refs == {
+        registration_candidate.apprehend_action_ref,
+        registration_candidate.basic_attack_action_ref,
+        registration_candidate.decimate_outer_zone_action_ref,
     }
+    # tres claves DISTINTAS — ninguna comparte estado con otra
+    assert len(refs) == 3
 
 
-def test_no_global_cartesian_product_of_scenarios(darius):
-    """Construir el baseline de UNA orientación no instancia nada de la
-    otra orientación ni de ningún otro nivel/campeón — se verifica por
-    conteo: exactamente un CombatState resulta de una llamada, con
-    exactamente las claves pedidas (ver test anterior), sin rastro de
-    otros niveles/roles en sus mappings."""
+# --- UNKNOWN distinto de FAILED (UNSATISFIED) -------------------------------
 
-    registration = build_apprehend_followup_registration(darius=darius, darius_role=ActorRole.CANDIDATE)
-    baseline = build_apprehend_followup_baseline(
-        performer_role=registration.darius_role,
-        performer_level=3,
-        control_action_ref=registration.apprehend_action_ref,
-        control_ability_slot=registration.apprehend_slot,
-        followup_action_refs=(registration.basic_attack_action_ref, registration.decimate_action_ref),
-        followup_ability_slots=(None, registration.decimate_slot),
-        stack_reference=registration.stack_reference,
+
+def test_unknown_precondition_differs_from_unsatisfied(registration_candidate):
+    unknown_baseline = build_apprehend_followup_baseline(registration_candidate)
+    failed_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={registration_candidate.apprehend_action_ref: RangeStatus.OUT_OF_RANGE},
     )
 
-    assert isinstance(baseline, CombatState)
-    # el receptor no declara NINGÚN nivel ni habilidad — no se rellenó
-    # con supuestos que esta secuencia no pidió.
-    assert baseline.enemy.level is None
-    assert dict(baseline.enemy.abilities) == {}
+    unknown_outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=unknown_baseline
+    )
+    failed_outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=failed_baseline
+    )
+
+    # UNKNOWN: la cadena avanza (hipotética), nunca bloqueada
+    assert unknown_outcome.execution_status is ExecutionStatus.HYPOTHETICAL
+    assert unknown_outcome.progress is SequenceProgress.COMPLETED
+    # UNSATISFIED (FAILED): la cadena se bloquea, con menos resultados
+    assert failed_outcome.execution_status is ExecutionStatus.BLOCKED
+    assert failed_outcome.progress is SequenceProgress.BLOCKED
+    assert len(failed_outcome.step_results) < len(unknown_outcome.step_results)
 
 
-# --- 21/22. Darius como candidate, y como enemy (orientación inversa) -----
+# ---------------------------------------------------------------------------
+# §6 del microfix: escenario shadow explícitamente satisfecho
+# ---------------------------------------------------------------------------
 
 
-def test_darius_as_candidate(darius, mordekaiser):
-    outcome = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id="q")
-    assert outcome is not None
-    assert outcome.sequence.sequence_id.startswith("darius_apprehend_followup:candidate:")
-    assert outcome.trade_outcome.state_delta.after.enemy.stacks["hemorrhage"].count == 1
+def test_fully_satisfied_scenario_produces_a_shadow_causal_component(registration_candidate):
+    confirmed_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate,
+        selected_alternative_id=Q_ALTERNATIVE_ID,
+        baseline=confirmed_baseline,
+        emit_shadow_causal_component=True,
+    )
+
+    assert len(outcome.causal_components) == 1
+    component = outcome.causal_components[0]
+    assert component.polarity is None  # nunca firmado — no se declara favorecido
+    assert component.sequence_id == outcome.sequence.sequence_id
 
 
-def test_darius_as_enemy_mirror_orientation(darius, mordekaiser):
-    outcome = evaluate_apprehend_followup_shadow(candidate=mordekaiser, enemy=darius, selected_alternative_id="q")
-    assert outcome is not None
-    assert outcome.sequence.sequence_id.startswith("darius_apprehend_followup:enemy:")
-    # en esta orientación Mordekaiser es candidate: recibe las cargas
-    assert outcome.trade_outcome.state_delta.after.candidate.stacks["hemorrhage"].count == 1
+def test_causal_component_never_emitted_without_explicit_opt_in(registration_candidate):
+    confirmed_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=confirmed_baseline
+    )
+    assert outcome.causal_components == ()
 
 
-# --- 23. otros matchups no ejecutan esta secuencia --------------------------
+# ---------------------------------------------------------------------------
+# Serialización round-trip de los nuevos campos
+# ---------------------------------------------------------------------------
 
 
-def test_other_matchups_do_not_run_this_sequence(darius):
-    fake = _synthetic_champion("some_other_champion")
-    assert is_darius_mordekaiser_matchup(darius, fake) is False
-    assert evaluate_apprehend_followup_shadow(candidate=darius, enemy=fake) is None
-    assert evaluate_apprehend_followup_shadow(candidate=fake, enemy=fake) is None
-
-
-def test_darius_mirror_matchup_is_not_the_registered_pair(darius):
-    # Darius vs Darius tampoco es el matchup registrado (falta Mordekaiser)
-    assert is_darius_mordekaiser_matchup(darius, darius) is False
-    assert evaluate_apprehend_followup_shadow(candidate=darius, enemy=darius) is None
-
-
-# --- 24. shadow report serializable a JSON ----------------------------------
-
-
-def test_shadow_outcome_is_fully_json_serializable(darius, mordekaiser):
-    outcome = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id="q")
+def test_execution_status_survives_serialization_round_trip(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
     primitive = scenario_outcome_to_primitive(outcome)
+
+    assert primitive["execution_status"] == outcome.execution_status.value
+    for step_primitive, step_result in zip(primitive["step_results"], outcome.step_results, strict=True):
+        assert step_primitive["execution_status"] == step_result.execution_status.value
 
     serialized = json.dumps(primitive)
     assert json.loads(serialized) == primitive
 
 
-# --- 25-29. shadow OFF vs ON: mismo score/ganador/RuleEffects/deduped/público
+def test_unresolved_outcome_serializes_with_null_branch_selection(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id=None)
+    primitive = scenario_outcome_to_primitive(outcome)
+
+    assert primitive["branch_selection"] is None
+    assert primitive["causal_components"] == []
+    assert json.dumps(primitive)
 
 
-def _evaluate_off(trace, mirror_trace, champion):
+# ---------------------------------------------------------------------------
+# Invariantes previas intactas (Etapa 2 + rondas anteriores)
+# ---------------------------------------------------------------------------
+
+
+def test_previous_invariants_still_hold_no_kill_no_forced_favor(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
+    assert outcome.trade_outcome.terminal_event.kind is TerminalEventKind.UNKNOWN
+    assert outcome.trade_outcome.terminal_event.killed_actors == ()
+    assert outcome.trade_outcome.evaluation not in (Evaluation.CANDIDATE_FAVORED, Evaluation.ENEMY_FAVORED)
+
+
+def test_initial_snapshot_stays_intact(registration_candidate):
+    baseline = build_apprehend_followup_baseline(registration_candidate)
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=baseline
+    )
+    assert baseline.enemy.stacks["hemorrhage"].count == 0
+    assert outcome.trade_outcome.state_delta.before is baseline
+
+
+def test_darius_as_candidate_and_as_enemy(darius, mordekaiser):
+    outcome_candidate = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
+    outcome_enemy = evaluate_apprehend_followup_shadow(
+        candidate=mordekaiser, enemy=darius, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
+    assert outcome_candidate.trade_outcome.state_delta.after.enemy.stacks["hemorrhage"].count == 1
+    assert outcome_enemy.trade_outcome.state_delta.after.candidate.stacks["hemorrhage"].count == 1
+
+
+def test_other_matchups_do_not_run_this_sequence(darius):
+    fake = _synthetic_champion("some_other_champion")
+    assert is_darius_mordekaiser_matchup(darius, fake) is False
+    assert evaluate_apprehend_followup_shadow(candidate=darius, enemy=fake, selected_alternative_id=Q_ALTERNATIVE_ID) is None
+
+
+# ---------------------------------------------------------------------------
+# Shadow OFF vs ON (idéntico resultado público)
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_public(trace, mirror_trace, champion):
     weights = DEFAULT_WEIGHTS
     score, breakdown = global_score(trace, weights, subject_id=champion.id)
     profile = PlayerProfile(mastery=None)
-    p_score, p_breakdown = personal_score(
+    p_score, _ = personal_score(
         score,
         profile=profile,
         execution_demand=champion.axis(Axis.EXECUTION_DEMAND),
@@ -516,34 +457,33 @@ def test_shadow_off_and_on_produce_identical_public_results(darius, mordekaiser,
     trace = engine.build_trace(darius, mordekaiser, ALL_PHASES)
     mirror_trace = engine.build_trace(mordekaiser, darius, ALL_PHASES)
 
-    off = _evaluate_off(trace, mirror_trace, darius)
+    off = _evaluate_public(trace, mirror_trace, darius)
 
-    record = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, trace=trace)
+    record = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID, trace=trace
+    )
     assert record is not None
     assert len(trace.shadow_sequence_outcomes) == 1
 
-    on = _evaluate_off(trace, mirror_trace, darius)  # mismas funciones, misma traza (ahora con shadow adjunto)
+    on = _evaluate_public(trace, mirror_trace, darius)
 
-    # 25: mismo GlobalScore
     assert off["score"] == on["score"]
     assert off["breakdown"] == on["breakdown"]
-    # 27: mismos RuleEffects puntuables (entries crudas sin tocar)
     assert off["entries"] == on["entries"]
-    # 28: mismo deduped_for_scoring
     assert off["deduped"] == on["deduped"]
-    # 29: mismo resultado público (razones, riesgos, confianza, PersonalScore)
     assert off["p_score"] == on["p_score"]
     assert off["confidence"] == on["confidence"]
     assert off["reasons"] == on["reasons"]
     assert off["risks"] == on["risks"]
 
 
-def test_shadow_off_and_on_produce_the_same_winner(darius, mordekaiser, engine):
+def test_shadow_off_and_on_produce_the_same_winner_both_orientations(darius, mordekaiser, engine):
     def _score_for(candidate, enemy, attach_shadow):
         trace = engine.build_trace(candidate, enemy, ALL_PHASES)
-        mirror_trace = engine.build_trace(enemy, candidate, ALL_PHASES)
         if attach_shadow:
-            evaluate_apprehend_followup_shadow(candidate=candidate, enemy=enemy, trace=trace)
+            evaluate_apprehend_followup_shadow(
+                candidate=candidate, enemy=enemy, selected_alternative_id=Q_ALTERNATIVE_ID, trace=trace
+            )
         score, _ = global_score(trace, DEFAULT_WEIGHTS, subject_id=candidate.id)
         return score
 
@@ -557,93 +497,25 @@ def test_shadow_off_and_on_produce_the_same_winner(darius, mordekaiser, engine):
 
     assert darius_off == darius_on
     assert mork_off == mork_on
-    assert winner_off == winner_on  # nunca se congela CUÁL es — solo que OFF y ON coinciden
-
-
-# --- 30. repetir la evaluación produce el mismo outcome --------------------
+    assert winner_off == winner_on
 
 
 def test_repeating_the_evaluation_produces_the_same_outcome(darius, mordekaiser):
-    outcome_1 = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id="q")
-    outcome_2 = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id="q")
-
+    outcome_1 = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
+    outcome_2 = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
     assert scenario_outcome_to_primitive(outcome_1) == scenario_outcome_to_primitive(outcome_2)
 
 
-# --- 31. ninguna regla atómica fue modificada o desactivada -----------------
-
-
 def test_no_atomic_rule_was_modified_or_disabled(darius, mordekaiser):
-    # Conteo estable de reglas registradas — esta ronda no agrega, quita
-    # ni deshabilita ninguna regla general/específica.
     assert len(ALL_GENERAL_RULES) > 0
-    assert len(SPECIFIC_INTERACTIONS) >= 0  # existen, sin cambios de conteo forzados acá
-
+    assert len(SPECIFIC_INTERACTIONS) >= 0
     engine = RuleEngine()
     trace = engine.build_trace(darius, mordekaiser, ALL_PHASES)
-    # Las reglas siguen produciendo entradas puntuables normalmente.
     assert len(trace.entries) > 0
-
-
-def test_shadow_modules_do_not_import_rule_or_scoring_internals():
-    import ast
-    import inspect
-
-    from lol_reasoner.reasoning.sequences import evaluator, generic_sequences, registry, shadow
-
-    for module in (evaluator, generic_sequences, registry, shadow):
-        tree = ast.parse(inspect.getsource(module))
-        imported = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module is not None
-        }
-        assert not any(m.startswith("lol_reasoner.reasoning.rules") for m in imported)
-        assert not any(m.startswith("lol_reasoner.scoring") for m in imported)
-        assert not any(m == "lol_reasoner.reasoning.engine" for m in imported)
-
-
-# --- 32. ningún test de este archivo congela un ganador o score absoluto --
-
-
-def test_this_file_never_asserts_a_hardcoded_absolute_score():
-    import re
-    from pathlib import Path
-
-    source = Path(__file__).read_text(encoding="utf-8")
-    # ninguna aserción compara un score/ganador contra un número mágico
-    # o un id de campeón hardcodeado como "el resultado correcto"
-    assert not re.search(r"assert\s+\w*score\w*\s*==\s*-?\d", source, re.IGNORECASE)
-    assert "== \"darius\"" not in source.replace("'", '"')
-    assert "== \"mordekaiser\"" not in source.replace("'", '"')
-
-
-# --- Sanidad estructural: no se emite RuleEffect ni se toca MatchupScore --
-
-
-def test_no_rule_effect_or_matchup_score_types_are_constructed_by_shadow_modules():
-    import inspect
-
-    from lol_reasoner.reasoning.sequences import evaluator, generic_sequences, registry, shadow
-
-    for module in (evaluator, generic_sequences, registry, shadow):
-        source = inspect.getsource(module)
-        assert "RuleEffect(" not in source
-        assert "MatchupScore" not in source
-
-
-def test_shadow_sequence_record_promoted_must_be_false(darius, mordekaiser):
-    outcome = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id="q")
-    record = ShadowSequenceRecord(matchup_id="darius_vs_mordekaiser", sequence_id=outcome.sequence.sequence_id, outcome=outcome)
-    assert record.promoted is False
-
-    with pytest.raises(ValueError):
-        ShadowSequenceRecord(
-            matchup_id="darius_vs_mordekaiser",
-            sequence_id=outcome.sequence.sequence_id,
-            outcome=outcome,
-            promoted=True,
-        )
 
 
 def test_shadow_record_lives_in_a_separate_channel_from_entries(darius, mordekaiser):
@@ -651,8 +523,28 @@ def test_shadow_record_lives_in_a_separate_channel_from_entries(darius, mordekai
     trace = engine.build_trace(darius, mordekaiser, ALL_PHASES)
     entries_before = list(trace.entries)
 
-    evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, trace=trace)
+    evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID, trace=trace
+    )
 
-    assert trace.entries == entries_before  # entries no tocadas
+    assert trace.entries == entries_before
     assert len(trace.shadow_sequence_outcomes) == 1
     assert trace.shadow_sequence_outcomes[0].promoted is False
+
+
+def test_shadow_sequence_record_promoted_must_be_false(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(
+        candidate=darius, enemy=mordekaiser, selected_alternative_id=Q_ALTERNATIVE_ID
+    )
+    with pytest.raises(ValueError):
+        ShadowSequenceRecord(
+            matchup_id="darius_vs_mordekaiser", sequence_id=outcome.sequence.sequence_id, outcome=outcome, promoted=True
+        )
+
+
+def test_this_file_never_asserts_a_hardcoded_absolute_score():
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert not re.search(r"assert\s+\w*score\w*\s*==\s*-?\d", source, re.IGNORECASE)

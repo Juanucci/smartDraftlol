@@ -39,7 +39,14 @@ class FollowupAlternative:
     `ability_slot=None` representa un follow-up sin `AbilityState` propio
     (p. ej. un autoataque: no tiene rango de puntos ni cooldown modelado
     en `domain.combat_state`) — en ese caso no se declara precondición ni
-    postcondición de disponibilidad para él, solo la de rango.
+    postcondición de disponibilidad para él, solo la de conexión.
+
+    `connect_reference` (microfix de esta ronda): el `action_ref` que se
+    consulta para "¿esta alternativa conectó?" — por defecto igual a
+    `action_ref`, pero puede ser OTRO más específico (p. ej. la zona
+    exterior de una habilidad de dos zonas) cuando "estar en rango de la
+    habilidad" y "conectar en la zona geométrica que aplica el efecto" son
+    hechos distintos que no deben inferirse uno del otro (§3 del microfix).
     """
 
     alternative_id: str
@@ -49,6 +56,7 @@ class FollowupAlternative:
     consumes: EffectIdentity
     stack_target: ActorRole
     stack_reference: str
+    connect_reference: str | None = None  # None -> se completa con action_ref en __post_init__
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -65,6 +73,10 @@ class FollowupAlternative:
             raise TypeError(f"FollowupAlternative.consumes debe ser EffectIdentity, no {self.consumes!r}")
         if not isinstance(self.stack_target, ActorRole):
             raise TypeError(f"FollowupAlternative.stack_target debe ser ActorRole, no {self.stack_target!r}")
+        if self.connect_reference is None:
+            object.__setattr__(self, "connect_reference", self.action_ref)
+        elif not isinstance(self.connect_reference, str) or not self.connect_reference.strip():
+            raise ValueError(f"FollowupAlternative.connect_reference no puede ser vacío: {self.connect_reference!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +103,52 @@ class GenericSequenceSpec:
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class ControlFollowupFamily:
+    """Resultado completo de `build_control_into_stack_sequences`:
+
+    - `opening`: la secuencia de UN SOLO paso (solo control) — SIN
+      `alternative_group` (no es ninguna de las alternativas, es el tramo
+      compartido). Sirve para representar "todavía no se declaró qué
+      follow-up ocurre" sin elegir ninguno arbitrariamente: al no
+      pertenecer a ningún grupo, un `ScenarioOutcome` sobre `opening`
+      estructuralmente NO PUEDE recibir una `branch_selection` (lo
+      rechaza `ScenarioOutcome.__post_init__`, §A2) — nada que confirmar,
+      nada que sumar.
+    - `alternatives`: una `GenericSequenceSpec` por follow-up, cada una
+      con el MISMO paso de control (reutilizado, no duplicado) más su
+      propio follow-up, compartiendo un único `AlternativeGroup`.
+    """
+
+    opening: GenericSequenceSpec
+    alternatives: tuple[GenericSequenceSpec, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.opening, GenericSequenceSpec):
+            raise TypeError(f"ControlFollowupFamily.opening debe ser GenericSequenceSpec, no {self.opening!r}")
+        if self.opening.sequence.alternative_group is not None:
+            raise ValueError("ControlFollowupFamily.opening no puede pertenecer a ningún AlternativeGroup")
+        if not isinstance(self.alternatives, tuple) or not self.alternatives:
+            raise ValueError("ControlFollowupFamily.alternatives debe ser una tuple no vacía")
+        for alt in self.alternatives:
+            if not isinstance(alt, GenericSequenceSpec):
+                raise TypeError(f"ControlFollowupFamily.alternatives[] debe ser GenericSequenceSpec, no {alt!r}")
+            if alt.sequence.alternative_group is None:
+                raise ValueError(
+                    f"ControlFollowupFamily.alternatives[{alt.sequence.sequence_id!r}] debe pertenecer a "
+                    "un AlternativeGroup"
+                )
+
+    def spec_for(self, alternative_id: str) -> GenericSequenceSpec:
+        for spec in self.alternatives:
+            if spec.sequence.alternative_id == alternative_id:
+                return spec
+        raise ValueError(
+            f"{alternative_id!r} no es una alternativa registrada — disponibles: "
+            f"{[spec.sequence.alternative_id for spec in self.alternatives]!r}"
+        )
+
+
 def build_control_into_stack_sequences(
     *,
     group_id: str,
@@ -101,8 +159,9 @@ def build_control_into_stack_sequences(
     control_consumes: EffectIdentity,
     followups: tuple[FollowupAlternative, ...],
     sequence_id_prefix: str,
-) -> tuple[GenericSequenceSpec, ...]:
-    """Construye, para cada alternativa de `followups`, UNA
+) -> ControlFollowupFamily:
+    """Construye la familia completa: la secuencia `opening` (solo
+    control, sin rama) y, para cada alternativa de `followups`, UNA
     `InteractionSequence` de dos pasos (control + esa alternativa) con
     `AlternativeGroup`/`alternative_id` coherentes entre sí — nunca
     sumadas (una sola se evalúa/selecciona por ejecución, ver §A2/§B4).
@@ -129,7 +188,7 @@ def build_control_into_stack_sequences(
         step=control_step,
         declared_support=Support.STRUCTURAL,
         preconditions=(
-            StructuralPrecondition(PreconditionCheckKind.ACTION_IN_RANGE, control_actor, control_action_ref),
+            StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, control_actor, control_action_ref),
             StructuralPrecondition(PreconditionCheckKind.ABILITY_READY, control_actor, control_ability_slot),
         ),
         postconditions=(
@@ -138,8 +197,12 @@ def build_control_into_stack_sequences(
             ),
         ),
     )
+    opening = GenericSequenceSpec(
+        sequence=InteractionSequence(sequence_id=f"{sequence_id_prefix}:opening", steps=(control_step,)),
+        step_specs=(control_spec,),
+    )
 
-    specs: list[GenericSequenceSpec] = []
+    alternatives: list[GenericSequenceSpec] = []
     for followup in followups:
         followup_step = SequenceStep(
             step_id=followup.step_id,
@@ -149,7 +212,9 @@ def build_control_into_stack_sequences(
         )
 
         preconditions = [
-            StructuralPrecondition(PreconditionCheckKind.ACTION_IN_RANGE, control_actor, followup.action_ref)
+            StructuralPrecondition(
+                PreconditionCheckKind.ACTION_CONNECTS, control_actor, followup.connect_reference
+            )
         ]
         postconditions = [
             StructuralPostcondition(
@@ -179,6 +244,6 @@ def build_control_into_stack_sequences(
             alternative_group=group,
             alternative_id=followup.alternative_id,
         )
-        specs.append(GenericSequenceSpec(sequence=sequence, step_specs=(control_spec, followup_spec)))
+        alternatives.append(GenericSequenceSpec(sequence=sequence, step_specs=(control_spec, followup_spec)))
 
-    return tuple(specs)
+    return ControlFollowupFamily(opening=opening, alternatives=tuple(alternatives))
