@@ -33,7 +33,6 @@ from lol_reasoner.domain.combat_state import (
     AbilityState,
     ActionContext,
     CombatState,
-    InvalidatorStatus,
     RangeStatus,
     StackState,
     StackWindow,
@@ -73,7 +72,10 @@ Q_ALTERNATIVE_ID = "q"
 
 _MORDEKAISER_RESPONSE_SLOT = "Q"  # Obliterate
 _DARKNESS_RISE_MECHANIC_ID = "darkness_rise"
-APPREHEND_INTERRUPT_INVALIDATOR_KEY = "apprehend_interrupt"
+# NOTA (cierre de hardening §B4): esta ronda ya NO declara un invalidador
+# "apprehend_interrupt" reutilizando el CC breve de Apprehend contra la
+# respuesta de Mordekaiser — ver el docstring de `response_step` en
+# `build_bidirectional_trade_registration` para la cronología corregida.
 
 _PERFORMER_LEVEL = 3  # E y Q disponibles desde EARLY_LANE, para ambos campeones
 
@@ -313,11 +315,18 @@ def build_apprehend_followup_baseline(
 def _require_mordekaiser_response(mordekaiser: Champion) -> tuple[Ability, StackingMechanic]:
     """Resuelve y verifica Obliterate (Q) + Darkness Rise contra el
     conocimiento cargado — ver `build_bidirectional_trade_registration`
-    para la justificación de por qué esta es la respuesta elegida."""
+    para la justificación de por qué esta es la respuesta elegida.
+
+    Verifica AMBAS causas reales que justifican elegir esta respuesta
+    (cierre de hardening §B6): `DAMAGE` (al menos un efecto, condicionado
+    o no) Y `STACK_APPLICATION` condicionado a `ON_HIT` — nunca se declara
+    una justificación que la propia base de conocimiento no sostiene."""
 
     obliterate = _require_ability(mordekaiser, _MORDEKAISER_RESPONSE_SLOT)
     darkness_rise = _require_stacking_mechanic(mordekaiser, _DARKNESS_RISE_MECHANIC_ID)
 
+    if EffectType.DAMAGE not in obliterate.effect_types():
+        raise ValueError(f"{obliterate.name!r} ya no tiene ningún efecto DAMAGE — la referencia de conocimiento cambió")
     if EffectType.STACK_APPLICATION not in obliterate.effect_types():
         raise ValueError(f"{obliterate.name!r} ya no aplica STACK_APPLICATION — la referencia de conocimiento cambió")
     on_hit_stack_effects = [
@@ -357,20 +366,29 @@ def build_bidirectional_trade_registration(
     *, darius: Champion, mordekaiser: Champion, darius_role: ActorRole
 ) -> BidirectionalTradeRegistration:
     """Extiende la familia Apprehend-followup con LA respuesta elegida de
-    Mordekaiser: **Obliterate (Q)**.
+    Mordekaiser para ESTA vertical: **Obliterate (Q)**, una respuesta
+    OFENSIVA.
 
-    Justificación (no W, no autoataque): de las cuatro habilidades
+    Justificación de Obliterate (no autoataque): de las cuatro habilidades
     tempranas de Mordekaiser, Obliterate es la única con un efecto
     `DAMAGE` Y `STACK_APPLICATION` (`ON_HIT`) que además alimenta su
     PROPIA `StackingMechanic` (`darkness_rise`, `applied_by` incluye su
     slot) — una contrarrespuesta mecánicamente real y no trivial, no un
-    autoataque genérico. `W` (Indestructible) queda descartada
-    estructuralmente: sus únicos efectos son `SHIELD_FROM_STORED` y
-    `CONVERT_SHIELD_TO_HEAL` — no impacta al rival (mismo hecho ya
-    establecido por `test_darkness_rise_is_not_fed_by_w`), así que no
-    puede representar una respuesta ACTIVA dentro del trade. Mordekaiser
-    es `RESOURCELESS`, así que no hace falta modelar maná para poder
-    castear la respuesta.
+    autoataque genérico.
+
+    **Por qué no `W` esta ronda (corrección de hardening §B5)**: `W`
+    (Indestructible) NO fue descartada por ser estructuralmente inválida
+    como respuesta — sí es una respuesta DEFENSIVA activa real dentro de
+    un trade (acumula/convierte escudo real, un efecto mecánico legítimo).
+    Se excluyó únicamente porque esta vertical eligió deliberadamente
+    representar un contra-golpe OFENSIVO (Obliterate demuestra daño,
+    aplicación de stack Y cooldown en un solo paso, más rico para esta
+    prueba). Nada en el conocimiento cargado ni en este módulo exige que
+    una respuesta tenga que impactar al rival para ser válida — `W` sigue
+    disponible como una rama defensiva futura, no implementada en esta
+    ronda (ver `test_w_is_documented_as_a_future_defensive_branch_not_structurally_invalid`).
+    Mordekaiser es `RESOURCELESS`, así que no hace falta modelar maná para
+    poder castear la respuesta elegida.
     """
 
     base = build_apprehend_followup_registration(darius=darius, darius_role=darius_role)
@@ -378,6 +396,28 @@ def build_bidirectional_trade_registration(
         raise ValueError(f"build_bidirectional_trade_registration espera a Mordekaiser, recibió {mordekaiser.id!r}")
 
     obliterate, darkness_rise = _require_mordekaiser_response(mordekaiser)
+
+    # Auditoría de identidad de stacks (cierre de hardening §B8):
+    # `StackingMechanic.id` NO es único globalmente entre campeones — solo
+    # local por campeón (knowledge/loader.py no valida colisiones entre
+    # YAML de campeones distintos). Este trade es el ÚNICO lugar de todo
+    # el código que combina la mecánica RECIBIDA de un campeón
+    # (`base.stack_reference`, Hemorrhage) con la PROPIA de otro
+    # (`darkness_rise.id`) en el MISMO `ActorState.stacks` de Mordekaiser
+    # (ver `build_bidirectional_trade_baseline`) — si algún día coincidieran,
+    # se fusionarían silenciosamente en una sola entrada. Namespacing
+    # global (p. ej. `champion_id:mechanic_id`) tocaría `domain.champion`,
+    # el schema de conocimiento y las reglas de stacking — fuera de alcance
+    # esta ronda (LÍMITES) — así que la mitigación mínima es esta guarda
+    # explícita en el único punto real de colisión, que falla ruidosamente
+    # en vez de fusionar en silencio.
+    if base.stack_reference == darkness_rise.id:
+        raise ValueError(
+            f"Colisión de StackingMechanic.id detectada: {base.stack_reference!r} identificaría a "
+            "la vez la mecánica recibida de Darius y la propia de Mordekaiser en el mismo "
+            "ActorState.stacks — StackingMechanic.id no es único globalmente entre campeones; "
+            "esta construcción no puede continuar sin fusionar dos mecánicas distintas"
+        )
 
     mordekaiser_role = base.mordekaiser_role
     response_action_ref = action_ref_for(mordekaiser_role, obliterate.slot)
@@ -388,21 +428,35 @@ def build_bidirectional_trade_registration(
         action_ref=response_action_ref,
         actor=mordekaiser_role,
         declared_support=Support.STRUCTURAL,
+        # Cronología corregida (cierre de hardening §B4): la secuencia es
+        # Apprehend -> follow-up de Darius -> ESTA respuesta, evaluada
+        # DESPUÉS de que el follow-up ya ocurrió. El breve CC/interrupt de
+        # Apprehend (BRIEF_CC/INTERRUPT) ya se resolvió para entonces — no
+        # es coherente reusarlo como si siguiera activo para bloquear un
+        # tercer paso posterior, y este módulo no simula tiempo para saber
+        # si en cambio expiró. La respuesta se bloquea SOLO por sus propias
+        # precondiciones reales: alcance (`ACTION_CONNECTS`) y
+        # disponibilidad de la habilidad (`ABILITY_READY`) — nunca por un
+        # invalidador de un control que ya pasó. Un futuro "response
+        # window" contextual (ligado a esta rama del trade, no al CC
+        # inicial) queda fuera de esta ronda.
         preconditions=(
             StructuralPrecondition(PreconditionCheckKind.ACTION_CONNECTS, mordekaiser_role, response_action_ref),
             StructuralPrecondition(PreconditionCheckKind.ABILITY_READY, mordekaiser_role, response_slot),
-            # Apprehend incluye BRIEF_CC/INTERRUPT reales (ver Champion) —
-            # un desplazamiento NO garantiza automáticamente que bloquea
-            # la respuesta: solo la bloquea si este invalidador CONCRETO
-            # está PRESENT (§3 del trade). Ausente/UNKNOWN por defecto.
-            StructuralPrecondition(
-                PreconditionCheckKind.INVALIDATOR_ABSENT,
-                mordekaiser_role,
-                response_action_ref,
-                invalidator_key=APPREHEND_INTERRUPT_INVALIDATOR_KEY,
-            ),
         ),
+        # Ambas causas reales verificadas contra el conocimiento cargado
+        # (cierre de hardening §B6): el daño de Q Y la aplicación de
+        # Darkness Rise — la selección de esta respuesta se justificó por
+        # DAMAGE + STACK_APPLICATION (ver docstring de arriba), así que
+        # ambas identidades deben quedar trazables acá, nunca solo una.
+        # No se suman como "doble ventaja": son dos efectos reales
+        # distintos, cada uno con su propio causal_role.
         consumes=(
+            EffectIdentity(
+                fact_ref=f"{mordekaiser.id}:{response_slot}",
+                causal_role="damage",
+                component=WHOLE_EFFECT_COMPONENT,
+            ),
             EffectIdentity(
                 fact_ref=f"{mordekaiser.id}:{response_slot}",
                 causal_role="stack_application",
@@ -436,16 +490,19 @@ def build_bidirectional_trade_baseline(
     registration: BidirectionalTradeRegistration,
     *,
     range_statuses: Mapping[str, RangeStatus] | None = None,
-    response_invalidators: Mapping[str, InvalidatorStatus] | None = None,
     mordekaiser_initial_darkness_rise_count: int | None = 0,
 ) -> CombatState:
     """Escenario mínimo del trade: todo lo del baseline de
     Apprehend-followup, más disponibilidad de Obliterate, su propio
-    `ActionContext` (con los invalidadores declarados EXPLÍCITAMENTE — por
-    defecto `ABSENT`, "contexto normal", igual que el catálogo de
-    invalidadores point-and-click ya documentado en §B.7), y el stack
-    inicial de Darkness Rise EN Mordekaiser (acumulación propia, no
-    recibida).
+    `ActionContext`, y el stack inicial de Darkness Rise EN Mordekaiser
+    (acumulación propia, no recibida).
+
+    La respuesta YA NO declara ningún invalidador (cierre de hardening
+    §B4: la cronología de este trade nunca justificó reusar el CC breve
+    de Apprehend contra un tercer paso posterior) — este baseline no
+    declara ni rellena ninguno por default; `response_obliterate` se
+    bloquea únicamente por `ACTION_CONNECTS`/`ABILITY_READY`, igual que
+    cualquier otro paso de esta familia.
 
     `mordekaiser_initial_darkness_rise_count=None` deja el conteo inicial
     genuinamente desconocido (para probar que una aplicación sobre un
@@ -453,12 +510,6 @@ def build_bidirectional_trade_baseline(
 
     base = registration.apprehend_followup
     range_statuses = range_statuses or {}
-    # Convención ya documentada en §B.7: un invalidador point-and-click se
-    # declara ABSENT por defecto ("contexto normal") — una declaración
-    # explícita, no un default silencioso. Solo queda PRESENT/UNKNOWN si
-    # el caller lo pide para probar esa rama específica.
-    if response_invalidators is None:
-        response_invalidators = {APPREHEND_INTERRUPT_INVALIDATOR_KEY: InvalidatorStatus.ABSENT}
 
     relevant_refs = (base.apprehend_action_ref, base.basic_attack_action_ref, base.decimate_outer_zone_action_ref)
     action_contexts = {
@@ -468,7 +519,6 @@ def build_bidirectional_trade_baseline(
     action_contexts[registration.mordekaiser_response_action_ref] = ActionContext(
         action_ref=registration.mordekaiser_response_action_ref,
         range_status=range_statuses.get(registration.mordekaiser_response_action_ref, RangeStatus.UNKNOWN),
-        invalidators=dict(response_invalidators),
     )
 
     darius_abilities = {

@@ -31,8 +31,10 @@ from lol_reasoner.reasoning.sequences.registry import (
     is_darius_mordekaiser_matchup,
 )
 from lol_reasoner.reasoning.sequences.sequence import (
+    CalibrationStatus,
     Evaluation,
     ExecutionStatus,
+    InteractionSequence,
     PreconditionStatus,
     SequenceProgress,
     TerminalEventKind,
@@ -345,6 +347,132 @@ def test_causal_component_never_emitted_without_explicit_opt_in(registration_can
         registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=confirmed_baseline
     )
     assert outcome.causal_components == ()
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening §B2/§B3 — causalidad hipotética nunca se materializa;
+# ningún delta inventado
+# ---------------------------------------------------------------------------
+
+
+def test_hypothetical_execution_never_materializes_a_causal_component(registration_candidate):
+    # Baseline por defecto: todo UNKNOWN -> ejecución HYPOTHETICAL, nunca
+    # CONFIRMED. Aun con emit_shadow_causal_component=True, no debe
+    # materializarse ningún CausalComponent: una ejecución hipotética
+    # puede retener la identidad potencial (sigue en covers_causes/
+    # consumes), pero nunca se presenta como un componente materializado.
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate,
+        selected_alternative_id=Q_ALTERNATIVE_ID,
+        emit_shadow_causal_component=True,
+    )
+
+    assert outcome.execution_status is ExecutionStatus.HYPOTHETICAL
+    assert outcome.causal_components == ()
+    # la identidad potencial sigue siendo auditable en la propia secuencia
+    assert any(identity.causal_role == "stack_application" for identity in outcome.sequence.covers_causes)
+
+
+def test_blocked_execution_never_materializes_a_causal_component(registration_candidate):
+    blocked_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={registration_candidate.decimate_outer_zone_action_ref: RangeStatus.OUT_OF_RANGE},
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate,
+        selected_alternative_id=Q_ALTERNATIVE_ID,
+        baseline=blocked_baseline,
+        emit_shadow_causal_component=True,
+    )
+
+    assert outcome.execution_status is ExecutionStatus.BLOCKED
+    assert outcome.causal_components == ()
+
+
+def test_confirmed_causal_component_has_no_invented_numeric_delta(registration_candidate):
+    confirmed_baseline = build_apprehend_followup_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_apprehend_followup_outcome(
+        registration_candidate,
+        selected_alternative_id=Q_ALTERNATIVE_ID,
+        baseline=confirmed_baseline,
+        emit_shadow_causal_component=True,
+    )
+
+    component = outcome.causal_components[0]
+    assert component.calibration_status is CalibrationStatus.UNCALIBRATED
+    assert component.delta is None  # nunca un placeholder numérico (antes: 1.0 sin calibración real)
+
+
+def test_shadow_causal_component_selects_by_causal_role_never_by_position():
+    # §B3: un paso que consume MÁS de una identidad no debe elegir "el
+    # primer elemento" — la selección es explícita por causal_role.
+    from lol_reasoner.reasoning.sequences.shadow import _shadow_causal_component
+    from lol_reasoner.reasoning.sequences.steps import EffectIdentity, SequenceStep, WHOLE_EFFECT_COMPONENT
+    from lol_reasoner.domain.enums import Support
+
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        consumes=(
+            EffectIdentity(fact_ref="synthetic:q", causal_role="damage", component=WHOLE_EFFECT_COMPONENT),
+            EffectIdentity(fact_ref="synthetic:q", causal_role="stack_application", component=WHOLE_EFFECT_COMPONENT),
+        ),
+    )
+    seq = InteractionSequence(sequence_id="seq_multi", steps=(step,))
+
+    component = _shadow_causal_component(seq, sequence_id="seq_multi")
+
+    # "damage" es el PRIMER elemento de consumes — la selección real elige
+    # "stack_application" por su causal_role, nunca por posición.
+    assert component.fact_ref == "synthetic:q"
+    consumed = next(i for i in step.consumes if i.causal_role == "stack_application")
+    assert component.fact_ref == consumed.fact_ref
+
+
+def test_shadow_causal_component_fails_explicitly_without_a_stack_application_identity():
+    from lol_reasoner.reasoning.sequences.shadow import _shadow_causal_component
+    from lol_reasoner.reasoning.sequences.steps import EffectIdentity, SequenceStep, WHOLE_EFFECT_COMPONENT
+    from lol_reasoner.domain.enums import Support
+
+    step = SequenceStep(
+        step_id="s1",
+        action_ref="candidate:q",
+        actor=ActorRole.CANDIDATE,
+        declared_support=Support.STRUCTURAL,
+        consumes=(EffectIdentity(fact_ref="synthetic:q", causal_role="damage", component=WHOLE_EFFECT_COMPONENT),),
+    )
+    seq = InteractionSequence(sequence_id="seq_no_stack", steps=(step,))
+
+    with pytest.raises(ValueError):
+        _shadow_causal_component(seq, sequence_id="seq_no_stack")
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening §B1 — rama irresuelta conserva sus alternativas
+# ---------------------------------------------------------------------------
+
+
+def test_apprehend_followup_pending_alternatives_preserved_when_unresolved(darius, mordekaiser):
+    outcome = evaluate_apprehend_followup_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id=None)
+
+    assert outcome.branch_selection is None
+    assert outcome.pending_alternatives is not None
+    assert outcome.pending_alternatives.selected_id is None
+    assert set(outcome.pending_alternatives.alternative_ids) == {AA_ALTERNATIVE_ID, Q_ALTERNATIVE_ID}
+    assert outcome.causal_components == ()
+
+
+def test_apprehend_followup_pending_alternatives_absent_once_selected(registration_candidate):
+    outcome = build_apprehend_followup_outcome(registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID)
+    assert outcome.pending_alternatives is None
 
 
 # ---------------------------------------------------------------------------

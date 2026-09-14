@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from lol_reasoner.reasoning.sequences.sequence import (
     AlternativeGroup,
+    CalibrationStatus,
     CausalComponent,
     Evaluation,
     ExecutionStatus,
@@ -49,6 +50,7 @@ __all__ = [
     "WHOLE_EFFECT_COMPONENT",
     "ActorRole",
     "AlternativeGroup",
+    "CalibrationStatus",
     "CausalComponent",
     "EffectIdentity",
     "Evaluation",

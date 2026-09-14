@@ -28,6 +28,7 @@ from lol_reasoner.reasoning.sequences import (
     WHOLE_EFFECT_COMPONENT,
     ActorRole,
     AlternativeGroup,
+    CalibrationStatus,
     CausalComponent,
     EffectIdentity,
     Evaluation,
@@ -116,6 +117,7 @@ def _blocked_result(step_id: str = "s1") -> StepResult:
 def _causal_component(sequence_id: str = "seq", *, polarity: Polarity | None = None) -> CausalComponent:
     return CausalComponent(
         factor=Factor.MECHANICAL_INTERACTION,
+        calibration_status=CalibrationStatus.CALIBRATED,
         delta=1.0,
         provenance=Provenance.DERIVED,
         fact_ref="synthetic:q",
@@ -640,6 +642,7 @@ def test_multiple_causal_components_preserve_separate_factors_and_deltas():
 
     component_a = CausalComponent(
         factor=Factor.MECHANICAL_INTERACTION,
+        calibration_status=CalibrationStatus.CALIBRATED,
         delta=2.0,
         provenance=Provenance.DERIVED,
         fact_ref="synthetic:q",
@@ -648,6 +651,7 @@ def test_multiple_causal_components_preserve_separate_factors_and_deltas():
     )
     component_b = CausalComponent(
         factor=Factor.STACKING_PAYOFF,
+        calibration_status=CalibrationStatus.CALIBRATED,
         delta=0.5,
         provenance=Provenance.DERIVED,
         fact_ref="synthetic:passive",
@@ -671,6 +675,7 @@ def test_causal_component_rejects_wrong_typed_delta():
     with pytest.raises(TypeError):
         CausalComponent(
             factor=Factor.MECHANICAL_INTERACTION,
+            calibration_status=CalibrationStatus.CALIBRATED,
             delta="2.0",  # type: ignore[arg-type]
             provenance=Provenance.DERIVED,
             fact_ref="synthetic:q",
@@ -682,11 +687,54 @@ def test_causal_component_rejects_bool_delta():
     with pytest.raises(TypeError):
         CausalComponent(
             factor=Factor.MECHANICAL_INTERACTION,
+            calibration_status=CalibrationStatus.CALIBRATED,
             delta=True,  # type: ignore[arg-type]
             provenance=Provenance.DERIVED,
             fact_ref="synthetic:q",
             sequence_id="seq",
         )
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — CalibrationStatus reemplaza el placeholder numérico
+# ---------------------------------------------------------------------------
+
+
+def test_causal_component_calibrated_requires_a_real_delta():
+    with pytest.raises(TypeError):
+        CausalComponent(
+            factor=Factor.MECHANICAL_INTERACTION,
+            calibration_status=CalibrationStatus.CALIBRATED,
+            delta=None,
+            provenance=Provenance.DERIVED,
+            fact_ref="synthetic:q",
+            sequence_id="seq",
+        )
+
+
+def test_causal_component_uncalibrated_forbids_any_delta():
+    with pytest.raises(ValueError):
+        CausalComponent(
+            factor=Factor.MECHANICAL_INTERACTION,
+            calibration_status=CalibrationStatus.UNCALIBRATED,
+            delta=1.0,  # nunca un número inventado para "rellenar" un componente sin calibrar
+            provenance=Provenance.DERIVED,
+            fact_ref="synthetic:q",
+            sequence_id="seq",
+        )
+
+
+def test_causal_component_uncalibrated_with_no_delta_is_valid():
+    component = CausalComponent(
+        factor=Factor.MECHANICAL_INTERACTION,
+        calibration_status=CalibrationStatus.UNCALIBRATED,
+        delta=None,
+        provenance=Provenance.DERIVED,
+        fact_ref="synthetic:q",
+        sequence_id="seq",
+    )
+    assert component.delta is None
+    assert component.calibration_status is CalibrationStatus.UNCALIBRATED
 
 
 # --- ScenarioOutcome: no emite RuleEffect, no toca el score -----------------

@@ -14,17 +14,17 @@ import json
 
 import pytest
 
-from lol_reasoner.domain.combat_state import InvalidatorStatus, RangeStatus
+from lol_reasoner.domain.combat_state import RangeStatus
 from lol_reasoner.domain.enums import ALL_PHASES, Axis
 from lol_reasoner.explain.narrator import build_reasons, build_risks
 from lol_reasoner.reasoning.engine import RuleEngine
 from lol_reasoner.reasoning.sequences.registry import (
-    APPREHEND_INTERRUPT_INVALIDATOR_KEY,
     Q_ALTERNATIVE_ID,
     build_bidirectional_trade_baseline,
     build_bidirectional_trade_registration,
 )
 from lol_reasoner.reasoning.sequences.sequence import (
+    CalibrationStatus,
     Evaluation,
     ExecutionStatus,
     PreconditionStatus,
@@ -131,10 +131,14 @@ def test_mordekaiser_response_is_hypothetical_by_default(registration_candidate)
     assert PreconditionStatus.UNKNOWN in [r.status for r in response_result.precondition_results]
 
 
-def test_mordekaiser_response_blocked_when_apprehend_interrupt_present(registration_candidate):
+def test_mordekaiser_response_blocked_by_its_own_out_of_range_precondition(registration_candidate):
+    # Cierre de hardening (§B4): la respuesta ya NO se bloquea reusando el
+    # CC breve de Apprehend (incoherente cronológicamente — ya pasó para
+    # cuando se evalúa esta respuesta) — se bloquea SOLO por sus propias
+    # precondiciones reales, como cualquier otro paso: acá, alcance.
     blocked_baseline = build_bidirectional_trade_baseline(
         registration_candidate,
-        response_invalidators={APPREHEND_INTERRUPT_INVALIDATOR_KEY: InvalidatorStatus.PRESENT},
+        range_statuses={registration_candidate.mordekaiser_response_action_ref: RangeStatus.OUT_OF_RANGE},
     )
     outcome = build_bidirectional_trade_outcome(
         registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=blocked_baseline
@@ -148,6 +152,16 @@ def test_mordekaiser_response_blocked_when_apprehend_interrupt_present(registrat
     assert outcome.trade_outcome.state_delta.after.enemy.stacks["darkness_rise"].count == 0
 
 
+def test_response_action_context_never_declares_an_invalidator_by_default(registration_candidate):
+    # Cierre de hardening (§B4): ningún invalidador se rellena en silencio
+    # con ABSENT cuando el caller no lo declara — la referencia queda
+    # genuinamente sin invalidadores (ausencia real, nunca "contexto
+    # normal" asumido).
+    baseline = build_bidirectional_trade_baseline(registration_candidate)
+    response_context = baseline.shared.action_contexts[registration_candidate.mordekaiser_response_action_ref]
+    assert dict(response_context.invalidators) == {}
+
+
 def test_mordekaiser_response_satisfied_when_everything_confirmed(registration_candidate):
     confirmed_baseline = build_bidirectional_trade_baseline(
         registration_candidate,
@@ -156,7 +170,6 @@ def test_mordekaiser_response_satisfied_when_everything_confirmed(registration_c
             registration_candidate.apprehend_followup.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
             registration_candidate.mordekaiser_response_action_ref: RangeStatus.IN_RANGE,
         },
-        response_invalidators={APPREHEND_INTERRUPT_INVALIDATOR_KEY: InvalidatorStatus.ABSENT},
     )
     outcome = build_bidirectional_trade_outcome(
         registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=confirmed_baseline
@@ -410,14 +423,25 @@ def test_trade_shadow_off_and_on_produce_the_same_winner(darius, mordekaiser, en
 
 
 def test_no_rule_effect_or_scoring_types_constructed_by_trade_modules():
+    # Reemplaza el grep tautológico anterior (buscar "RuleEffect(" como
+    # string) por una verificación real de comportamiento: ni registry.py
+    # ni shadow.py pueden siquiera IMPORTAR nada de rules/scoring (AST,
+    # no substring) — así que es estructuralmente imposible que construyan
+    # un RuleEffect/MatchupScore, no solo "no se encontró la palabra".
+    import ast
     import inspect
 
     from lol_reasoner.reasoning.sequences import registry, shadow
 
+    forbidden_prefixes = ("lol_reasoner.reasoning.rules", "lol_reasoner.scoring")
     for module in (registry, shadow):
-        source = inspect.getsource(module)
-        assert "RuleEffect(" not in source
-        assert "MatchupScore" not in source
+        tree = ast.parse(inspect.getsource(module))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                assert not node.module.startswith(forbidden_prefixes), (
+                    f"{module.__name__} importa {node.module!r} — no puede depender de reglas "
+                    "atómicas ni de scoring"
+                )
 
 
 def test_this_file_never_asserts_a_hardcoded_absolute_score():
@@ -426,3 +450,116 @@ def test_this_file_never_asserts_a_hardcoded_absolute_score():
 
     source = Path(__file__).read_text(encoding="utf-8")
     assert not re.search(r"assert\s+\w*score\w*\s*==\s*-?\d", source, re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Cierre de hardening — Fase B
+# ---------------------------------------------------------------------------
+
+
+def test_response_covers_both_damage_and_stack_application_causes(registration_candidate):
+    # §B6: la respuesta se justificó por DAMAGE + STACK_APPLICATION — ambas
+    # identidades deben quedar trazables en el paso, nunca solo una.
+    response_step = registration_candidate.spec_for(Q_ALTERNATIVE_ID).steps[-1]
+    causal_roles = {identity.causal_role for identity in response_step.consumes}
+    assert causal_roles == {"damage", "stack_application"}
+    # dos efectos reales distintos — nunca se funden en una sola identidad
+    # ni se cuentan como si fueran el mismo hecho duplicado.
+    assert len(response_step.consumes) == 2
+
+
+def test_w_is_documented_as_a_future_defensive_branch_not_structurally_invalid(registration_candidate):
+    # §B5: W (Indestructible) es una respuesta DEFENSIVA activa real — se
+    # excluyó porque esta vertical eligió un contra-golpe ofensivo, nunca
+    # porque fuera inválida. La documentación debe decirlo explícitamente,
+    # nunca dejar la vieja afirmación de invalidez estructural.
+    from lol_reasoner.reasoning.sequences.registry import build_bidirectional_trade_registration
+
+    doc = (build_bidirectional_trade_registration.__doc__ or "").lower()
+    assert "defensiva activa real" in doc
+    assert "rama defensiva futura" in doc
+    # la vieja afirmación ("queda descartada estructuralmente") ya no está
+    assert "queda descartada estructuralmente" not in doc
+
+
+def test_stacking_mechanic_id_collision_between_champions_fails_explicitly(darius, mordekaiser, monkeypatch):
+    # §B8: StackingMechanic.id no es único globalmente entre campeones (la
+    # base de conocimiento no lo valida) — si dos ids coincidieran (ninguno
+    # lo hace realmente con el par cargado; se fuerza acá con un
+    # contrafactual), este módulo debe fallar explícito en vez de fusionar
+    # silenciosamente ambas mecánicas en el mismo ActorState.stacks.
+    import dataclasses
+
+    from lol_reasoner.reasoning.sequences import registry
+
+    colliding_mordekaiser = dataclasses.replace(
+        mordekaiser,
+        stacking_mechanics=tuple(
+            dataclasses.replace(m, id="hemorrhage") if m.id == "darkness_rise" else m
+            for m in mordekaiser.stacking_mechanics
+        ),
+    )
+    monkeypatch.setattr(registry, "_DARKNESS_RISE_MECHANIC_ID", "hemorrhage")
+
+    with pytest.raises(ValueError, match="Colisión de StackingMechanic.id"):
+        registry.build_bidirectional_trade_registration(
+            darius=darius, mordekaiser=colliding_mordekaiser, darius_role=ActorRole.CANDIDATE
+        )
+
+
+def test_stacking_mechanic_ids_do_not_collide_for_the_real_pair(darius, mordekaiser):
+    # Demuestra, con el conocimiento REAL cargado, que hemorrhage y
+    # darkness_rise son ids distintos — la guarda de arriba nunca dispara
+    # para el par real.
+    hemorrhage_id = next(m.id for m in darius.stacking_mechanics if m.id == "hemorrhage")
+    darkness_rise_id = next(m.id for m in mordekaiser.stacking_mechanics if m.id == "darkness_rise")
+    assert hemorrhage_id != darkness_rise_id
+
+
+def test_pending_alternatives_preserved_when_trade_is_unresolved(darius, mordekaiser):
+    # §B1: la rama irresuelta conserva auditablemente qué alternativas
+    # existían (group_id + aa/q), con selected_id=None — nunca se simula
+    # ni promedia ninguna, y nunca se elige una por defecto.
+    outcome = evaluate_bidirectional_trade_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id=None)
+
+    assert outcome.branch_selection is None
+    assert outcome.pending_alternatives is not None
+    assert outcome.pending_alternatives.selected_id is None
+    assert set(outcome.pending_alternatives.alternative_ids) == {"aa", "q"}
+    assert outcome.causal_components == ()
+
+
+def test_pending_alternatives_absent_once_a_branch_is_selected(registration_candidate):
+    outcome = build_bidirectional_trade_outcome(registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID)
+    assert outcome.pending_alternatives is None
+    assert outcome.branch_selection is not None
+    assert outcome.branch_selection.selected_id == Q_ALTERNATIVE_ID
+
+
+def test_pending_alternatives_serializes_with_null_selection(darius, mordekaiser):
+    outcome = evaluate_bidirectional_trade_shadow(candidate=darius, enemy=mordekaiser, selected_alternative_id=None)
+    primitive = scenario_outcome_to_primitive(outcome)
+
+    assert primitive["pending_alternatives"] is not None
+    assert primitive["pending_alternatives"]["selected_id"] is None
+    assert set(primitive["pending_alternatives"]["alternative_ids"]) == {"aa", "q"}
+    assert primitive["branch_selection"] is None
+
+
+def test_bidirectional_trade_never_emits_a_causal_component_by_design(registration_candidate):
+    # Decisión explícita de esta ronda (§B2/§B7): el trade bidireccional
+    # sigue sin exponer un emit_shadow_causal_component propio — nunca
+    # produce componentes, confirmado o no.
+    confirmed_baseline = build_bidirectional_trade_baseline(
+        registration_candidate,
+        range_statuses={
+            registration_candidate.apprehend_followup.apprehend_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.apprehend_followup.decimate_outer_zone_action_ref: RangeStatus.IN_RANGE,
+            registration_candidate.mordekaiser_response_action_ref: RangeStatus.IN_RANGE,
+        },
+    )
+    outcome = build_bidirectional_trade_outcome(
+        registration_candidate, selected_alternative_id=Q_ALTERNATIVE_ID, baseline=confirmed_baseline
+    )
+    assert outcome.execution_status is ExecutionStatus.CONFIRMED
+    assert outcome.causal_components == ()

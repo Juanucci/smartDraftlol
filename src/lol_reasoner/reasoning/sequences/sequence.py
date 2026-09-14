@@ -635,6 +635,21 @@ class TradeOutcome:
 # ---------------------------------------------------------------------------
 
 
+class CalibrationStatus(str, Enum):
+    """Cierre de hardening (§B3): reemplaza el placeholder
+    `delta=1.0` que no tenía calibración ni significado real. Un
+    `CausalComponent` declara EXPLÍCITAMENTE si su `delta` es una
+    magnitud calibrada (un número real, producto de una conversión ya
+    validada) o si todavía no hay ninguna — nunca un número inventado
+    disfrazado de magnitud real. Cualquier promoción futura hacia
+    scoring debe exigir `CALIBRATED` antes de leer `delta`; esta ronda
+    no calibra nada ni implementa esa promoción, solo hace la distinción
+    estructuralmente imposible de ignorar."""
+
+    CALIBRATED = "calibrated"
+    UNCALIBRATED = "uncalibrated"
+
+
 @dataclass(frozen=True, slots=True)
 class CausalComponent:
     """Un componente causal individual dentro de una secuencia — puede
@@ -644,11 +659,20 @@ class CausalComponent:
     `Factor`/`Provenance`/`Polarity` de `domain.enums` — no declara
     vocabulario paralelo.
 
+    **`calibration_status`/`delta`** (cierre de hardening §B3): no hay
+    forma de declarar un componente "calibrado" sin un `delta` real, ni
+    de darle un `delta` a un componente todavía sin calibrar — el
+    `__post_init__` lo impide. `CALIBRATED` exige `delta` un número real;
+    `UNCALIBRATED` exige `delta is None` — nunca otro número inventado
+    para "rellenar" el campo. Esto reemplaza el placeholder numérico que
+    usaba shadow.py sin calibración real.
+
     Esta etapa solo REPRESENTA el componente; no lo envía a
     `scoring`/`RuleEffect` (eso es K, ya existente y sin cambios)."""
 
     factor: Factor
-    delta: float
+    calibration_status: CalibrationStatus
+    delta: float | None
     provenance: Provenance
     fact_ref: str  # referencia al hecho mecánico concreto que originó este componente
     sequence_id: str  # referencia común a la secuencia que lo produjo
@@ -659,10 +683,21 @@ class CausalComponent:
             raise TypeError(
                 f"CausalComponent.factor debe ser Factor, no {self.factor!r} ({type(self.factor).__name__})"
             )
-        if isinstance(self.delta, bool) or not isinstance(self.delta, (int, float)):
+        if not isinstance(self.calibration_status, CalibrationStatus):
             raise TypeError(
-                f"CausalComponent.delta debe ser un número real, no {self.delta!r} "
-                f"({type(self.delta).__name__})"
+                f"CausalComponent.calibration_status debe ser CalibrationStatus, no "
+                f"{self.calibration_status!r} ({type(self.calibration_status).__name__})"
+            )
+        if self.calibration_status is CalibrationStatus.CALIBRATED:
+            if self.delta is None or isinstance(self.delta, bool) or not isinstance(self.delta, (int, float)):
+                raise TypeError(
+                    "CausalComponent.delta debe ser un número real cuando calibration_status es "
+                    f"CALIBRATED, no {self.delta!r} ({type(self.delta).__name__})"
+                )
+        elif self.delta is not None:
+            raise ValueError(
+                "CausalComponent.delta debe ser None cuando calibration_status es UNCALIBRATED — "
+                f"nunca un número inventado para rellenarlo (recibido {self.delta!r})"
             )
         if not isinstance(self.provenance, Provenance):
             raise TypeError(
@@ -725,6 +760,18 @@ class ScenarioOutcome:
       `CausalComponent` con `polarity` firmada — `NEUTRAL`/`CONDITIONAL`/
       `UNRESOLVED` nunca fuerzan una polaridad.
 
+    **`pending_alternatives`** (cierre de hardening §B1): declara,
+    INDEPENDIENTEMENTE de `branch_selection`, que esta secuencia (típicamente
+    la `opening` de una `ControlFollowupFamily` — sin `alternative_group`
+    propio) tiene un punto de decisión pendiente con estas alternativas
+    disponibles — nunca confirma ninguna (`selected_id` debe ser `None`,
+    blindado en `__post_init__`; una alternativa ya confirmada pertenece a
+    `branch_selection`, no acá). No simula ni promedia ramas: es
+    puramente informativo, para que un `ScenarioOutcome` irresuelto no
+    pierda auditablemente qué alternativas existían. Nunca habilita
+    `causal_components` por sí solo — eso sigue exigiendo una secuencia
+    QUE PERTENEZCA a un grupo con su alternativa confirmada.
+
     No emite `RuleEffect` ni modifica `MatchupScore` — eso pertenece al
     contrato K, ya existente, sin cambios en esta ronda."""
 
@@ -732,6 +779,7 @@ class ScenarioOutcome:
     step_results: tuple[StepResult, ...]
     trade_outcome: TradeOutcome | None = None
     branch_selection: AlternativeGroup | None = None
+    pending_alternatives: AlternativeGroup | None = None
     causal_components: tuple[CausalComponent, ...] = field(default_factory=tuple)
     support: Support | None = field(init=False, default=None)
     progress: SequenceProgress = field(init=False, default=None)  # type: ignore[assignment]
@@ -801,6 +849,19 @@ class ScenarioOutcome:
                 f"ScenarioOutcome.branch_selection debe ser AlternativeGroup o None, no "
                 f"{self.branch_selection!r} ({type(self.branch_selection).__name__})"
             )
+        if self.pending_alternatives is not None:
+            if not isinstance(self.pending_alternatives, AlternativeGroup):
+                raise TypeError(
+                    f"ScenarioOutcome.pending_alternatives debe ser AlternativeGroup o None, no "
+                    f"{self.pending_alternatives!r} ({type(self.pending_alternatives).__name__})"
+                )
+            if self.pending_alternatives.selected_id is not None:
+                raise ValueError(
+                    "ScenarioOutcome.pending_alternatives declara un punto de decisión TODAVÍA "
+                    f"pendiente — su selected_id debe ser None (recibido "
+                    f"{self.pending_alternatives.selected_id!r}); una alternativa ya confirmada "
+                    "pertenece a branch_selection, no a pending_alternatives"
+                )
         if not isinstance(self.causal_components, tuple):
             raise TypeError(
                 f"ScenarioOutcome.causal_components debe ser tuple, no "
@@ -934,6 +995,7 @@ def _trade_outcome_to_primitive(trade: TradeOutcome) -> dict[str, object]:
 def _causal_component_to_primitive(component: CausalComponent) -> dict[str, object]:
     return {
         "factor": component.factor.value,
+        "calibration_status": component.calibration_status.value,
         "delta": component.delta,
         "provenance": component.provenance.value,
         "fact_ref": component.fact_ref,
@@ -1002,6 +1064,11 @@ def scenario_outcome_to_primitive(outcome: ScenarioOutcome) -> dict[str, object]
         "branch_selection": (
             _alternative_group_to_primitive(outcome.branch_selection)
             if outcome.branch_selection is not None
+            else None
+        ),
+        "pending_alternatives": (
+            _alternative_group_to_primitive(outcome.pending_alternatives)
+            if outcome.pending_alternatives is not None
             else None
         ),
         "causal_components": [

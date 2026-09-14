@@ -23,7 +23,7 @@ aparte."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from lol_reasoner.domain.enums import Support
 from lol_reasoner.reasoning.sequences.sequence import AlternativeGroup, InteractionSequence
@@ -102,10 +102,18 @@ class ControlFollowupFamily:
     - `alternatives`: una `InteractionSequence` por follow-up, cada una
       con el MISMO paso de control (reutilizado, no duplicado) más su
       propio follow-up, compartiendo un único `AlternativeGroup`.
+    - `pending_group` (cierre de hardening §B1): la proyección IRRESUELTA
+      (`selected_id=None`, siempre) del mismo grupo — group_id y las
+      alternativas disponibles, nunca cuál se eligió. Derivado
+      (`field(init=False)`), nunca declarado a mano: existe para que
+      `ScenarioOutcome.pending_alternatives` pueda auditar, sobre
+      `opening`, qué alternativas seguían disponibles sin tener que
+      simular ninguna ni elegir una por defecto.
     """
 
     opening: InteractionSequence
     alternatives: tuple[InteractionSequence, ...]
+    pending_group: AlternativeGroup = field(init=False, default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if not isinstance(self.opening, InteractionSequence):
@@ -114,6 +122,7 @@ class ControlFollowupFamily:
             raise ValueError("ControlFollowupFamily.opening no puede pertenecer a ningún AlternativeGroup")
         if not isinstance(self.alternatives, tuple) or not self.alternatives:
             raise ValueError("ControlFollowupFamily.alternatives debe ser una tuple no vacía")
+        first_group: AlternativeGroup | None = None
         for alt in self.alternatives:
             if not isinstance(alt, InteractionSequence):
                 raise TypeError(f"ControlFollowupFamily.alternatives[] debe ser InteractionSequence, no {alt!r}")
@@ -122,6 +131,22 @@ class ControlFollowupFamily:
                     f"ControlFollowupFamily.alternatives[{alt.sequence_id!r}] debe pertenecer a "
                     "un AlternativeGroup"
                 )
+            if first_group is None:
+                first_group = alt.alternative_group
+            elif (
+                alt.alternative_group.group_id != first_group.group_id
+                or alt.alternative_group.alternative_ids != first_group.alternative_ids
+            ):
+                raise ValueError(
+                    "ControlFollowupFamily.alternatives deben compartir el MISMO group_id/"
+                    f"alternative_ids — {alt.sequence_id!r} declara {alt.alternative_group!r}, "
+                    f"distinto de {first_group!r}"
+                )
+        object.__setattr__(
+            self,
+            "pending_group",
+            AlternativeGroup(group_id=first_group.group_id, alternative_ids=first_group.alternative_ids),
+        )
 
     def spec_for(self, alternative_id: str) -> InteractionSequence:
         for sequence in self.alternatives:

@@ -34,57 +34,86 @@ from lol_reasoner.reasoning.sequences.registry import (
 )
 from lol_reasoner.reasoning.sequences.sequence import (
     AlternativeGroup,
+    CalibrationStatus,
     CausalComponent,
     Evaluation,
+    ExecutionStatus,
     InteractionSequence,
     ScenarioOutcome,
     StateDelta,
+    StepResult,
     TradeOutcome,
+    chain_execution_status,
 )
 from lol_reasoner.reasoning.sequences.steps import ActorRole
 from lol_reasoner.reasoning.trace import ReasoningTrace, ShadowSequenceRecord
 
-# Placeholder deliberado, NO calibrado — ver "decisiones no especificadas"
-# en la entrega de esta ronda. Nunca llega a scoring (shadow mode, §B7):
-# existe solo para demostrar que el evaluador puede completar la cadena y
-# producir un CausalComponent real cuando la ejecución está confirmada.
-_SHADOW_CAUSAL_COMPONENT_PLACEHOLDER_DELTA = 1.0
+# El causal_role con el que toda esta familia identifica "el efecto que
+# efectivamente aplica el stack" — nunca se selecciona por posición
+# (cierre de hardening §B3: "steps[-1].consumes[0]" podía tomar
+# arbitrariamente CUALQUIER identidad si un paso llegaba a consumir más de
+# una, como ahora ocurre con `response_obliterate`, que también consume
+# una identidad de daño).
+_STACK_APPLICATION_CAUSAL_ROLE = "stack_application"
 
 
 def _resolve_darius_role(candidate: Champion, enemy: Champion) -> ActorRole:
     return ActorRole.CANDIDATE if candidate.id == DARIUS_ID else ActorRole.ENEMY
 
 
-def _build_outcome_from_spec(
+def _build_outcome_from_step_results(
     *,
     spec: InteractionSequence,
+    step_results: tuple[StepResult, ...],
     baseline: CombatState,
+    final_state: CombatState,
     branch_selection: AlternativeGroup | None,
+    pending_alternatives: AlternativeGroup | None,
     causal_components: tuple[CausalComponent, ...],
     evaluation: Evaluation,
 ) -> ScenarioOutcome:
-    step_results, final_state = evaluate_sequence_prefix(spec.steps, baseline)
     trade_outcome = TradeOutcome(state_delta=StateDelta(before=baseline, after=final_state), evaluation=evaluation)
     return ScenarioOutcome(
         sequence=spec,
         step_results=step_results,
         trade_outcome=trade_outcome,
         branch_selection=branch_selection,
+        pending_alternatives=pending_alternatives,
         causal_components=causal_components,
     )
 
 
 def _shadow_causal_component(spec: InteractionSequence, *, sequence_id: str) -> CausalComponent:
-    """UN `CausalComponent` shadow-only a partir del `EffectIdentity` que
-    consume el ÚLTIMO paso de `spec` (el follow-up que efectivamente
-    aplica el stack). `polarity=None`: no se firma una dirección — esta
-    ronda no decide favorecidos, solo demuestra que la cadena puede
-    completarse y producir un componente representable."""
+    """UN `CausalComponent` shadow-only a partir del `EffectIdentity` de
+    `causal_role == "stack_application"` del ÚLTIMO paso de `spec` (el
+    follow-up/respuesta que efectivamente aplica el stack) — seleccionada
+    EXPLÍCITAMENTE por su identidad causal, nunca por posición (cierre de
+    hardening §B3): un paso puede consumir más de una identidad (p. ej.
+    `response_obliterate` también consume una identidad de daño) y "el
+    primer elemento" no es de fiar para decidir cuál es la relevante acá.
 
-    consumed = spec.steps[-1].consumes[0]
+    `calibration_status=UNCALIBRATED`/`delta=None` (cierre de hardening
+    §B3): reemplaza el placeholder `delta=1.0` sin calibración real — ver
+    "decisiones no especificadas" en la entrega de esta ronda. Nunca llega
+    a scoring (shadow mode, §B7): existe solo para demostrar que el
+    evaluador puede completar la cadena y producir una OBSERVACIÓN causal
+    representable, sin inventar una magnitud. `polarity=None`: tampoco se
+    firma una dirección — esta ronda no decide favorecidos."""
+
+    candidates = [
+        identity for identity in spec.steps[-1].consumes if identity.causal_role == _STACK_APPLICATION_CAUSAL_ROLE
+    ]
+    if len(candidates) != 1:
+        raise ValueError(
+            f"El último paso de {spec.sequence_id!r} debe consumir EXACTAMENTE una identidad con "
+            f"causal_role={_STACK_APPLICATION_CAUSAL_ROLE!r} para poder derivar un CausalComponent "
+            f"shadow — encontró {len(candidates)}: {candidates!r}"
+        )
+    consumed = candidates[0]
     return CausalComponent(
         factor=Factor.STACKING_PAYOFF,
-        delta=_SHADOW_CAUSAL_COMPONENT_PLACEHOLDER_DELTA,
+        calibration_status=CalibrationStatus.UNCALIBRATED,
+        delta=None,
         provenance=Provenance.DERIVED,
         fact_ref=consumed.fact_ref,
         sequence_id=sequence_id,
@@ -114,21 +143,34 @@ def build_apprehend_followup_outcome(
 
     `emit_shadow_causal_component=True` adjunta UN `CausalComponent`
     shadow-only derivado del follow-up seleccionado — nunca automático,
-    nunca cuando no hay alternativa seleccionada."""
+    nunca cuando no hay alternativa seleccionada, y (cierre de hardening
+    §B2) nunca cuando la ejecución no está `CONFIRMED`: una ejecución
+    `HYPOTHETICAL` puede retener la identidad causal potencial (sigue
+    viajando en `sequence.covers_causes`/`step.consumes`), pero jamás se
+    presenta como un componente MATERIALIZADO; una rama `BLOCKED` tampoco
+    produce ninguno."""
 
     if selected_alternative_id is None:
         spec = registration.family.opening
         resolved_baseline = baseline if baseline is not None else build_apprehend_followup_baseline(registration)
-        return _build_outcome_from_spec(
+        step_results, final_state = evaluate_sequence_prefix(spec.steps, resolved_baseline)
+        return _build_outcome_from_step_results(
             spec=spec,
+            step_results=step_results,
             baseline=resolved_baseline,
+            final_state=final_state,
             branch_selection=None,
+            # §B1: la decisión sigue pendiente, pero las alternativas que
+            # existían (group_id + aa/q) quedan preservadas auditablemente
+            # — nunca se simulan ni se promedian, solo se declaran.
+            pending_alternatives=registration.family.pending_group,
             causal_components=(),
             evaluation=Evaluation.UNRESOLVED,
         )
 
     spec = registration.spec_for(selected_alternative_id)
     resolved_baseline = baseline if baseline is not None else build_apprehend_followup_baseline(registration)
+    step_results, final_state = evaluate_sequence_prefix(spec.steps, resolved_baseline)
 
     group = spec.alternative_group
     assert group is not None  # toda alternativa de esta familia pertenece a un grupo
@@ -137,13 +179,16 @@ def build_apprehend_followup_outcome(
     )
 
     causal_components: tuple[CausalComponent, ...] = ()
-    if emit_shadow_causal_component:
+    if emit_shadow_causal_component and chain_execution_status(step_results) is ExecutionStatus.CONFIRMED:
         causal_components = (_shadow_causal_component(spec, sequence_id=spec.sequence_id),)
 
-    return _build_outcome_from_spec(
+    return _build_outcome_from_step_results(
         spec=spec,
+        step_results=step_results,
         baseline=resolved_baseline,
+        final_state=final_state,
         branch_selection=branch_selection,
+        pending_alternatives=None,
         causal_components=causal_components,
         # El acierto del follow-up no está garantizado por defecto (§B6);
         # incluso cuando `baseline` confirma la ejecución, esta ronda no
@@ -209,25 +254,34 @@ def build_bidirectional_trade_outcome(
 ) -> ScenarioOutcome:
     """Igual que `build_apprehend_followup_outcome`, para la familia
     extendida con la respuesta de Mordekaiser. `causal_components` queda
-    siempre vacío acá: el trade bidireccional es puramente diagnóstico en
-    esta ronda (§B7), sin variante "confirmada" que reclame un componente.
-    """
+    siempre vacío acá POR DISEÑO (decisión explícita de esta ronda, §B2/
+    §B7): el trade bidireccional sigue siendo puramente diagnóstico — no
+    expone un `emit_shadow_causal_component` propio. El gate
+    confirmado-únicamente de §B2 ya vive en `_shadow_causal_component`/
+    `build_apprehend_followup_outcome` para cuando una ronda futura decida
+    extenderlo también acá; esta ronda no califica ninguna causalidad del
+    trade bidireccional."""
 
     if selected_alternative_id is None:
         spec = registration.family.opening
         resolved_baseline = (
             baseline if baseline is not None else build_bidirectional_trade_baseline(registration)
         )
-        return _build_outcome_from_spec(
+        step_results, final_state = evaluate_sequence_prefix(spec.steps, resolved_baseline)
+        return _build_outcome_from_step_results(
             spec=spec,
+            step_results=step_results,
             baseline=resolved_baseline,
+            final_state=final_state,
             branch_selection=None,
+            pending_alternatives=registration.family.pending_group,
             causal_components=(),
             evaluation=Evaluation.UNRESOLVED,
         )
 
     spec = registration.spec_for(selected_alternative_id)
     resolved_baseline = baseline if baseline is not None else build_bidirectional_trade_baseline(registration)
+    step_results, final_state = evaluate_sequence_prefix(spec.steps, resolved_baseline)
 
     group = spec.alternative_group
     assert group is not None
@@ -235,10 +289,13 @@ def build_bidirectional_trade_outcome(
         group_id=group.group_id, alternative_ids=group.alternative_ids, selected_id=selected_alternative_id
     )
 
-    return _build_outcome_from_spec(
+    return _build_outcome_from_step_results(
         spec=spec,
+        step_results=step_results,
         baseline=resolved_baseline,
+        final_state=final_state,
         branch_selection=branch_selection,
+        pending_alternatives=None,
         causal_components=(),
         # Trade no necesariamente letal, sin ganador forzado (§5 del
         # trade): CONDITIONAL es la lectura honesta mientras el contacto
