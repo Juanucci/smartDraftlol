@@ -11,6 +11,7 @@ ticks, ganador ni score en este archivo — esa es una etapa distinta.
 from __future__ import annotations
 
 import dataclasses
+import json
 from enum import Enum
 from types import MappingProxyType
 
@@ -38,6 +39,7 @@ from lol_reasoner.domain.combat_state import (
     StackWindow,
     WaveState,
     WaveStateKind,
+    combat_state_to_primitive,
 )
 
 # --- composición de CombatState ---------------------------------------------
@@ -574,6 +576,214 @@ def test_mutating_original_action_contexts_dict_does_not_affect_snapshot():
     original["a"] = ActionContext(action_ref="a", range_status=RangeStatus.OUT_OF_RANGE)
 
     assert shared.action_contexts["a"].range_status is RangeStatus.IN_RANGE
+
+
+# --- microfix de cierre de Etapa 1: claves de mapping no-string/vacías -------
+
+_VALID_VALUE_BY_ACTOR_FIELD = {
+    "stacks": StackState(count=1, window=StackWindow.ACTIVE),
+    "reserves": ReserveBand.NONE,
+    "abilities": AbilityState(rank=1, availability=AbilityAvailability.READY),
+    "extension": "some_qualitative_value",
+}
+
+
+@pytest.mark.parametrize("field_name", ["stacks", "reserves", "abilities", "extension"])
+@pytest.mark.parametrize("bad_key", [123, True, False, None, 1.5])
+def test_actor_state_mapping_rejects_non_string_keys(field_name, bad_key):
+    value = _VALID_VALUE_BY_ACTOR_FIELD[field_name]
+
+    with pytest.raises(TypeError):
+        ActorState(**{field_name: {bad_key: value}})
+
+
+@pytest.mark.parametrize("field_name", ["stacks", "reserves", "abilities", "extension"])
+@pytest.mark.parametrize("bad_key", ["", "   ", "\t\n"])
+def test_actor_state_mapping_rejects_empty_or_whitespace_keys(field_name, bad_key):
+    value = _VALID_VALUE_BY_ACTOR_FIELD[field_name]
+
+    with pytest.raises(ValueError):
+        ActorState(**{field_name: {bad_key: value}})
+
+
+@pytest.mark.parametrize("bad_key", [123, True, None])
+def test_action_context_invalidators_rejects_non_string_keys(bad_key):
+    with pytest.raises(TypeError):
+        ActionContext(action_ref="candidate:q", invalidators={bad_key: InvalidatorStatus.PRESENT})
+
+
+@pytest.mark.parametrize("bad_key", ["", "   "])
+def test_action_context_invalidators_rejects_empty_or_whitespace_keys(bad_key):
+    with pytest.raises(ValueError):
+        ActionContext(action_ref="candidate:q", invalidators={bad_key: InvalidatorStatus.PRESENT})
+
+
+@pytest.mark.parametrize("bad_key", [123, True, None])
+def test_shared_context_action_contexts_rejects_non_string_keys(bad_key):
+    with pytest.raises(TypeError):
+        SharedContext(action_contexts={bad_key: ActionContext(action_ref="candidate:q")})
+
+
+@pytest.mark.parametrize("bad_key", ["", "   "])
+def test_shared_context_action_contexts_rejects_empty_or_whitespace_keys(bad_key):
+    # la clave vacía/whitespace se rechaza antes de siquiera comparar contra
+    # action_ref — no importa que el ActionContext en sí sea válido.
+    with pytest.raises(ValueError):
+        SharedContext(action_contexts={bad_key: ActionContext(action_ref="candidate:q")})
+
+
+def test_actor_state_stacks_preserves_valid_key_without_normalization():
+    key = "  candidate:hemorrhage  "  # espacios internos/laterales, no solo-espacios
+
+    state = ActorState(stacks={key: StackState(count=2, window=StackWindow.ACTIVE)})
+
+    assert list(state.stacks.keys()) == [key]
+    assert state.stacks[key].count == 2
+
+
+def test_shared_context_action_contexts_preserves_valid_key_without_normalization():
+    key = "candidate:q "
+    context = ActionContext(action_ref=key)
+
+    shared = SharedContext(action_contexts={key: context})
+
+    assert list(shared.action_contexts.keys()) == [key]
+
+
+def test_action_context_action_ref_wrong_type_raises_type_error():
+    with pytest.raises(TypeError):
+        ActionContext(action_ref=123)
+
+
+def test_action_context_action_ref_empty_string_raises_value_error():
+    with pytest.raises(ValueError):
+        ActionContext(action_ref="   ")
+
+
+# --- microfix de cierre de Etapa 1: frontera de serialización explícita -----
+
+
+def _build_nontrivial_combat_state() -> CombatState:
+    candidate = ActorState(
+        level=6,
+        health_band=HealthBand.HIGH,
+        resource_type=ResourceKind.MANA,
+        resource_band=ResourceBand.PARTIAL,
+        stacks={
+            "hemorrhage": StackState(count=3, window=StackWindow.ACTIVE, reward_state=RewardState.INACTIVE),
+        },
+        reserves={"shield": ReserveBand.NONE},
+        abilities={
+            "q": AbilityState(rank=3, availability=AbilityAvailability.READY),
+            "r": AbilityState(rank=0, availability=AbilityAvailability.UNLEARNED),
+        },
+        extension={"zone:count": "2"},
+    )
+    enemy = ActorState()  # todo lo dejado en default: unknown/ausente
+    shared = SharedContext(
+        wave_state=WaveState(state=WaveStateKind.PUSHING, pushing_toward=PushDirection.CANDIDATE),
+        action_contexts={
+            "candidate:q": ActionContext(
+                action_ref="candidate:q",
+                range_status=RangeStatus.IN_RANGE,
+                invalidators={"cc": InvalidatorStatus.ABSENT},
+            ),
+        },
+    )
+    return CombatState(candidate=candidate, enemy=enemy, shared=shared)
+
+
+def test_combat_state_to_primitive_converts_full_snapshot():
+    primitive = combat_state_to_primitive(_build_nontrivial_combat_state())
+
+    assert primitive["candidate"]["level"] == 6
+    assert primitive["candidate"]["health_band"] == "high"
+    assert primitive["candidate"]["stacks"]["hemorrhage"]["count"] == 3
+    assert primitive["candidate"]["abilities"]["r"]["availability"] == "unlearned"
+    assert primitive["shared"]["wave_state"]["pushing_toward"] == "candidate"
+    assert primitive["shared"]["action_contexts"]["candidate:q"]["invalidators"]["cc"] == "absent"
+
+
+def test_combat_state_to_primitive_converts_enums_to_their_string_values():
+    primitive = combat_state_to_primitive(_build_nontrivial_combat_state())
+
+    assert primitive["candidate"]["resource_type"] == "mana"
+    assert primitive["candidate"]["resource_band"] == "partial"
+    assert primitive["candidate"]["stacks"]["hemorrhage"]["window"] == "active"
+    assert primitive["shared"]["wave_state"]["state"] == "pushing"
+    assert primitive["shared"]["action_contexts"]["candidate:q"]["range_status"] == "in_range"
+
+
+def test_combat_state_to_primitive_preserves_absent_key_unknown_and_known_zero():
+    primitive = combat_state_to_primitive(_build_nontrivial_combat_state())
+
+    # clave ausente: el enemigo no declaró ninguna entrada de stacks/reserves
+    assert primitive["enemy"]["stacks"] == {}
+    assert primitive["enemy"]["reserves"] == {}
+    # escalar sin declarar -> "unknown" explícito, no se omite el campo
+    assert primitive["enemy"]["health_band"] == "unknown"
+    # None real para un nivel desconocido
+    assert primitive["enemy"]["level"] is None
+    # cero conocido preservado como 0, nunca como None ni omitido
+    assert primitive["candidate"]["abilities"]["r"]["rank"] == 0
+
+
+def test_combat_state_to_primitive_is_json_serializable():
+    primitive = combat_state_to_primitive(_build_nontrivial_combat_state())
+
+    serialized = json.dumps(primitive)
+
+    assert json.loads(serialized) == primitive
+
+
+def test_combat_state_to_primitive_uses_only_json_primitive_types():
+    def _assert_all_primitive(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                assert isinstance(key, str)
+                _assert_all_primitive(value)
+        elif isinstance(node, list):
+            for item in node:
+                _assert_all_primitive(item)
+        else:
+            assert node is None or isinstance(node, (str, int, bool))
+
+    _assert_all_primitive(combat_state_to_primitive(_build_nontrivial_combat_state()))
+
+
+def test_mutating_serialized_dict_does_not_affect_snapshot():
+    state = _build_nontrivial_combat_state()
+    primitive = combat_state_to_primitive(state)
+
+    primitive["candidate"]["stacks"]["hemorrhage"]["count"] = 999
+    primitive["candidate"]["abilities"]["q"] = {"rank": 99, "availability": "ready"}
+    del primitive["shared"]["action_contexts"]["candidate:q"]
+
+    assert state.candidate.stacks["hemorrhage"].count == 3
+    assert state.candidate.abilities["q"].rank == 3
+    assert "candidate:q" in state.shared.action_contexts
+
+
+def test_serializing_does_not_mutate_original_state():
+    state = _build_nontrivial_combat_state()
+
+    combat_state_to_primitive(state)
+
+    assert isinstance(state.candidate.stacks, MappingProxyType)
+    assert isinstance(state.shared.action_contexts, MappingProxyType)
+    assert state.candidate.stacks["hemorrhage"].count == 3
+
+
+def test_combat_state_to_primitive_is_deterministic_for_equivalent_snapshots():
+    state_a = _build_nontrivial_combat_state()
+    state_b = _build_nontrivial_combat_state()
+
+    assert combat_state_to_primitive(state_a) == combat_state_to_primitive(state_b)
+
+
+def test_combat_state_to_primitive_rejects_wrong_type():
+    with pytest.raises(TypeError):
+        combat_state_to_primitive("not a combat state")  # type: ignore[arg-type]
 
 
 # --- ausencia de nombres de campeones/habilidades/matchups ------------------

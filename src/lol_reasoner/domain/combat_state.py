@@ -57,6 +57,25 @@ Python no validan nada en runtime. Cada campo que declara un enum o un
 campo de enum, o un `bool`/`float`/`str` en un campo numérico, se
 rechazan con `TypeError`, no se aceptan silenciosamente porque "parecen"
 compatibles.
+
+**Claves de mapping también validadas** (microfix de cierre de Etapa 1):
+tipar y validar solo los *valores* de `stacks`/`reserves`/`abilities`/
+`extension`/`invalidators`/`action_contexts` no alcanza — una clave
+`int`, `bool`, `None` o una cadena vacía/solo-espacios sería una identidad
+ambigua o inutilizable por cualquier paso futuro que busque por clave.
+Toda clave de estos mappings debe ser un `str` real, no vacío; no se
+recorta ni normaliza una clave válida (`_require_nonempty_string_key`).
+
+**Frontera de serialización explícita** (`combat_state_to_primitive`, al
+final de este módulo): `MappingProxyType` es exactamente lo que impide que
+`dataclasses.asdict()` recorra este árbol — `asdict()` intenta copiar cada
+mapping con `copy.deepcopy`/reconstrucción interna asumiendo `dict`, y
+falla o produce resultados no confiables sobre un `mappingproxy`. La
+función de este módulo es la única frontera aprobada para convertir un
+`CombatState` a datos primitivos (`dict`/`list`/`str`/`int`/`bool`/`None`,
+serializables con `json.dumps`) pensados para una traza futura — **nunca
+debe usarse `dataclasses.asdict()` directamente sobre `CombatState`** ni
+sobre ninguno de sus tipos compuestos.
 """
 
 from __future__ import annotations
@@ -124,6 +143,23 @@ def _require_enum_member(value: object, enum_cls: type[Enum], *, field_name: str
         )
 
 
+def _require_nonempty_string_key(key: object, *, field_name: str) -> None:
+    """Exige que una clave de mapping sea un `str` real, no vacío ni
+    compuesto solo de espacios. No recorta ni normaliza una clave válida
+    — un `" q"` y un `"q"` siguen siendo claves distintas."""
+
+    if not isinstance(key, str):
+        raise TypeError(
+            f"{field_name} tiene una clave que no es str: {key!r} "
+            f"({type(key).__name__}) — las claves de este mapping deben ser "
+            "identidad string explícita, nunca int/bool/None u otro tipo"
+        )
+    if not key.strip():
+        raise ValueError(
+            f"{field_name} tiene una clave vacía o compuesta solo de espacios: {key!r}"
+        )
+
+
 def _freeze_mapping(
     source: object,
     *,
@@ -131,13 +167,15 @@ def _freeze_mapping(
     value_type: type,
 ) -> MappingProxyType:
     """Copia defensiva de `source` (corta aliasing con el `dict` externo),
-    valida que cada valor sea una instancia real de `value_type`, y
-    devuelve el resultado envuelto en `MappingProxyType` (bloquea
-    mutaciones futuras a través del objeto de dominio)."""
+    valida que cada clave sea un `str` real no vacío y que cada valor sea
+    una instancia real de `value_type`, y devuelve el resultado envuelto en
+    `MappingProxyType` (bloquea mutaciones futuras a través del objeto de
+    dominio)."""
 
     if not isinstance(source, Mapping):
         raise TypeError(f"{field_name} debe ser un mapping, no {type(source).__name__}")
     for key, value in source.items():
+        _require_nonempty_string_key(key, field_name=field_name)
         if not isinstance(value, value_type):
             raise TypeError(
                 f"{field_name}[{key!r}] debe ser una instancia de "
@@ -439,7 +477,12 @@ class ActionContext:
     __hash__ = None  # type: ignore[assignment]  # contiene un mapping congelado, no un valor hashable
 
     def __post_init__(self) -> None:
-        if not isinstance(self.action_ref, str) or not self.action_ref.strip():
+        if not isinstance(self.action_ref, str):
+            raise TypeError(
+                f"ActionContext.action_ref debe ser str, no {self.action_ref!r} "
+                f"({type(self.action_ref).__name__})"
+            )
+        if not self.action_ref.strip():
             raise ValueError(
                 "ActionContext.action_ref no puede ser vacío ni contener solo "
                 f"espacios (recibido {self.action_ref!r})"
@@ -544,6 +587,7 @@ class SharedContext:
                 f"{type(self.action_contexts).__name__}"
             )
         for key, value in self.action_contexts.items():
+            _require_nonempty_string_key(key, field_name="SharedContext.action_contexts")
             if not isinstance(value, ActionContext):
                 raise TypeError(
                     f"SharedContext.action_contexts[{key!r}] debe ser una instancia "
@@ -601,3 +645,97 @@ class CombatState:
                 f"CombatState.shared debe ser una instancia de SharedContext, no "
                 f"{self.shared!r} ({type(self.shared).__name__})"
             )
+
+
+# ---------------------------------------------------------------------------
+# Frontera de serialización explícita (microfix de cierre de Etapa 1)
+# ---------------------------------------------------------------------------
+#
+# `dataclasses.asdict()` no puede copiar `MappingProxyType` de forma
+# confiable — esta es la única conversión aprobada de `CombatState` a datos
+# primitivos JSON-compatibles, pensada para una traza futura. Cada función
+# es pura (no muta el snapshot recibido), construye mappings NUEVOS (nunca
+# expone el `mappingproxy` original ni ninguna referencia mutable hacia él)
+# y preserva exactamente la distinción de tres/cuatro lecturas del diseño:
+# una clave ausente en el snapshot sigue ausente en el resultado; un valor
+# `UNKNOWN` se serializa como el string `"unknown"`, no se omite; un `None`
+# (p. ej. `level`/`count` desconocidos) se preserva como `None`; un cero
+# conocido (`count=0`, `rank=0`) se preserva como `0`, nunca como `None`.
+
+
+def _stack_state_to_primitive(stack: StackState) -> dict[str, object]:
+    return {
+        "count": stack.count,
+        "window": stack.window.value,
+        "reward_state": stack.reward_state.value,
+    }
+
+
+def _ability_state_to_primitive(ability: AbilityState) -> dict[str, object]:
+    return {
+        "rank": ability.rank,
+        "availability": ability.availability.value,
+    }
+
+
+def _action_context_to_primitive(context: ActionContext) -> dict[str, object]:
+    return {
+        "action_ref": context.action_ref,
+        "range_status": context.range_status.value,
+        "target_isolation": context.target_isolation.value,
+        "invalidators": {key: value.value for key, value in context.invalidators.items()},
+    }
+
+
+def _wave_state_to_primitive(wave: WaveState) -> dict[str, object]:
+    return {
+        "state": wave.state.value,
+        "pushing_toward": wave.pushing_toward.value,
+    }
+
+
+def _actor_state_to_primitive(actor: ActorState) -> dict[str, object]:
+    return {
+        "level": actor.level,
+        "health_band": actor.health_band.value,
+        "resource_type": actor.resource_type.value,
+        "resource_band": actor.resource_band.value,
+        "stacks": {key: _stack_state_to_primitive(value) for key, value in actor.stacks.items()},
+        "reserves": {key: value.value for key, value in actor.reserves.items()},
+        "abilities": {key: _ability_state_to_primitive(value) for key, value in actor.abilities.items()},
+        "extension": dict(actor.extension),
+    }
+
+
+def _shared_context_to_primitive(shared: SharedContext) -> dict[str, object]:
+    return {
+        "wave_state": _wave_state_to_primitive(shared.wave_state),
+        "action_contexts": {
+            key: _action_context_to_primitive(value) for key, value in shared.action_contexts.items()
+        },
+    }
+
+
+def combat_state_to_primitive(state: CombatState) -> dict[str, object]:
+    """Convierte un `CombatState` a datos primitivos JSON-compatibles
+    (`dict`/`list`/`str`/`int`/`bool`/`None`), sin mutar el snapshot
+    recibido ni exponer ninguna referencia mutable hacia su estado interno.
+
+    Esta es la frontera de serialización aprobada para una traza futura.
+    **No usar `dataclasses.asdict()` sobre `CombatState`** — no sabe copiar
+    los `MappingProxyType` internos. Esta función no implementa
+    deserialización, persistencia en disco, versionado de schema ni
+    serialización genérica de cualquier dataclass del proyecto: es
+    exclusivamente la conversión de ida para este tipo.
+    """
+
+    if not isinstance(state, CombatState):
+        raise TypeError(
+            f"combat_state_to_primitive espera un CombatState, no {state!r} "
+            f"({type(state).__name__})"
+        )
+    return {
+        "candidate": _actor_state_to_primitive(state.candidate),
+        "enemy": _actor_state_to_primitive(state.enemy),
+        "shared": _shared_context_to_primitive(state.shared),
+    }
